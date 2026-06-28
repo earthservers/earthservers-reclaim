@@ -5,7 +5,11 @@ All notable changes to Earth Reclaim are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.0.2] - 2026-06-28
+## [1.0.3] - 2026-06-28
+
+> Supersedes 1.0.2, whose release build failed before publishing (the NoScript
+> build step couldn't be found from the CI working directory). Same changes,
+> plus the build-pipeline fix below.
 
 ### Fixed
 - **Private Bookmarks and Local AI / History passwords are now per-profile.** They
@@ -22,7 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - The release build now compiles and bundles the NoScript extension automatically
-  (`build:noscript` step); CI installs the WebKit 4.0 web-extension dev library.
+  (`build:noscript` step), invoked via `pnpm --filter reclaim` so it resolves from
+  the CI working directory; CI installs the WebKit 4.0 web-extension dev library.
 
 ## [1.0.1] - 2026-06-28
 
