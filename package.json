@@ -18,10 +18,10 @@
     "test": "turbo run test",
     "reclaim": "pnpm --filter reclaim tauri:dev",
     "reclaim:x11": "GDK_BACKEND=x11 WEBKIT_DISABLE_COMPOSITING_MODE=1 pnpm --filter reclaim tauri:dev",
-    "reclaim:build": "pnpm --filter reclaim tauri:build",
+    "reclaim:build": "APPIMAGE_EXTRACT_AND_RUN=1 NO_STRIP=1 pnpm --filter reclaim tauri:build",
     "desktop": "pnpm --filter reclaim tauri:dev",
     "desktop:x11": "GDK_BACKEND=x11 pnpm --filter reclaim tauri:dev",
-    "desktop:build": "pnpm --filter reclaim tauri:build"
+    "desktop:build": "APPIMAGE_EXTRACT_AND_RUN=1 NO_STRIP=1 pnpm --filter reclaim tauri:build"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.0.0",
