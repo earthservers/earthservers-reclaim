@@ -207,7 +207,7 @@ export function BookmarkBar({ profileId, visible = true, onNavigate, onToggleMan
 
   const checkPrivatePasswordStatus = async () => {
     try {
-      const hasPass = await invoke<boolean>('has_private_bookmarks_password');
+      const hasPass = await invoke<boolean>('has_private_bookmarks_password', { profileId });
       setHasPassword(hasPass);
     } catch {
       setHasPassword(false);
@@ -216,7 +216,7 @@ export function BookmarkBar({ profileId, visible = true, onNavigate, onToggleMan
 
   const unlockPrivateBookmarks = async () => {
     try {
-      const valid = await invoke<boolean>('verify_private_bookmarks_password', { password: passwordInput });
+      const valid = await invoke<boolean>('verify_private_bookmarks_password', { profileId, password: passwordInput });
       if (valid) {
         setPrivateUnlocked(true);
         setPasswordInput('');
@@ -234,7 +234,7 @@ export function BookmarkBar({ profileId, visible = true, onNavigate, onToggleMan
       return;
     }
     try {
-      await invoke('set_private_bookmarks_password', { password: passwordInput });
+      await invoke('set_private_bookmarks_password', { profileId, password: passwordInput });
       setHasPassword(true);
       setPrivateUnlocked(true);
       setPasswordInput('');

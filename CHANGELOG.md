@@ -5,6 +5,25 @@ All notable changes to Earth Reclaim are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.2] - 2026-06-28
+
+### Fixed
+- **Private Bookmarks and Local AI / History passwords are now per-profile.** They
+  were stored in a single shared row, so the same password applied to every
+  profile and survived wiping one. Each profile now has its own, independent
+  password, and wiping/deleting a profile clears it. The old shared password is
+  migrated away on first launch (bookmarks/AI data are device-key encrypted, so
+  nothing is lost — set a new per-profile password if you want the gate back).
+- **NoScript now works in installed builds (.rpm/.deb/AppImage), not just dev.**
+  The WebKit web-process extension (`libearth_noscript_ext.so`) is now built and
+  bundled as an app resource, and located in the bundle at runtime. Previously it
+  was only found in the dev source tree, so installed builds reported "No script
+  sources detected yet."
+
+### Changed
+- The release build now compiles and bundles the NoScript extension automatically
+  (`build:noscript` step); CI installs the WebKit 4.0 web-extension dev library.
+
 ## [1.0.1] - 2026-06-28
 
 ### Added

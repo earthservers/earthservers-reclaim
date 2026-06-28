@@ -109,37 +109,74 @@ impl BookmarkManager {
         BookmarkManager { db_path }
     }
 
-    // ---- private-bookmarks password (Argon2id, single global row) ----
+    // ---- private-bookmarks password (Argon2id, PER PROFILE) ----
+    //
+    // Each profile has its OWN private-bookmarks password (keyed by profile_id),
+    // so it's independent across profiles and is removed when the profile is wiped
+    // or deleted. Earlier versions used a single global row shared by all profiles;
+    // `ensure_private_auth_table` migrates that away. The bookmarks themselves are
+    // encrypted with a device key (not this password), so dropping the old shared
+    // gate loses no data — it just resets to "no password" until one is set again.
 
-    pub fn set_private_password(&self, password: &str) -> Result<(), String> {
-        use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
-        use argon2::Argon2;
-        let conn = Connection::open(&self.db_path).map_err(|e| e.to_string())?;
+    fn ensure_private_auth_table(conn: &Connection) -> Result<(), String> {
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='private_bookmarks_auth'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if exists > 0 {
+            // Legacy global schema has an `id` column and no `profile_id`.
+            let has_profile_id = conn
+                .prepare("PRAGMA table_info(private_bookmarks_auth)")
+                .and_then(|mut s| {
+                    let cols: Vec<String> = s
+                        .query_map([], |r| r.get::<_, String>(1))?
+                        .filter_map(|r| r.ok())
+                        .collect();
+                    Ok(cols.iter().any(|c| c == "profile_id"))
+                })
+                .unwrap_or(false);
+            if !has_profile_id {
+                conn.execute("DROP TABLE private_bookmarks_auth", [])
+                    .map_err(|e| e.to_string())?;
+            }
+        }
         conn.execute(
-            "CREATE TABLE IF NOT EXISTS private_bookmarks_auth (id INTEGER PRIMARY KEY CHECK (id = 1), hash TEXT NOT NULL)",
+            "CREATE TABLE IF NOT EXISTS private_bookmarks_auth (profile_id INTEGER PRIMARY KEY, hash TEXT NOT NULL)",
             [],
         )
         .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn set_private_password(&self, profile_id: i64, password: &str) -> Result<(), String> {
+        use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
+        use argon2::Argon2;
+        let conn = Connection::open(&self.db_path).map_err(|e| e.to_string())?;
+        Self::ensure_private_auth_table(&conn)?;
         let salt = SaltString::generate(&mut OsRng);
         let hash = Argon2::default()
             .hash_password(password.as_bytes(), &salt)
             .map_err(|e| e.to_string())?
             .to_string();
         conn.execute(
-            "INSERT OR REPLACE INTO private_bookmarks_auth (id, hash) VALUES (1, ?1)",
-            params![hash],
+            "INSERT OR REPLACE INTO private_bookmarks_auth (profile_id, hash) VALUES (?1, ?2)",
+            params![profile_id, hash],
         )
         .map_err(|e| e.to_string())?;
         Ok(())
     }
 
-    pub fn has_private_password(&self) -> bool {
+    pub fn has_private_password(&self, profile_id: i64) -> bool {
         Connection::open(&self.db_path)
             .ok()
             .and_then(|conn| {
+                let _ = Self::ensure_private_auth_table(&conn);
                 conn.query_row(
-                    "SELECT COUNT(*) FROM private_bookmarks_auth WHERE id = 1",
-                    [],
+                    "SELECT COUNT(*) FROM private_bookmarks_auth WHERE profile_id = ?1",
+                    params![profile_id],
                     |r| r.get::<_, i64>(0),
                 )
                 .ok()
@@ -148,11 +185,12 @@ impl BookmarkManager {
             .unwrap_or(false)
     }
 
-    pub fn verify_private_password(&self, password: &str) -> bool {
+    pub fn verify_private_password(&self, profile_id: i64, password: &str) -> bool {
         let stored: Option<String> = Connection::open(&self.db_path).ok().and_then(|conn| {
+            let _ = Self::ensure_private_auth_table(&conn);
             conn.query_row(
-                "SELECT hash FROM private_bookmarks_auth WHERE id = 1",
-                [],
+                "SELECT hash FROM private_bookmarks_auth WHERE profile_id = ?1",
+                params![profile_id],
                 |r| r.get(0),
             )
             .ok()

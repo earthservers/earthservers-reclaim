@@ -68,3 +68,6 @@ ehthumbs.db
 # Rust
 Cargo.lock
 **/*.rs.bk
+
+# Generated NoScript web-extension .so (built by build:noscript at bundle time)
+apps/reclaim/src-tauri/resources/noscript/

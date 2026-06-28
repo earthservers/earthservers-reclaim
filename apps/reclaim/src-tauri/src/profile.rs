@@ -397,6 +397,9 @@ impl ProfileManager {
             "DELETE FROM password_entries WHERE profile_id = ?1",
             "DELETE FROM otp_entries WHERE profile_id = ?1",
             "DELETE FROM vault_master WHERE profile_id = ?1",
+            // Per-profile feature-password gates (each profile has its own).
+            "DELETE FROM private_bookmarks_auth WHERE profile_id = ?1",
+            "DELETE FROM ai_lock_auth WHERE profile_id = ?1",
         ];
 
         for sql in child_deletes.iter().chain(profile_deletes.iter()) {

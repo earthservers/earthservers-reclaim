@@ -42,21 +42,21 @@ const FEATURES: Feature[] = [
   {
     key: 'bookmarks',
     label: 'Private Bookmarks',
-    hasPassword: () => invoke<boolean>('has_private_bookmarks_password'),
-    change: async (_p, o, n) => {
-      const ok = await invoke<boolean>('verify_private_bookmarks_password', { password: o });
+    hasPassword: (p) => invoke<boolean>('has_private_bookmarks_password', { profileId: p }),
+    change: async (p, o, n) => {
+      const ok = await invoke<boolean>('verify_private_bookmarks_password', { profileId: p, password: o });
       if (!ok) throw new Error('Incorrect current password');
-      await invoke('set_private_bookmarks_password', { password: n });
+      await invoke('set_private_bookmarks_password', { profileId: p, password: n });
     },
   },
   {
     key: 'local-ai',
     label: 'Local AI / History',
-    hasPassword: () => invoke<boolean>('ai_lock_has_password'),
-    change: async (_p, o, n) => {
-      const ok = await invoke<boolean>('ai_lock_verify_password', { password: o });
+    hasPassword: (p) => invoke<boolean>('ai_lock_has_password', { profileId: p }),
+    change: async (p, o, n) => {
+      const ok = await invoke<boolean>('ai_lock_verify_password', { profileId: p, password: o });
       if (!ok) throw new Error('Incorrect current password');
-      await invoke('ai_lock_set_password', { password: n });
+      await invoke('ai_lock_set_password', { profileId: p, password: n });
     },
   },
 ];

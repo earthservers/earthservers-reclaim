@@ -1298,27 +1298,29 @@ async fn get_all_bookmarks(
 }
 
 #[tauri::command(rename_all = "camelCase")]
-async fn has_private_bookmarks_password(state: State<'_, Mutex<AppState>>) -> Result<bool, String> {
+async fn has_private_bookmarks_password(state: State<'_, Mutex<AppState>>, profile_id: i64) -> Result<bool, String> {
     let state = state.lock().map_err(|e| e.to_string())?;
-    Ok(state.bookmark_manager.has_private_password())
+    Ok(state.bookmark_manager.has_private_password(profile_id))
 }
 
 #[tauri::command(rename_all = "camelCase")]
 async fn set_private_bookmarks_password(
     state: State<'_, Mutex<AppState>>,
+    profile_id: i64,
     password: String,
 ) -> Result<(), String> {
     let state = state.lock().map_err(|e| e.to_string())?;
-    state.bookmark_manager.set_private_password(&password)
+    state.bookmark_manager.set_private_password(profile_id, &password)
 }
 
 #[tauri::command(rename_all = "camelCase")]
 async fn verify_private_bookmarks_password(
     state: State<'_, Mutex<AppState>>,
+    profile_id: i64,
     password: String,
 ) -> Result<bool, String> {
     let state = state.lock().map_err(|e| e.to_string())?;
-    Ok(state.bookmark_manager.verify_private_password(&password))
+    Ok(state.bookmark_manager.verify_private_password(profile_id, &password))
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -2088,18 +2090,48 @@ async fn query_knowledge_graph(query: String) -> Result<String, String> {
     Ok(format!("Knowledge graph query: {}", query))
 }
 
-/// Locate the built NoScript web-extension `.so`. Checks `EARTH_NOSCRIPT_EXT`
-/// (full path) first, then walks up from the executable looking for the
-/// standalone crate's build output (it has its own target dir since it's not a
-/// workspace member). Returns None if not built.
+/// Locate the built NoScript web-extension `.so`. Search order:
+///   1. `EARTH_NOSCRIPT_EXT` (full path override)
+///   2. the bundled resource dir — this is where it lives in an INSTALLED build
+///      (.rpm/.deb/AppImage); bundled via `bundle.resources` in tauri.conf.json
+///   3. next to the executable
+///   4. the dev source tree (the standalone crate's own target dir)
+/// Returns None if not built/bundled.
 #[cfg(target_os = "linux")]
-fn locate_noscript_so() -> Option<std::path::PathBuf> {
+fn locate_noscript_so(resource_dir: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
+    const SO: &str = "libearth_noscript_ext.so";
+
     if let Ok(p) = std::env::var("EARTH_NOSCRIPT_EXT") {
         let p = std::path::PathBuf::from(p);
         if p.exists() {
             return Some(p);
         }
     }
+
+    // Installed build: bundled as a resource. Tauri's exact layout can vary, so
+    // check the common sub-paths rather than assuming one.
+    if let Some(res) = resource_dir {
+        for rel in [
+            format!("noscript/{SO}"),
+            format!("resources/noscript/{SO}"),
+            SO.to_string(),
+        ] {
+            let cand = res.join(rel);
+            if cand.exists() {
+                return Some(cand);
+            }
+        }
+    }
+
+    // Alongside the executable (e.g. /usr/lib/<app>/).
+    if let Some(exe_dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.to_path_buf())) {
+        let cand = exe_dir.join(SO);
+        if cand.exists() {
+            return Some(cand);
+        }
+    }
+
+    // Dev: walk up from the executable to the standalone crate's target dir.
     let exe = std::env::current_exe().ok()?;
     let mut dir: Option<&std::path::Path> = exe.parent();
     while let Some(d) = dir {
@@ -2107,7 +2139,7 @@ fn locate_noscript_so() -> Option<std::path::PathBuf> {
             let cand = d
                 .join("crates/earth-noscript-ext/target")
                 .join(profile)
-                .join("libearth_noscript_ext.so");
+                .join(SO);
             if cand.exists() {
                 return Some(cand);
             }
@@ -2118,7 +2150,7 @@ fn locate_noscript_so() -> Option<std::path::PathBuf> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn locate_noscript_so() -> Option<std::path::PathBuf> {
+fn locate_noscript_so(_resource_dir: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
     None
 }
 
@@ -2243,9 +2275,11 @@ pub fn run() {
             // NoScript per-script engine: stage the WebKit web-process extension
             // (.so) into a clean directory and point the browser surface at it.
             // The extension observes (Phase 1) per-origin requests in the web
-            // process. Built separately: cargo build --manifest-path
-            // crates/earth-noscript-ext/Cargo.toml.
-            if let Some(so) = locate_noscript_so() {
+            // process. In dev it's found in the crate's target dir; in an installed
+            // build it's bundled as a resource (see bundle.resources + the
+            // build:noscript step).
+            let res_dir = app.path().resource_dir().ok();
+            if let Some(so) = locate_noscript_so(res_dir.as_deref()) {
                 let ext_dir = app_dir.join("web-extensions");
                 let _ = std::fs::create_dir_all(&ext_dir);
                 let dest = ext_dir.join("libearth_noscript_ext.so");

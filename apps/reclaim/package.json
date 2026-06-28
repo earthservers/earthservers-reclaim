@@ -1,10 +1,11 @@
 {
   "name": "reclaim",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "build:noscript": "mkdir -p src-tauri/resources/noscript && cargo build --release --manifest-path ../../crates/earth-noscript-ext/Cargo.toml && cp ../../crates/earth-noscript-ext/target/release/libearth_noscript_ext.so src-tauri/resources/noscript/libearth_noscript_ext.so",
     "dev:mock": "VITE_USE_MOCK_DATA=true vite",
     "build": "tsc && vite build",
     "preview": "vite preview",

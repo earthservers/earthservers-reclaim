@@ -278,8 +278,9 @@ let mockBookmarks: any[] = [
   { id: 5, profileId: 1, title: 'Secret Docs', url: 'https://docs.secret.io', favicon: null, folderId: null, folder_name: null, tags: ['private', 'docs'], notes: 'Secret documentation', position: 4, location: 'private', created_at: new Date().toISOString(), updated_at: new Date().toISOString(), is_system: false },
 ];
 
-// Private bookmarks password (hashed in production) - null means not set
-let privateBookmarksPassword: string | null = null;
+// Per-profile feature-gate passwords (hashed in production). Keyed by profileId.
+const privateBookmarksPasswords: Record<number, string> = {};
+const aiLockPasswords: Record<number, string> = {};
 
 // Password manager data
 let passwordManagerMaster: Record<number, string> = {}; // profile_id -> master password
@@ -728,15 +729,31 @@ const mockCommands: Record<string, (args?: any) => any> = {
   // Private bookmarks commands
   get_private_bookmarks: (args: any) => mockBookmarks.filter(b => b.location === 'private' && b.profile_id === args.profile_id),
   set_private_bookmarks_password: (args: any) => {
-    privateBookmarksPassword = args.password;
+    privateBookmarksPasswords[args.profileId] = args.password;
     return true;
   },
   verify_private_bookmarks_password: (args: any) => {
-    if (!privateBookmarksPassword) return true; // No password set
-    return args.password === privateBookmarksPassword;
+    const pw = privateBookmarksPasswords[args.profileId];
+    if (!pw) return true; // No password set
+    return args.password === pw;
   },
-  has_private_bookmarks_password: () => privateBookmarksPassword !== null,
+  has_private_bookmarks_password: (args: any) => privateBookmarksPasswords[args.profileId] != null,
   get_bookmarks_by_location: (args: any) => mockBookmarks.filter(b => b.location === args.location && b.profile_id === args.profile_id && !b.url.startsWith('earth://')),
+
+  // Local AI / History password gate (per profile)
+  ai_lock_has_password: (args: any) => aiLockPasswords[args.profileId] != null,
+  ai_lock_verify_password: (args: any) => {
+    const pw = aiLockPasswords[args.profileId];
+    if (!pw) return true;
+    return args.password === pw;
+  },
+  ai_lock_set_password: (args: any) => { aiLockPasswords[args.profileId] = args.password; return undefined; },
+  ai_lock_remove_password: (args: any) => {
+    const pw = aiLockPasswords[args.profileId];
+    if (pw && args.password !== pw) throw new Error('Incorrect password');
+    delete aiLockPasswords[args.profileId];
+    return undefined;
+  },
 
   // Password Manager commands
   has_password_manager_master: (args: any) => passwordManagerMaster[args.profile_id] !== undefined,

@@ -414,13 +414,14 @@ function AiTab({ profileId, settings, onChange }: { profileId: number | null; se
   );
 }
 
-// Session unlock for the AI / History tab. Module-scoped so it survives the
-// component's remounts (the page remounts every time you re-open the tab); resets
-// to locked on app restart, like the other password gates.
-let aiUnlocked = false;
+// Session unlock for the AI / History tab, PER PROFILE. Module-scoped so it
+// survives the component's remounts (the page remounts every time you re-open the
+// tab); resets to locked on app restart, like the other password gates. Per
+// profile so unlocking one profile doesn't unlock another.
+const aiUnlockedProfiles = new Set<number>();
 
 // Modal to set / change / remove the AI / History password (its own unique one).
-function AiLockModal({ hasPw, onClose, onChanged }: { hasPw: boolean; onClose: () => void; onChanged: (hasPw: boolean) => void }) {
+function AiLockModal({ profileId, hasPw, onClose, onChanged }: { profileId: number; hasPw: boolean; onClose: () => void; onChanged: (hasPw: boolean) => void }) {
   const [mode, setMode] = useState<'set' | 'remove'>('set');
   const [pw, setPw] = useState('');
   const [confirm, setConfirm] = useState('');
@@ -433,12 +434,12 @@ function AiLockModal({ hasPw, onClose, onChanged }: { hasPw: boolean; onClose: (
     if (pw.length < 4) { setErr('Password must be at least 4 characters'); return; }
     if (pw !== confirm) { setErr('Passwords do not match'); return; }
     setBusy(true);
-    try { await invoke('ai_lock_set_password', { password: pw }); aiUnlocked = true; onChanged(true); onClose(); }
+    try { await invoke('ai_lock_set_password', { profileId, password: pw }); aiUnlockedProfiles.add(profileId); onChanged(true); onClose(); }
     catch (e) { setErr(String(e).replace(/^.*?:\s*/, '')); } finally { setBusy(false); }
   };
   const doRemove = async () => {
     setErr(''); setBusy(true);
-    try { await invoke('ai_lock_remove_password', { password: current }); onChanged(false); onClose(); }
+    try { await invoke('ai_lock_remove_password', { profileId, password: current }); onChanged(false); onClose(); }
     catch (e) { setErr(String(e).replace(/^.*?:\s*/, '')); } finally { setBusy(false); }
   };
 
@@ -481,17 +482,18 @@ export function LocalAIHub({ profileId, settings, onChange, onOpenUrl }: LocalAI
   const [unlockInput, setUnlockInput] = useState('');
   const [unlockError, setUnlockError] = useState('');
   const [showLockModal, setShowLockModal] = useState(false);
+  const pid = profileId ?? 1;
 
   useEffect(() => {
-    invoke<boolean>('ai_lock_has_password')
-      .then(has => { setHasPw(has); setLocked(has && !aiUnlocked); })
+    invoke<boolean>('ai_lock_has_password', { profileId: pid })
+      .then(has => { setHasPw(has); setLocked(has && !aiUnlockedProfiles.has(pid)); })
       .catch(() => { setHasPw(false); setLocked(false); });
-  }, []);
+  }, [pid]);
 
   const unlock = async () => {
     try {
-      const ok = await invoke<boolean>('ai_lock_verify_password', { password: unlockInput });
-      if (ok) { aiUnlocked = true; setLocked(false); setUnlockInput(''); setUnlockError(''); }
+      const ok = await invoke<boolean>('ai_lock_verify_password', { profileId: pid, password: unlockInput });
+      if (ok) { aiUnlockedProfiles.add(pid); setLocked(false); setUnlockInput(''); setUnlockError(''); }
       else setUnlockError('Incorrect password');
     } catch { setUnlockError('Could not verify password'); }
   };
@@ -571,7 +573,7 @@ export function LocalAIHub({ profileId, settings, onChange, onOpenUrl }: LocalAI
         : <MemoryManager profileId={profileId} onOpenUrl={onOpenUrl} />}
 
       {showLockModal && (
-        <AiLockModal hasPw={hasPw} onClose={() => setShowLockModal(false)} onChanged={setHasPw} />
+        <AiLockModal profileId={pid} hasPw={hasPw} onClose={() => setShowLockModal(false)} onChanged={setHasPw} />
       )}
     </div>
   );
