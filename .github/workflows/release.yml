@@ -65,6 +65,15 @@ jobs:
         with:
           targets: ${{ matrix.settings.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
+      # Cache compiled Rust deps so cold ~20-min builds drop to a few minutes on
+      # subsequent runs. Keyed on Cargo.lock + toolchain + platform; first run
+      # after this is added is still cold (it populates the cache).
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target'
+          key: ${{ matrix.settings.platform }}
+
       - name: Install dependencies (Ubuntu only)
         if: matrix.settings.platform == 'ubuntu-22.04'
         run: |
