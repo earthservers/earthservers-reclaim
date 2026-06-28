@@ -55,6 +55,16 @@ pub fn web_extension_initialize(extension: &WebExtension) {
     });
 
     extension.connect_page_created(|_ext, page| {
+        // This web process just came up with an EMPTY trusted set (TRUSTED is
+        // thread-local per web process, and WebKit spawns a fresh process per
+        // tab). Ask the UI to (re)broadcast the trusted set now, before the page
+        // issues any sub-resource requests — otherwise a newly-opened tab blocks
+        // trusted third-party scripts until the user manually toggles trust. The
+        // UI's message handler is registered when the view is built (before this
+        // process spawned), so there is no race.
+        let ready = UserMessage::new("noscript:ready", None::<&glib::Variant>);
+        page.send_message_to_view(&ready, None::<&gio::Cancellable>, |_res| {});
+
         // Distinct origins already reported for this page (dedupe the messages).
         let seen: Rc<RefCell<HashSet<String>>> = Rc::new(RefCell::new(HashSet::new()));
         // Track the page's first-party origin; when it changes (a new top-level

@@ -430,6 +430,126 @@ impl VaultManager {
         Ok(())
     }
 
+    // ---- Reclaim app passwords (non-site entries, master-gated, autofillable) ----
+    // The password manager master acts as the one master password. App passwords
+    // (media / bookmarks / authenticator / local-ai …) are stored as ordinary
+    // password_entries keyed by a `reclaim://<key>` URL in the "Reclaim" category,
+    // so the manager lists/edits them like any entry, but feature gates can look
+    // one up by key and autofill it after the user enters the master once.
+
+    pub fn has_app_password(&self, profile_id: i64, key: &str) -> Result<bool, String> {
+        let conn = self.conn()?;
+        let url = format!("reclaim://{}", key);
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM password_entries WHERE profile_id = ?1 AND url = ?2",
+                params![profile_id, url],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(n > 0)
+    }
+
+    /// Decrypt and return a stored app password — after verifying the master
+    /// (which also unlocks the session for decryption). None if no entry exists.
+    pub fn get_app_password(&self, profile_id: i64, key: &str, master: &str) -> Result<Option<String>, String> {
+        if !self.has_master(profile_id, KIND_PASSWORD)? {
+            return Err("Set up your password manager master password first.".into());
+        }
+        if !self.verify_master(profile_id, KIND_PASSWORD, master)? {
+            return Err("Incorrect master password".into());
+        }
+        let sk = session_key(profile_id, KIND_PASSWORD).ok_or("Vault is locked")?;
+        let conn = self.conn()?;
+        let url = format!("reclaim://{}", key);
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT password FROM password_entries WHERE profile_id = ?1 AND url = ?2",
+                params![profile_id, url],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        Ok(stored.map(|enc| decrypt_data(&enc, &sk).unwrap_or_default()))
+    }
+
+    /// Store (or replace) an app password — master-gated. One entry per key.
+    pub fn set_app_password(&self, profile_id: i64, key: &str, label: &str, password: &str, master: &str) -> Result<(), String> {
+        if !self.has_master(profile_id, KIND_PASSWORD)? {
+            return Err("Set up your password manager master password first.".into());
+        }
+        if !self.verify_master(profile_id, KIND_PASSWORD, master)? {
+            return Err("Incorrect master password".into());
+        }
+        let url = format!("reclaim://{}", key);
+        {
+            let conn = self.conn()?;
+            conn.execute(
+                "DELETE FROM password_entries WHERE profile_id = ?1 AND url = ?2",
+                params![profile_id, url],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        // verify_master unlocked the session, so add_password_entry can encrypt.
+        self.add_password_entry(profile_id, label, "", password, Some(&url), Some("Reclaim app password"), "Reclaim")
+    }
+
+    /// Change a vault master (password manager or authenticator/OTP), requiring
+    /// the current password and RE-ENCRYPTING every entry of that kind under the
+    /// new password — otherwise the stored secrets would become unreadable. The
+    /// hash swap + re-encryption happen in one transaction (all-or-nothing).
+    pub fn change_master(&self, profile_id: i64, kind: &str, old: &str, new: &str) -> Result<(), String> {
+        if new.trim().is_empty() {
+            return Err("New password cannot be empty".into());
+        }
+        if !self.has_master(profile_id, kind)? {
+            return Err("No password is set yet".into());
+        }
+        if !self.verify_master(profile_id, kind, old)? {
+            return Err("Incorrect current password".into());
+        }
+        let (table, col) = match kind {
+            KIND_PASSWORD => ("password_entries", "password"),
+            KIND_OTP => ("otp_entries", "secret"),
+            _ => return Err("unknown vault".into()),
+        };
+        let conn = self.conn()?;
+        // Decrypt each entry's secret with the OLD password (it IS the key).
+        let mut decrypted: Vec<(i64, String)> = Vec::new();
+        {
+            let mut stmt = conn
+                .prepare(&format!("SELECT id, {} FROM {} WHERE profile_id = ?1", col, table))
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(params![profile_id], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                })
+                .map_err(|e| e.to_string())?;
+            for row in rows {
+                let (id, enc) = row.map_err(|e| e.to_string())?;
+                decrypted.push((id, decrypt_data(&enc, old).unwrap_or_default()));
+            }
+        }
+        let new_hash = hash_password(new)?;
+        let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        tx.execute(
+            "UPDATE vault_master SET hash = ?1 WHERE profile_id = ?2 AND kind = ?3",
+            params![new_hash, profile_id, kind],
+        )
+        .map_err(|e| e.to_string())?;
+        for (id, plain) in &decrypted {
+            let enc = encrypt_data(plain, new)?;
+            tx.execute(
+                &format!("UPDATE {} SET {} = ?1 WHERE id = ?2", table, col),
+                params![enc, id],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        unlock_session(profile_id, kind, new);
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn update_password_entry(
         &self,
@@ -576,6 +696,38 @@ pub async fn set_password_manager_master(state: State<'_, Mutex<AppState>>, prof
 pub async fn lock_password_manager(profile_id: i64) -> Result<(), String> {
     lock_session(profile_id, KIND_PASSWORD);
     Ok(())
+}
+
+// ---- Reclaim app passwords (master-gated autofill for feature gates) ----
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn vault_has_app_password(state: State<'_, Mutex<AppState>>, profile_id: i64, key: String) -> Result<bool, String> {
+    let s = state.lock().map_err(|e| e.to_string())?;
+    s.vault_manager.has_app_password(profile_id, &key)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn vault_get_app_password(state: State<'_, Mutex<AppState>>, profile_id: i64, key: String, master: String) -> Result<Option<String>, String> {
+    let s = state.lock().map_err(|e| e.to_string())?;
+    s.vault_manager.get_app_password(profile_id, &key, &master)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn vault_set_app_password(state: State<'_, Mutex<AppState>>, profile_id: i64, key: String, label: String, password: String, master: String) -> Result<(), String> {
+    let s = state.lock().map_err(|e| e.to_string())?;
+    s.vault_manager.set_app_password(profile_id, &key, &label, &password, &master)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn change_password_manager_master(state: State<'_, Mutex<AppState>>, profile_id: i64, old_password: String, new_password: String) -> Result<(), String> {
+    let s = state.lock().map_err(|e| e.to_string())?;
+    s.vault_manager.change_master(profile_id, KIND_PASSWORD, &old_password, &new_password)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn change_otp_master(state: State<'_, Mutex<AppState>>, profile_id: i64, old_password: String, new_password: String) -> Result<(), String> {
+    let s = state.lock().map_err(|e| e.to_string())?;
+    s.vault_manager.change_master(profile_id, KIND_OTP, &old_password, &new_password)
 }
 
 #[tauri::command(rename_all = "camelCase")]

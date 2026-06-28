@@ -4,6 +4,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { invoke } from '../lib/tauri';
 import { RightDockPanel } from '../lib/rightDock';
+import { VaultAutofill } from './VaultAutofill';
 
 export interface OTPEntry {
   id: number;
@@ -265,6 +266,11 @@ export function OTPAuthenticator({ profileId, isOpen, onClose }: OTPAuthenticato
                 >
                   {hasMasterPassword ? 'Unlock' : 'Create Password'}
                 </button>
+                {hasMasterPassword && (
+                  <div className="mt-3 flex justify-center">
+                    <VaultAutofill profileId={profileId} appKey="authenticator" onFill={pw => setMasterPassword(pw)} />
+                  </div>
+                )}
               </div>
             </div>
           </div>

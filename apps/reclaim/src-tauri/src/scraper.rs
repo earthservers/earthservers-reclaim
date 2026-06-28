@@ -23,6 +23,10 @@ pub struct ScrapingJob {
     pub last_run_at: Option<String>,
     pub pages_scraped: i32,
     pub created_at: String,
+    /// Opt-in: also journal each scraped page into EarthMemory (the AI knowledge
+    /// graph), so the assistant can use it.
+    #[serde(default)]
+    pub add_to_ai: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,10 +71,14 @@ pub fn init_scraper_tables(conn: &Connection) -> Result<()> {
             status TEXT DEFAULT 'pending',
             last_run_at TEXT,
             pages_scraped INTEGER DEFAULT 0,
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            add_to_ai INTEGER DEFAULT 0
         )",
         [],
     )?;
+    // Migrate older DBs that predate the opt-in AI-memory flag (ignore the error
+    // when the column already exists).
+    let _ = conn.execute("ALTER TABLE scraping_jobs ADD COLUMN add_to_ai INTEGER DEFAULT 0", []);
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS scraped_pages (
@@ -102,6 +110,7 @@ pub fn init_scraper_tables(conn: &Connection) -> Result<()> {
 
 // ==================== Manager ====================
 
+#[derive(Clone)]
 pub struct ScraperManager {
     db_path: String,
 }
@@ -125,15 +134,16 @@ impl ScraperManager {
         max_depth: i32,
         max_pages: i32,
         content_selectors: Vec<ContentSelector>,
+        add_to_ai: bool,
     ) -> Result<i64> {
         let conn = Connection::open(&self.db_path)?;
         let now = chrono::Utc::now().to_rfc3339();
         let selectors_json = serde_json::to_string(&content_selectors).unwrap_or_default();
 
         conn.execute(
-            "INSERT INTO scraping_jobs (profile_id, name, base_url, url_pattern, max_depth, max_pages, content_selectors, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![profile_id, name, base_url, url_pattern, max_depth, max_pages, selectors_json, now],
+            "INSERT INTO scraping_jobs (profile_id, name, base_url, url_pattern, max_depth, max_pages, content_selectors, created_at, add_to_ai)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![profile_id, name, base_url, url_pattern, max_depth, max_pages, selectors_json, now, add_to_ai as i64],
         )?;
 
         Ok(conn.last_insert_rowid())
@@ -144,7 +154,7 @@ impl ScraperManager {
         let conn = Connection::open(&self.db_path)?;
         let mut stmt = conn.prepare(
             "SELECT id, profile_id, name, base_url, url_pattern, max_depth, max_pages,
-                    content_selectors, schedule_cron, status, last_run_at, pages_scraped, created_at
+                    content_selectors, schedule_cron, status, last_run_at, pages_scraped, created_at, add_to_ai
              FROM scraping_jobs
              WHERE profile_id = ?1
              ORDER BY created_at DESC"
@@ -168,6 +178,7 @@ impl ScraperManager {
                 last_run_at: row.get(10)?,
                 pages_scraped: row.get(11)?,
                 created_at: row.get(12)?,
+                add_to_ai: row.get::<_, i64>(13).unwrap_or(0) != 0,
             })
         })?;
 
@@ -180,7 +191,7 @@ impl ScraperManager {
 
         conn.query_row(
             "SELECT id, profile_id, name, base_url, url_pattern, max_depth, max_pages,
-                    content_selectors, schedule_cron, status, last_run_at, pages_scraped, created_at
+                    content_selectors, schedule_cron, status, last_run_at, pages_scraped, created_at, add_to_ai
              FROM scraping_jobs WHERE id = ?1",
             params![job_id],
             |row| {
@@ -201,6 +212,7 @@ impl ScraperManager {
                     last_run_at: row.get(10)?,
                     pages_scraped: row.get(11)?,
                     created_at: row.get(12)?,
+                    add_to_ai: row.get::<_, i64>(13).unwrap_or(0) != 0,
                 })
             },
         )
@@ -351,6 +363,30 @@ impl ScraperManager {
                         } else {
                             pages_scraped += 1;
                             self.update_job_status(job_id, "running", pages_scraped).ok();
+
+                            // Opt-in: also journal into EarthMemory so the assistant
+                            // can use it. Best-effort summary (skipped if Ollama is
+                            // down); only a small excerpt is stored, like the curator.
+                            if job.add_to_ai {
+                                let summary = crate::ai::summarize(
+                                    title.as_deref().unwrap_or(""),
+                                    &text_content,
+                                )
+                                .await;
+                                let excerpt: String = text_content
+                                    .split_whitespace()
+                                    .take(160)
+                                    .collect::<Vec<_>>()
+                                    .join(" ");
+                                let _ = crate::memory::MemoryManager::new(self.db_path.clone())
+                                    .journal_page(
+                                        &url,
+                                        title.as_deref().unwrap_or(&url),
+                                        Some(&excerpt),
+                                        summary.as_deref(),
+                                        job.profile_id,
+                                    );
+                            }
                         }
 
                         // Extract links for crawling

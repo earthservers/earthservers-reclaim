@@ -236,6 +236,28 @@ impl ControlsServer {
 /// Global controls server instance
 lazy_static::lazy_static! {
     pub static ref CONTROLS_SERVER: Arc<ControlsServer> = Arc::new(ControlsServer::new(9876));
+    /// Which player the floating controls currently drive. The status-broadcast
+    /// loop reads this each tick and the controls echo it back on commands, so
+    /// updating it (via `set_active_player_id`) retargets the controls to the
+    /// focused pane. Defaults to the first pane.
+    static ref ACTIVE_PLAYER_ID: std::sync::RwLock<String> =
+        std::sync::RwLock::new("pane-0".to_string());
+}
+
+/// Set the player the floating controls drive (called from the frontend when the
+/// focused pane changes).
+pub fn set_active_player_id(id: String) {
+    if let Ok(mut g) = ACTIVE_PLAYER_ID.write() {
+        *g = id;
+    }
+}
+
+/// Current active player id for the controls (defaults to "pane-0").
+pub fn get_active_player_id() -> String {
+    ACTIVE_PLAYER_ID
+        .read()
+        .map(|g| g.clone())
+        .unwrap_or_else(|_| "pane-0".to_string())
 }
 
 /// Initialize and start the controls server

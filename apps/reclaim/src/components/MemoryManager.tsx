@@ -37,9 +37,13 @@ interface MemoryStats {
 
 interface MemoryManagerProps {
   profileId: number | null;
+  // Opens a URL in the in-app browser (Search service). Used to make indexed
+  // history entries clickable — they navigate Reclaim's own search rather than
+  // the OS browser.
+  onOpenUrl?: (url: string) => void;
 }
 
-export function MemoryManager({ profileId }: MemoryManagerProps) {
+export function MemoryManager({ profileId, onOpenUrl }: MemoryManagerProps) {
   const [pages, setPages] = useState<IndexedPage[]>([]);
   const [stats, setStats] = useState<MemoryStats | null>(null);
   const [tags, setTags] = useState<string[]>([]);
@@ -438,7 +442,13 @@ export function MemoryManager({ profileId }: MemoryManagerProps) {
                       </svg>
                     )}
                   </div>
-                  <div className="text-sm text-gray-400 truncate">{page.url}</div>
+                  <button
+                    onClick={(e) => { e.stopPropagation(); onOpenUrl?.(page.url); }}
+                    title="Open in search"
+                    className="block max-w-full text-left text-sm text-theme-secondary hover:underline truncate"
+                  >
+                    {page.url}
+                  </button>
                   <div className="flex items-center gap-3 mt-1 text-xs text-gray-500">
                     <span>{page.visit_count} visits</span>
                     <span>•</span>
@@ -580,9 +590,13 @@ export function MemoryManager({ profileId }: MemoryManagerProps) {
                       </svg>
                     </button>
                   </div>
-                  <a href={selectedPage.url} target="_blank" rel="noopener noreferrer" className="text-sm text-theme-secondary hover:underline truncate block">
+                  <button
+                    onClick={() => { const url = selectedPage.url; setSelectedPage(null); onOpenUrl?.(url); }}
+                    title="Open in search"
+                    className="block max-w-full text-left text-sm text-theme-secondary hover:underline truncate"
+                  >
                     {selectedPage.url}
-                  </a>
+                  </button>
                 </div>
                 <button
                   onClick={() => setSelectedPage(null)}

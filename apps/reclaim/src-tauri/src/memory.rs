@@ -217,6 +217,31 @@ impl MemoryManager {
         Ok(())
     }
 
+    /// Whether `url` already has a non-empty auto summary that's still fresh
+    /// (last visited within `within_secs`). Lets the curator skip re-fetching and
+    /// re-summarizing a page the user just keeps revisiting. last_visited is
+    /// stored as unix-epoch seconds (see chrono_now), so compare numerically.
+    pub fn curated_recently(&self, url: &str, profile_id: i64, within_secs: i64) -> bool {
+        let conn = match Connection::open(&self.db_path) {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let cutoff = now - within_secs;
+        conn.query_row(
+            "SELECT 1 FROM indexed_pages
+             WHERE url = ?1 AND profile_id = ?2
+               AND summary IS NOT NULL AND summary != ''
+               AND CAST(last_visited AS INTEGER) >= ?3",
+            params![url, profile_id, cutoff],
+            |_| Ok(()),
+        )
+        .is_ok()
+    }
+
     /// Get page by ID
     fn get_page_by_id(&self, id: i64) -> Result<IndexedPage> {
         let conn = Connection::open(&self.db_path)?;

@@ -271,6 +271,15 @@ pub async fn player_expose(
     GLOBAL_PLAYER_MANAGER.expose(&player_id).map_err(|e| e.to_string())
 }
 
+/// Set which player the floating media controls drive. The frontend calls this
+/// whenever the focused pane changes, so the controls' status display and its
+/// commands follow the active pane instead of being stuck on pane-0.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn set_active_media_player(player_id: String) -> Result<(), String> {
+    crate::controls_server::set_active_player_id(player_id);
+    Ok(())
+}
+
 /// Get the X11 window ID (XID) for embedding video
 /// This is Linux/X11 specific - returns error on other platforms or Wayland
 ///

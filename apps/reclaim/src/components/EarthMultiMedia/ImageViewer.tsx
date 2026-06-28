@@ -377,7 +377,12 @@ export function ImageViewer({
           top: '50%',
           marginLeft: `-${state.naturalWidth / 2}px`,
           marginTop: `-${state.naturalHeight / 2}px`,
-          transition: 'none', // no animation on photo change (or zoom/pan)
+          // Stay hidden until the freshly-loaded image has been fitted (scale +
+          // centering applied in handleImageLoad's single setState). Otherwise the
+          // new photo paints once at natural size, top-left, before the fit lands —
+          // the "spawn full size then snap to fit" flash on each slideshow change.
+          opacity: state.isLoading ? 0 : 1,
+          transition: 'opacity 120ms ease-out', // only opacity; transform never animates
         }}
         onLoad={handleImageLoad}
         onError={handleImageError}

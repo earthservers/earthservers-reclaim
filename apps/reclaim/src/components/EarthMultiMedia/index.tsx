@@ -57,13 +57,27 @@ interface SlideshowSettings {
   mode: SlideshowMode;
 }
 
-// Media tab for consolidating/separating instances
+// A media tab is an independent workspace (browser-style): its own queue, pane
+// contents, layout, and playback focus. Only the active tab's state is "live"
+// (mounted players); switching tabs snapshots the current tab and restores the
+// target, so each tab's media/queue is hidden when you switch away from it.
 interface MediaTab {
   id: string;
   title: string;
-  mediaItem: MediaItem | null;
-  paneIndex: number; // which pane this tab is assigned to (-1 if not in a pane)
+  queue: QueueItem[];
+  mediaItems: (MediaItem | null)[];
+  paneStates: PaneState[];
+  layout: ViewLayout;
+  activePane: number;
+  playedItems: string[]; // QueueItem ids already played (Set serialized for storage)
 }
+
+const emptyPaneStates = (): PaneState[] => [
+  { currentItem: null, isPlaying: false, currentTime: 0, duration: 0 },
+  { currentItem: null, isPlaying: false, currentTime: 0, duration: 0 },
+  { currentItem: null, isPlaying: false, currentTime: 0, duration: 0 },
+  { currentItem: null, isPlaying: false, currentTime: 0, duration: 0 },
+];
 
 interface PrivacySettings {
   profile_id: number;
@@ -106,15 +120,16 @@ interface EarthMultiMediaProps {
 }
 
 // Detect media type from URL/path
+const VIDEO_EXTS = ['mp4', 'webm', 'ogg', 'mov', 'avi', 'mkv', 'm4v'];
+const IMAGE_EXTS = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'svg', 'ico'];
+const AUDIO_EXTS = ['mp3', 'wav', 'ogg', 'flac', 'm4a', 'aac'];
+
 function detectMediaType(source: string): MediaType {
   const ext = source.split('.').pop()?.toLowerCase() || '';
-  const videoExts = ['mp4', 'webm', 'ogg', 'mov', 'avi', 'mkv', 'm4v'];
-  const imageExts = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'svg', 'ico'];
-  const audioExts = ['mp3', 'wav', 'ogg', 'flac', 'm4a', 'aac'];
 
-  if (videoExts.includes(ext)) return 'video';
-  if (imageExts.includes(ext)) return 'image';
-  if (audioExts.includes(ext)) return 'audio';
+  if (VIDEO_EXTS.includes(ext)) return 'video';
+  if (IMAGE_EXTS.includes(ext)) return 'image';
+  if (AUDIO_EXTS.includes(ext)) return 'audio';
 
   // Check URL patterns
   if (source.includes('youtube.com') || source.includes('youtu.be') || source.includes('vimeo.com')) {
@@ -122,6 +137,14 @@ function detectMediaType(source: string): MediaType {
   }
 
   return 'video'; // Default to video
+}
+
+// Whether a filename has a recognised media extension. Unlike detectMediaType
+// (which defaults unknown names to 'video'), this returns false for anything
+// without a known extension — used to filter folder contents on drop.
+function isMediaFile(name: string): boolean {
+  const ext = name.split('.').pop()?.toLowerCase() || '';
+  return VIDEO_EXTS.includes(ext) || IMAGE_EXTS.includes(ext) || AUDIO_EXTS.includes(ext);
 }
 
 // Persists media UI state ACROSS REMOUNTS. Switching to the Search tab unmounts
@@ -138,6 +161,13 @@ const mediaStateCache: {
   queue?: QueueItem[];
   slideshow?: SlideshowSettings;
 } = {};
+
+// Whether we've already auto-prompted for a media password this app session.
+// The prompt is a full-screen overlay, and EarthMultiMedia remounts every time
+// you return to the Media tab — without this guard the modal re-opens on each
+// return (its dialog hidden behind the native video surfaces), blacking out and
+// blocking the whole UI while videos keep playing.
+let mediaPasswordPrompted = false;
 
 export function EarthMultiMedia({ profileId, initialSource, initialType, onFullscreenChange }: EarthMultiMediaProps & { onFullscreenChange?: (isFullscreen: boolean) => void }) {
   // State
@@ -176,6 +206,9 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
   // Queue management for multi-pane playback
   const [queue, setQueue] = useState<QueueItem[]>(() => mediaStateCache.queue ?? []);
   const [playedItems, setPlayedItems] = useState<Set<string>>(new Set());
+  // Drag-to-reorder state for the (temporary) queue list.
+  const [queueDragIndex, setQueueDragIndex] = useState<number | null>(null);
+  const [queueDropIndex, setQueueDropIndex] = useState<number | null>(null);
 
   // Per-pane state tracking
   const [paneStates, setPaneStates] = useState<PaneState[]>([
@@ -201,11 +234,33 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
   const staggerPaneRef = useRef(0);
 
   // Media tabs state for consolidating/separating instances
-  const [mediaTabs, setMediaTabs] = useState<MediaTab[]>([]);
-  const [activeTabId, setActiveTabId] = useState<string | null>(null);
-  const [draggingTab, setDraggingTab] = useState<MediaTab | null>(null);
-  const [dropZone, setDropZone] = useState<'tab-bar' | 'pane' | number | null>(null);
+  // Workspace tabs. The first tab mirrors the initial (cached) working state;
+  // all other tabs are independent sessions. The currently-active tab's data is
+  // the live working state above (queue/mediaItems/paneStates/layout/...).
+  const [mediaTabs, setMediaTabs] = useState<MediaTab[]>(() => [{
+    id: 'tab-1',
+    title: 'Tab 1',
+    queue: mediaStateCache.queue ?? [],
+    mediaItems: mediaStateCache.mediaItems ?? [null, null, null, null],
+    paneStates: emptyPaneStates(),
+    layout: mediaStateCache.layout ?? 'single',
+    activePane: 0,
+    playedItems: [],
+  }]);
+  const [activeTabId, setActiveTabId] = useState<string>('tab-1');
   const tabIdCounter = useRef(0);
+
+  // Refs to each pane container, used to hit-test OS file drops against pane
+  // bounds. Native (Tauri) drag-drop only reports a window position, not the
+  // DOM element under the cursor — and the video panes render as native
+  // GStreamer surfaces over the DOM, so HTML5 onDrop never fires for them.
+  // We therefore resolve the target pane geometrically at drop time.
+  const paneRefs = useRef<Array<HTMLDivElement | null>>([]);
+  // Pane currently highlighted by an in-progress OS file drag-over (null = none).
+  const [osDropPane, setOsDropPane] = useState<number | null>(null);
+  // Mirror of activePane for use inside stable native-event listeners.
+  const activePaneRef = useRef(0);
+  activePaneRef.current = activePane;
 
   // Mirror persistent UI state into the module cache so it survives a remount
   // (switch to Search and back). The players keep running in the backend; this
@@ -281,6 +336,11 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
 
   // Track which player is currently active (last clicked/interacted with)
   const [activePlayerId, setActivePlayerId] = useState<string>('pane-0');
+  // Mirror so the (mount-only) control-action listener targets the CURRENT active
+  // player instead of the value captured at mount — without it the floating
+  // controls always drove pane-0.
+  const activePlayerIdRef = useRef(activePlayerId);
+  activePlayerIdRef.current = activePlayerId;
   const floatingControlsCreatedRef = useRef(false);
   const playerStatusesRef = useRef(playerStatuses);
   // Mirror of mediaItems so the slideshow tick can read current pane contents
@@ -294,6 +354,22 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
   useEffect(() => {
     mediaItemsRef.current = mediaItems;
   }, [mediaItems]);
+
+  // The floating controls follow the focused pane. Clicking any pane updates
+  // activePane (DOM click handler / native video-surface-clicked / tab restore);
+  // mirror that into activePlayerId so the controls retarget to that pane's
+  // player. Each pane's playerId is `pane-${index}`.
+  useEffect(() => {
+    setActivePlayerId(`pane-${activePane}`);
+  }, [activePane]);
+
+  // Tell the backend which player the floating controls should drive. The
+  // controls talk to a WebSocket server that broadcasts ONE player's status and
+  // routes commands to it — so without this the controls are stuck on pane-0.
+  useEffect(() => {
+    if (!isTauri()) return;
+    invoke('set_active_media_player', { playerId: activePlayerId }).catch(() => {});
+  }, [activePlayerId]);
 
   // Create X11 webview controls window with HTML controls
   // This creates a GTK window with WebKitGTK that loads the /media-controls route
@@ -317,7 +393,7 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
         if (!mounted) return;
 
         const { action, playerId, volume, time } = event.payload;
-        const targetPlayerId = playerId || activePlayerId;
+        const targetPlayerId = playerId || activePlayerIdRef.current;
 
         console.log('[EarthMultiMedia] Control action:', action, 'for player:', targetPlayerId);
 
@@ -367,10 +443,11 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
         console.log('[EarthMultiMedia] Controls ready, sending initial state');
         // Use ref to get fresh state (closure would have stale data)
         const currentStatuses = playerStatusesRef.current;
-        const status = currentStatuses[activePlayerId];
+        const activeId = activePlayerIdRef.current;
+        const status = currentStatuses[activeId];
         if (status) {
           emitTo('media-controls', 'media-state-update', {
-            playerId: activePlayerId,
+            playerId: activeId,
             isPlaying: status.isPlaying,
             currentTime: status.currentTime * 1000,
             duration: status.duration * 1000,
@@ -486,88 +563,99 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
     return `tab-${Date.now()}-${tabIdCounter.current}`;
   }, []);
 
-  // Create a new tab from a media item
-  const createTab = useCallback((mediaItem: MediaItem | null, paneIndex: number = -1): MediaTab => {
-    const title = mediaItem?.title || mediaItem?.source?.split('/').pop() || 'New Tab';
-    return {
-      id: generateTabId(),
-      title,
-      mediaItem,
-      paneIndex,
-    };
-  }, [generateTabId]);
+  // A readable title for a tab from its first loaded media (or first queue item).
+  const sessionTitle = (items: (MediaItem | null)[], q: QueueItem[]): string => {
+    const first = (items.find(Boolean) as MediaItem | undefined);
+    const src = first?.title || first?.source || q[0]?.title || q[0]?.source;
+    return src ? (src.split('/').pop() || src) : 'Empty Tab';
+  };
 
-  // Add a new tab
-  const addTab = useCallback((mediaItem: MediaItem | null = null) => {
-    const newTab = createTab(mediaItem);
-    setMediaTabs(prev => [...prev, newTab]);
-    setActiveTabId(newTab.id);
-    return newTab;
-  }, [createTab]);
-
-  // Remove a tab
-  const removeTab = useCallback((tabId: string) => {
-    setMediaTabs(prev => {
-      const filtered = prev.filter(t => t.id !== tabId);
-      // If we removed the active tab, activate another one
-      if (activeTabId === tabId && filtered.length > 0) {
-        setActiveTabId(filtered[filtered.length - 1].id);
-      } else if (filtered.length === 0) {
-        setActiveTabId(null);
+  // Stop the native players backing the CURRENT panes — call before swapping the
+  // visible tab so the previous tab's video/audio doesn't keep playing underneath.
+  const stopCurrentPlayers = () => {
+    mediaItems.forEach((m, i) => {
+      if (m && (m.type === 'video' || m.type === 'audio')) {
+        const playerId = `pane-${i}`;
+        invoke('player_stop', { playerId }).catch(() => {});
+        invoke('hide_video_surface', { playerId }).catch(() => {});
       }
-      return filtered;
     });
-  }, [activeTabId]);
+  };
 
-  // Assign tab to a pane
-  const assignTabToPane = useCallback((tabId: string, paneIndex: number) => {
-    setMediaTabs(prev => prev.map(tab => {
-      if (tab.id === tabId) {
-        // Update mediaItems when assigning to pane
-        if (tab.mediaItem) {
-          setMediaItems(items => {
-            const newItems = [...items];
-            newItems[paneIndex] = tab.mediaItem;
-            return newItems;
-          });
-        }
-        return { ...tab, paneIndex };
-      }
-      // Remove other tabs from this pane
-      if (tab.paneIndex === paneIndex) {
-        return { ...tab, paneIndex: -1 };
-      }
-      return tab;
-    }));
-    setActiveTabId(tabId);
-  }, []);
+  // Pane states with each video/audio pane's LIVE playback position and play
+  // state folded in (from the player status poller). Captured at snapshot time so
+  // a tab restores to exactly where it was paused/playing. currentTime is seconds.
+  const livePaneStates = (): PaneState[] => paneStates.map((ps, i) => {
+    const st = playerStatusesRef.current[`pane-${i}`];
+    return st ? { ...ps, currentTime: st.currentTime, isPlaying: st.isPlaying } : ps;
+  });
 
-  // Unassign tab from pane (make it floating in tab bar)
-  const unassignTabFromPane = useCallback((tabId: string) => {
-    setMediaTabs(prev => prev.map(tab =>
-      tab.id === tabId ? { ...tab, paneIndex: -1 } : tab
-    ));
-  }, []);
+  // Fold the live working state back into the active tab's stored snapshot.
+  const snapshotActive = (tabs: MediaTab[]): MediaTab[] => {
+    const live = livePaneStates();
+    return tabs.map(t => t.id === activeTabId
+      ? { ...t, queue, mediaItems, paneStates: live, layout, activePane, playedItems: [...playedItems], title: sessionTitle(mediaItems, queue) }
+      : t);
+  };
 
-  // Handle tab drag start
-  const handleTabDragStart = useCallback((tab: MediaTab) => {
-    setDraggingTab(tab);
-  }, []);
+  // Make a stored tab the live working state.
+  const loadSession = (s: MediaTab) => {
+    setQueue(s.queue);
+    setMediaItems(s.mediaItems);
+    setPaneStates(s.paneStates);
+    setLayout(s.layout);
+    setActivePane(s.activePane);
+    setPlayedItems(new Set(s.playedItems));
+  };
 
-  // Handle tab drag end
-  const handleTabDragEnd = useCallback(() => {
-    if (draggingTab && dropZone !== null) {
-      if (typeof dropZone === 'number') {
-        // Dropped on a pane
-        assignTabToPane(draggingTab.id, dropZone);
-      } else if (dropZone === 'tab-bar') {
-        // Dropped back on tab bar - unassign from pane
-        unassignTabFromPane(draggingTab.id);
-      }
+  // Switch to another tab: snapshot the current one, reveal the target's queue
+  // and panes (the previous tab's media is now hidden / unmounted).
+  const switchToTab = (id: string) => {
+    if (id === activeTabId) return;
+    const target = mediaTabs.find(t => t.id === id);
+    if (!target) return;
+    stopCurrentPlayers();
+    setMediaTabs(prev => snapshotActive(prev));
+    loadSession(target);
+    setActiveTabId(id);
+  };
+
+  // New tab: snapshot the current one, then open a fresh empty workspace (empty
+  // queue + empty panes), keeping the current layout.
+  const addTab = () => {
+    stopCurrentPlayers();
+    const fresh: MediaTab = {
+      id: generateTabId(),
+      title: 'New Tab',
+      queue: [],
+      mediaItems: [null, null, null, null],
+      paneStates: emptyPaneStates(),
+      layout,
+      activePane: 0,
+      playedItems: [],
+    };
+    setMediaTabs(prev => [...snapshotActive(prev), fresh]);
+    loadSession(fresh);
+    setActiveTabId(fresh.id);
+  };
+
+  // Close a tab. Closing the active tab reveals a neighbour; the last tab can't
+  // be closed (there's always one workspace).
+  const removeTab = (id: string) => {
+    if (mediaTabs.length <= 1) return;
+    const idx = mediaTabs.findIndex(t => t.id === id);
+    const filtered = mediaTabs.filter(t => t.id !== id);
+    if (id === activeTabId) {
+      stopCurrentPlayers();
+      const next = filtered[Math.min(idx, filtered.length - 1)];
+      setMediaTabs(filtered);
+      loadSession(next);
+      setActiveTabId(next.id);
+    } else {
+      // Background tab: keep the active tab's snapshot fresh, just drop the one.
+      setMediaTabs(snapshotActive(filtered));
     }
-    setDraggingTab(null);
-    setDropZone(null);
-  }, [draggingTab, dropZone, assignTabToPane, unassignTabFromPane]);
+  };
 
   // Media password state (separate from bookmarks)
   const [showPasswordSetupModal, setShowPasswordSetupModal] = useState(false);
@@ -670,6 +758,17 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
     return newItems;
   }, []);
 
+  // Move a queue item from one position to another (drag-to-reorder).
+  const reorderQueue = useCallback((from: number, to: number) => {
+    setQueue(prev => {
+      if (from === to || from < 0 || to < 0 || from >= prev.length || to >= prev.length) return prev;
+      const updated = [...prev];
+      const [moved] = updated.splice(from, 1);
+      updated.splice(to, 0, moved);
+      return updated;
+    });
+  }, []);
+
   // Get next unplayed item from queue
   const getNextUnplayedItem = useCallback((shuffle: boolean, excludeIds: Set<string> = new Set()): QueueItem | null => {
     const unplayed = queue.filter(item => !playedItems.has(item.id) && !excludeIds.has(item.id));
@@ -694,6 +793,34 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
         return 1;
     }
   }, []);
+
+  // Change layout and, when it exposes more panes, fill the newly-visible empty
+  // panes from the queue (unplayed items not already showing). This is why
+  // switching single -> quad now populates panes 2..N instead of leaving them empty.
+  const changeLayout = useCallback((l: ViewLayout) => {
+    setLayout(l);
+    const maxPanes = getMaxPanesForLayout(l);
+    const newItems = [...mediaItemsRef.current];
+    const showing = new Set(newItems.map(m => m?.source).filter(Boolean) as string[]);
+    const candidates = queue.filter(it => !playedItems.has(it.id) && !showing.has(it.source));
+    let ci = 0;
+    const updates: { index: number; item: QueueItem }[] = [];
+    for (let i = 0; i < maxPanes; i++) {
+      if (newItems[i] == null && ci < candidates.length) {
+        const item = candidates[ci++];
+        newItems[i] = { source: item.source, type: item.type, title: item.title };
+        updates.push({ index: i, item });
+      }
+    }
+    if (updates.length > 0) {
+      setMediaItems(newItems);
+      setPaneStates(prev => {
+        const u = [...prev];
+        updates.forEach(({ index, item }) => { u[index] = { ...u[index], currentItem: item, isPlaying: true }; });
+        return u;
+      });
+    }
+  }, [getMaxPanesForLayout, queue, playedItems]);
 
   // Assign next item to a specific pane
   const assignNextToPaneIndex = useCallback((paneIndex: number) => {
@@ -934,24 +1061,104 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
   }, [layout, slideshow.mode, setSlideshowMode]);
 
   // Initialize queue from files (for "Open with" functionality)
-  const initializeFromFiles = useCallback((files: Array<{ source: string; title?: string }>) => {
+  const initializeFromFiles = useCallback((files: Array<{ source: string; title?: string }>, startPaneIndex: number = 0) => {
     const newItems = addToQueue(files);
+    if (newItems.length === 0) return;
     const maxPanes = getMaxPanesForLayout(layout);
+    const current = mediaItemsRef.current;
 
-    // Assign items to panes
-    newItems.slice(0, maxPanes).forEach((item, index) => {
-      setPaneStates(prev => {
-        const updated = [...prev];
-        updated[index] = { ...updated[index], currentItem: item, isPlaying: true };
-        return updated;
+    // New media only fills EMPTY panes. If the relevant panes already hold
+    // content, the items just stay queued (and autoplay into a pane as each video
+    // there finishes — media-ended-pane-* -> assignNextToPaneIndex). A batch fills
+    // the empty panes left-to-right (pane 1..N); a single file prefers the
+    // targeted (dropped-on) pane when it's empty.
+    let targetPanes: number[];
+    if (newItems.length === 1) {
+      const t = Math.max(0, Math.min(startPaneIndex, maxPanes - 1));
+      targetPanes = current[t] == null ? [t] : [];
+    } else {
+      targetPanes = [];
+      for (let i = 0; i < maxPanes; i++) if (current[i] == null) targetPanes.push(i);
+    }
+
+    // Pair each empty pane with the next new item (extras stay in the queue).
+    const assignments = targetPanes
+      .map((paneIndex, k) => ({ paneIndex, item: newItems[k] }))
+      .filter(a => a.item);
+    if (assignments.length === 0) return;
+
+    // Apply all assignments in one batched update so the 4 panes mount together
+    // with the final quad layout already settled (stable surface bounds).
+    setPaneStates(prev => {
+      const updated = [...prev];
+      assignments.forEach(({ paneIndex, item }) => {
+        updated[paneIndex] = { ...updated[paneIndex], currentItem: item, isPlaying: true };
       });
-      setMediaItems(prev => {
-        const updated = [...prev];
-        updated[index] = { source: item.source, type: item.type, title: item.title };
-        return updated;
+      return updated;
+    });
+    setMediaItems(prev => {
+      const updated = [...prev];
+      assignments.forEach(({ paneIndex, item }) => {
+        updated[paneIndex] = { source: item.source, type: item.type, title: item.title };
       });
+      return updated;
     });
   }, [addToQueue, layout, getMaxPanesForLayout]);
+
+  // Expand a list of dropped OS paths into media files. A dropped directory is
+  // read one level deep (its own files only, no subfolders) and its media files
+  // are returned sorted by name; a dropped file passes through unchanged. This
+  // is why a folder of pictures no longer loads as a single (mis-detected) video.
+  const expandDroppedPaths = useCallback(async (paths: string[]): Promise<Array<{ source: string; title?: string }>> => {
+    const { stat, readDir } = await import('@tauri-apps/plugin-fs');
+    const out: Array<{ source: string; title?: string }> = [];
+
+    for (const path of paths) {
+      let isDir = false;
+      try {
+        isDir = (await stat(path)).isDirectory;
+      } catch {
+        // If we can't stat it, treat it as a plain file path below.
+      }
+
+      if (isDir) {
+        try {
+          const sep = path.includes('\\') ? '\\' : '/';
+          const base = path.endsWith(sep) ? path.slice(0, -1) : path;
+          const entries = await readDir(path); // top level only — never recurses
+          entries
+            .filter(e => e.isFile && isMediaFile(e.name))
+            .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' }))
+            .forEach(e => out.push({ source: `file://${base}${sep}${e.name}`, title: e.name }));
+        } catch (err) {
+          console.error('Failed to read dropped folder:', path, err);
+        }
+      } else {
+        out.push({
+          source: path.startsWith('file://') ? path : `file://${path}`,
+          title: path.split('/').pop() || path.split('\\').pop(),
+        });
+      }
+    }
+
+    return out;
+  }, []);
+
+  // Hit-test a viewport (client) point against each visible pane's bounds and
+  // return the pane index under it, or -1 if none. Used to route OS file drops
+  // to the pane the cursor is actually over.
+  const hitTestPane = useCallback((clientX: number, clientY: number): number => {
+    const maxPanes = getMaxPanesForLayout(layout);
+    for (let i = 0; i < maxPanes; i++) {
+      const el = paneRefs.current[i];
+      if (!el) continue;
+      const r = el.getBoundingClientRect();
+      if (clientX >= r.left && clientX <= r.right && clientY >= r.top && clientY <= r.bottom) {
+        return i;
+      }
+    }
+    return -1;
+  }, [layout, getMaxPanesForLayout]);
 
   // Listen for playback updates from VideoPlayer
   useEffect(() => {
@@ -988,16 +1195,45 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
     const unlisteners: Array<() => void> = [];
     const track = (u: () => void) => { if (cancelled) u(); else unlisteners.push(u); };
 
+    // Tauri reports native drag positions in *physical* pixels relative to the
+    // webview's top-left; getBoundingClientRect() works in CSS (client) pixels.
+    // Divide by the device pixel ratio to bring them into the same space.
+    const toClientPoint = (position?: { x: number; y: number }) => {
+      if (!position) return null;
+      const dpr = window.devicePixelRatio || 1;
+      return { x: position.x / dpr, y: position.y / dpr };
+    };
+
     const setupFileOpenListener = async () => {
       try {
+        // Highlight the pane under the cursor while an OS file is dragged over
+        // the window. Position-only events (no element), so we hit-test bounds.
+        const unlistenDragOver = await listen<{ position?: { x: number; y: number } }>('tauri://drag-over', (event) => {
+          const point = toClientPoint(event.payload?.position);
+          if (!point) return;
+          const pane = hitTestPane(point.x, point.y);
+          setOsDropPane(pane >= 0 ? pane : null);
+        });
+
+        const unlistenDragLeave = await listen('tauri://drag-leave', () => {
+          setOsDropPane(null);
+        });
+
         // Listen for OS file-drop events (Tauri v2 renamed this from 'tauri://file-drop').
-        const unlistenDrop = await listen<{ paths: string[] }>('tauri://drag-drop', (event) => {
+        const unlistenDrop = await listen<{ paths: string[]; position?: { x: number; y: number } }>('tauri://drag-drop', (event) => {
+          setOsDropPane(null);
           if (event.payload.paths && event.payload.paths.length > 0) {
-            const files = event.payload.paths.map(path => ({
-              source: path.startsWith('file://') ? path : `file://${path}`,
-              title: path.split('/').pop() || path.split('\\').pop(),
-            }));
-            initializeFromFiles(files);
+            // Route the drop to the pane under the cursor; fall back to the
+            // active pane when the point matches none (e.g. dropped on chrome).
+            // Resolve the target pane synchronously, before any async folder
+            // expansion, so it reflects the cursor position at drop time.
+            const point = toClientPoint(event.payload.position);
+            const targetPane = point ? hitTestPane(point.x, point.y) : -1;
+            const startPane = targetPane >= 0 ? targetPane : activePaneRef.current;
+            // Dropped folders are expanded into their (top-level) media files.
+            expandDroppedPaths(event.payload.paths).then(files => {
+              if (files.length > 0) initializeFromFiles(files, startPane);
+            });
           }
         });
 
@@ -1023,6 +1259,8 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
           }
         });
 
+        track(unlistenDragOver);
+        track(unlistenDragLeave);
         track(unlistenDrop);
         track(unlistenOpen);
         track(unlistenCliFiles);
@@ -1037,11 +1275,12 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
       cancelled = true;
       unlisteners.forEach(u => u());
     };
-  }, [initializeFromFiles]);
+  }, [initializeFromFiles, hitTestPane, expandDroppedPaths]);
 
   // Native video surface clicks. The X11 video window renders above the DOM, so
-  // it forwards a `video-surface-clicked` event from the backend. Focus that pane
-  // (so the floating controls target it) and toggle its play/pause.
+  // it forwards a `video-surface-clicked` event from the backend. Two-stage:
+  // the first click on an unfocused pane just FOCUSES it (so the floating controls
+  // target it); clicking the already-focused pane toggles its play/pause.
   useEffect(() => {
     if (!isTauri()) return;
     let cancelled = false;
@@ -1049,9 +1288,14 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
     listen<{ playerId: string }>('video-surface-clicked', (event) => {
       const pid = event.payload.playerId;
       const idx = parseInt(pid.replace('pane-', ''), 10);
+      const alreadyActive = !isNaN(idx) && activePaneRef.current === idx;
       if (!isNaN(idx)) setActivePane(idx);
       setActivePlayerId(pid);
-      window.dispatchEvent(new CustomEvent('media-playpause-player', { detail: { playerId: pid } }));
+      // Only toggle play/pause when this pane was already the focused one — a
+      // focus click shouldn't also start/stop the video.
+      if (alreadyActive) {
+        window.dispatchEvent(new CustomEvent('media-playpause-player', { detail: { playerId: pid } }));
+      }
     }).then(u => { if (cancelled) u(); else unlisten = u; });
     return () => { cancelled = true; unlisten?.(); };
   }, []);
@@ -1072,8 +1316,12 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
     try {
       const settings = await invoke<PrivacySettings>('get_media_privacy_settings', { profileId });
       setPrivacySettings(settings);
-      // Show password setup modal if no password is set
-      if (!settings.password_hash) {
+      // Show the password setup modal if no password is set — but only ONCE per
+      // session. It's a full-screen overlay; re-prompting on every return to the
+      // Media tab blacks out and blocks the UI (the dialog hides behind the
+      // native video surfaces).
+      if (!settings.password_hash && !mediaPasswordPrompted) {
+        mediaPasswordPrompted = true;
         setShowPasswordSetupModal(true);
       }
     } catch (err) {
@@ -1149,9 +1397,6 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
     const newItems = [...mediaItems];
     newItems[paneIndex] = null;
     setMediaItems(newItems);
-
-    // Also remove any tab assigned to this pane
-    setMediaTabs(prev => prev.filter(tab => tab.paneIndex !== paneIndex));
   }, [mediaItems]);
 
   // Open media in active pane (no automatic tab creation)
@@ -1163,17 +1408,7 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
     const newItems = [...mediaItems];
     newItems[activePane] = mediaItem;
     setMediaItems(newItems);
-
-    // If there's a tab assigned to this pane, update its media item
-    const existingTab = mediaTabs.find(t => t.paneIndex === activePane);
-    if (existingTab) {
-      setMediaTabs(prev => prev.map(tab =>
-        tab.id === existingTab.id
-          ? { ...tab, mediaItem, title: title || source.split('/').pop() || 'Media' }
-          : tab
-      ));
-    }
-  }, [mediaItems, activePane, mediaTabs]);
+  }, [mediaItems, activePane]);
 
   // Listen for media-prev and media-next events (from ImageViewer arrow keys)
   useEffect(() => {
@@ -1384,43 +1619,33 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
   const renderPane = (index: number) => {
     const media = mediaItems[index];
     const isActive = activePane === index;
-    const isDropTarget = draggingTab && dropZone === index;
+    // Highlight the pane an OS file drag is currently hovering (resolved via
+    // geometric hit-testing in the Tauri drag-drop handler).
+    const isDropTarget = osDropPane === index;
 
     return (
       <div
+        ref={(el) => { paneRefs.current[index] = el; }}
         className={`relative flex-1 min-w-0 min-h-0 overflow-hidden bg-black/50 ${
           isActive && layout !== 'single' ? 'ring-2 ring-[var(--primary-color)]' : ''
         } ${layout !== 'single' && mediaItems.every(m => m === null) ? 'border border-gray-700/50' : ''} ${
           isDropTarget ? 'ring-2 ring-[var(--primary-color)] ring-dashed bg-[var(--primary-color)]/10' : ''
         }`}
         onClick={() => setActivePane(index)}
-        onDragOver={(e) => {
-          e.preventDefault();
-          e.stopPropagation();
-          setDropZone(index);
-        }}
-        onDragLeave={(e) => {
-          e.stopPropagation();
-          // Only clear if leaving to non-pane element
-          if (!e.relatedTarget || !(e.relatedTarget as HTMLElement).closest('[data-pane]')) {
-            setDropZone(null);
-          }
-        }}
-        onDrop={(e) => {
-          e.preventDefault();
-          e.stopPropagation();
-          handleTabDragEnd();
-        }}
-        data-pane={index}
       >
         {media ? (
           media.type === 'video' || media.type === 'audio' ? (
             <GStreamerVideoPlayer
-              key={`pane-${index}-${layout}`}
+              key={`pane-${index}-${layout}-${activeTabId}`}
               source={media.source}
               title={media.title}
               playerId={`pane-${index}`}
-              autoPlay={true}
+              // Resume in the tab's saved play state at its saved position when
+              // this pane is (re)mounted by a tab switch. Fresh media has
+              // isPlaying=true / currentTime=0, so it just plays from the start.
+              autoPlay={paneStates[index]?.isPlaying !== false}
+              startPositionMs={Math.floor((paneStates[index]?.currentTime || 0) * 1000)}
+              isActive={activePane === index}
               className="w-full h-full"
               hideControls={layout !== 'single'}  // Hide in multi-pane (StackedControls handles it)
               onStatusChange={handlePlayerStatusChange}
@@ -1457,23 +1682,6 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
             }`}>
               {index + 1}
             </div>
-            {/* Create tab from pane content */}
-            {media && (
-              <button
-                onClick={(e) => {
-                  e.stopPropagation();
-                  const newTab = createTab(media, index);
-                  setMediaTabs(prev => [...prev, newTab]);
-                  setActiveTabId(newTab.id);
-                }}
-                className="p-1 bg-black/50 hover:bg-black/70 rounded text-gray-400 hover:text-white transition-colors"
-                title="Create tab from this pane"
-              >
-                <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6v6m0 0v6m0-6h6m-6 0H6" />
-                </svg>
-              </button>
-            )}
           </div>
         )}
 
@@ -1482,7 +1690,7 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
         {isDropTarget && (
           <div className="absolute inset-0 flex items-center justify-center bg-[var(--primary-color)]/20 border-2 border-dashed border-[var(--primary-color)] pointer-events-none z-10">
             <div className="bg-black/70 rounded-lg px-4 py-2 text-white text-sm font-medium">
-              Drop to assign to Pane {index + 1}
+              Drop media on Pane {index + 1}
             </div>
           </div>
         )}
@@ -1522,7 +1730,7 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
                 {(['single', 'horizontal', 'vertical', 'quad'] as ViewLayout[]).map((l) => (
                   <button
                     key={l}
-                    onClick={() => setLayout(l)}
+                    onClick={() => changeLayout(l)}
                     className={`p-1.5 rounded transition-colors ${
                       layout === l ? 'bg-[var(--primary-color)]/20 text-[var(--primary-color)]' : 'text-gray-400 hover:text-white'
                     }`}
@@ -1717,92 +1925,66 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
           </button>
         </div>
 
-        {/* Media Tabs */}
-        <div
-          className={`flex items-center gap-1 flex-1 min-w-0 bg-black/20 rounded px-1 py-0.5 overflow-x-auto scrollbar-thin ${
-            draggingTab && dropZone === 'tab-bar' ? 'ring-2 ring-[var(--primary-color)]' : ''
-          }`}
-          onDragOver={(e) => {
-            e.preventDefault();
-            setDropZone('tab-bar');
-          }}
-          onDragLeave={() => setDropZone(null)}
-          onDrop={(e) => {
-            e.preventDefault();
-            handleTabDragEnd();
-          }}
-        >
-          {mediaTabs.map((tab) => (
-            <div
-              key={tab.id}
-              draggable
-              onDragStart={() => handleTabDragStart(tab)}
-              onDragEnd={handleTabDragEnd}
-              onClick={() => {
-                setActiveTabId(tab.id);
-                if (tab.paneIndex >= 0) {
-                  // Tab is assigned to a pane, focus that pane
-                  setActivePane(tab.paneIndex);
-                } else if (tab.mediaItem) {
-                  // Tab is not assigned to a pane, assign it to active pane and load media
-                  assignTabToPane(tab.id, activePane);
-                  const newItems = [...mediaItems];
-                  newItems[activePane] = tab.mediaItem;
-                  setMediaItems(newItems);
-                }
-              }}
-              className={`flex items-center gap-1.5 px-2 py-1 rounded cursor-grab active:cursor-grabbing transition-colors min-w-0 max-w-[150px] ${
-                activeTabId === tab.id
-                  ? 'bg-[var(--primary-color)]/20 text-white'
-                  : 'bg-black/30 text-gray-400 hover:text-white hover:bg-black/40'
-              } ${draggingTab?.id === tab.id ? 'opacity-50' : ''}`}
-            >
-              {/* Tab icon based on type */}
-              {tab.mediaItem?.type === 'video' && (
-                <svg className="w-3.5 h-3.5 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
-                </svg>
-              )}
-              {tab.mediaItem?.type === 'image' && (
-                <svg className="w-3.5 h-3.5 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
-                </svg>
-              )}
-              {tab.mediaItem?.type === 'audio' && (
-                <svg className="w-3.5 h-3.5 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19V6l12-3v13M9 19c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zm12-3c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zM9 10l12-3" />
-                </svg>
-              )}
-              {!tab.mediaItem && (
-                <svg className="w-3.5 h-3.5 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6v6m0 0v6m0-6h6m-6 0H6" />
-                </svg>
-              )}
-
-              {/* Tab title */}
-              <span className="text-xs truncate">{tab.title}</span>
-
-              {/* Pane indicator */}
-              {tab.paneIndex >= 0 && (
-                <span className="text-[10px] bg-[var(--primary-color)]/30 rounded px-1 flex-shrink-0">
-                  {tab.paneIndex + 1}
-                </span>
-              )}
-
-              {/* Close button */}
-              <button
-                onClick={(e) => {
-                  e.stopPropagation();
-                  removeTab(tab.id);
-                }}
-                className="p-0.5 hover:bg-white/10 rounded flex-shrink-0"
+        {/* Workspace Tabs — each is an independent queue + panes + layout */}
+        <div className="flex items-center gap-1 flex-1 min-w-0 bg-black/20 rounded px-1 py-0.5 overflow-x-auto scrollbar-thin">
+          {mediaTabs.map((tab) => {
+            const tabMedia = tab.id === activeTabId ? mediaItems : tab.mediaItems;
+            const firstType = (tabMedia.find(Boolean) as MediaItem | undefined)?.type;
+            const title = tab.id === activeTabId ? sessionTitle(mediaItems, queue) : tab.title;
+            return (
+              <div
+                key={tab.id}
+                onClick={() => switchToTab(tab.id)}
+                title={title}
+                className={`flex items-center gap-1.5 px-2 py-1 rounded cursor-pointer transition-colors min-w-0 max-w-[170px] ${
+                  activeTabId === tab.id
+                    ? 'bg-[var(--primary-color)]/20 text-white'
+                    : 'bg-black/30 text-gray-400 hover:text-white hover:bg-black/40'
+                }`}
               >
-                <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                </svg>
-              </button>
-            </div>
-          ))}
+                {/* Tab icon based on its first loaded media */}
+                {firstType === 'video' && (
+                  <svg className="w-3.5 h-3.5 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                  </svg>
+                )}
+                {firstType === 'image' && (
+                  <svg className="w-3.5 h-3.5 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                  </svg>
+                )}
+                {firstType === 'audio' && (
+                  <svg className="w-3.5 h-3.5 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19V6l12-3v13M9 19c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zm12-3c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zM9 10l12-3" />
+                  </svg>
+                )}
+                {!firstType && (
+                  <svg className="w-3.5 h-3.5 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h7" />
+                  </svg>
+                )}
+
+                {/* Tab title */}
+                <span className="text-xs truncate">{title}</span>
+
+                {/* Close button (hidden when only one tab remains) */}
+                {mediaTabs.length > 1 && (
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      removeTab(tab.id);
+                    }}
+                    className="p-0.5 hover:bg-white/10 rounded flex-shrink-0"
+                    title="Close tab"
+                  >
+                    <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                  </button>
+                )}
+              </div>
+            );
+          })}
 
           {/* Add new tab button */}
           <button
@@ -1814,19 +1996,41 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6v6m0 0v6m0-6h6m-6 0H6" />
             </svg>
           </button>
-
-          {/* Drop hint when empty */}
-          {mediaTabs.length === 0 && (
-            <span className="text-gray-600 text-xs px-2">Drag media here to create tabs</span>
-          )}
         </div>
+
+        {/* Active-pane selector — picks which pane the floating media controls
+            drive. Clicks on an embedded, playing video don't reliably reach the
+            app (the native surface composites over the webview and the video sink
+            swallows the click), so this is the dependable way to retarget the
+            controls in multi-pane layouts. */}
+        {layout !== 'single' && (
+          <div className="flex items-center gap-1 bg-black/30 rounded p-1">
+            <span className="text-[10px] text-gray-500 px-1 select-none">Controls</span>
+            {Array.from({ length: getMaxPanesForLayout(layout) }, (_, i) => i).map((i) => (
+              <button
+                key={i}
+                onClick={() => setActivePane(i)}
+                title={`Drive controls for pane ${i + 1}`}
+                className={`w-6 h-6 rounded text-xs font-medium transition-colors ${
+                  activePane === i
+                    ? 'bg-[var(--primary-color)] text-white'
+                    : mediaItems[i]
+                    ? 'bg-black/40 text-gray-300 hover:text-white'
+                    : 'bg-black/20 text-gray-600'
+                }`}
+              >
+                {i + 1}
+              </button>
+            ))}
+          </div>
+        )}
 
         {/* Layout buttons */}
         <div className="flex items-center gap-1 bg-black/30 rounded p-1">
           {(['single', 'horizontal', 'vertical', 'quad'] as ViewLayout[]).map((l) => (
             <button
               key={l}
-              onClick={() => setLayout(l)}
+              onClick={() => changeLayout(l)}
               className={`p-1.5 rounded transition-colors ${
                 layout === l ? 'bg-[var(--primary-color)]/20 text-[var(--primary-color)]' : 'text-gray-400 hover:text-white'
               }`}
@@ -2082,13 +2286,38 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
                 ) : (
                   <div className="space-y-1 max-h-48 overflow-y-auto pr-2">
                     {queue.map((item, index) => (
-                      <div key={item.id}>
+                      <div
+                        key={item.id}
+                        draggable
+                        onDragStart={(e) => { setQueueDragIndex(index); e.dataTransfer.effectAllowed = 'move'; }}
+                        onDragOver={(e) => {
+                          e.preventDefault();
+                          e.dataTransfer.dropEffect = 'move';
+                          if (queueDragIndex !== null && queueDragIndex !== index) setQueueDropIndex(index);
+                        }}
+                        onDragLeave={() => setQueueDropIndex(d => (d === index ? null : d))}
+                        onDrop={(e) => {
+                          e.preventDefault();
+                          if (queueDragIndex !== null) reorderQueue(queueDragIndex, index);
+                          setQueueDragIndex(null);
+                          setQueueDropIndex(null);
+                        }}
+                        onDragEnd={() => { setQueueDragIndex(null); setQueueDropIndex(null); }}
+                        className={`${queueDropIndex === index ? 'border-t-2 border-[var(--primary-color)]' : ''} ${queueDragIndex === index ? 'opacity-40' : ''}`}
+                      >
                       <div
                         className={`p-1.5 rounded cursor-pointer flex items-center gap-2 ${
                           playedItems.has(item.id) ? 'opacity-50' : ''
                         } hover:bg-white/5`}
                         onClick={() => openMedia(item.source, item.type, item.title)}
                       >
+                        {/* Drag handle */}
+                        <svg className="w-3 h-3 text-gray-600 flex-shrink-0 cursor-grab active:cursor-grabbing" fill="currentColor" viewBox="0 0 24 24">
+                          <title>Drag to reorder</title>
+                          <circle cx="9" cy="6" r="1.5" /><circle cx="15" cy="6" r="1.5" />
+                          <circle cx="9" cy="12" r="1.5" /><circle cx="15" cy="12" r="1.5" />
+                          <circle cx="9" cy="18" r="1.5" /><circle cx="15" cy="18" r="1.5" />
+                        </svg>
                         <span className="text-gray-500 text-xs w-4">{index + 1}</span>
                         {item.type === 'video' && (
                           <svg className="w-3 h-3 text-gray-400 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">

@@ -5,6 +5,16 @@ import { useState, useEffect } from 'react';
 import { invoke, listen } from '../lib/tauri';
 import { RightDockPanel, RIGHT_DOCK_WIDTH_WIDE } from '../lib/rightDock';
 
+// Reclaim's internal feature password gates. Storing one of these (optional) lets
+// it autofill when that feature asks for its password. Keys match the gate's
+// VaultAutofill appKey and the backend `reclaim://<key>` URL convention.
+const RECLAIM_FEATURES: { key: string; label: string }[] = [
+  { key: 'media', label: 'Media' },
+  { key: 'bookmarks', label: 'Private Bookmarks' },
+  { key: 'authenticator', label: 'Authenticator' },
+  { key: 'local-ai', label: 'Local AI / History' },
+];
+
 export interface PasswordEntry {
   id: number;
   profile_id: number;
@@ -482,6 +492,29 @@ function PasswordEntryModal({
         </div>
 
         <div className="p-4 space-y-4">
+          {!entry && (
+            <div>
+              <label className="block text-sm text-gray-400 mb-1">Reclaim feature password (optional)</label>
+              <select
+                value={url.startsWith('reclaim://') ? url.replace('reclaim://', '') : ''}
+                onChange={(e) => {
+                  const k = e.target.value;
+                  if (!k) { setUrl(''); return; }
+                  const f = RECLAIM_FEATURES.find(x => x.key === k);
+                  setUrl(`reclaim://${k}`);
+                  setCategory('Reclaim');
+                  if (!title) setTitle(`Reclaim — ${f?.label ?? k}`);
+                  if (!username) setUsername(k);
+                }}
+                className="w-full px-3 py-2 bg-gray-800 border border-gray-600 rounded focus:outline-none focus:border-[var(--primary-color)]"
+              >
+                <option value="">— Regular website login —</option>
+                {RECLAIM_FEATURES.map(f => <option key={f.key} value={f.key}>{f.label} (autofills its password)</option>)}
+              </select>
+              <p className="text-[11px] text-gray-500 mt-1">Optional: store a Reclaim feature's own password here so it autofills when that feature asks for it. Use the same password you set on the feature.</p>
+            </div>
+          )}
+
           <div>
             <label className="block text-sm text-gray-400 mb-1">Title *</label>
             <input

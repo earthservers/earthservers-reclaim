@@ -6,6 +6,7 @@ import { ProfileManager } from './components/ProfileManager';
 import { IncognitoToggle, IncognitoBanner } from './components/IncognitoToggle';
 import { DownloadsButton } from './components/DownloadsButton';
 import { PrivacyButton } from './components/PrivacyButton';
+import { SecurityButton } from './components/SecurityButton';
 import { HistoryViewer } from './components/HistoryViewer';
 import { ThemeCustomizer } from './components/ThemeCustomizer';
 import { ThemeProvider, useTheme } from './contexts/ThemeContext';
@@ -125,7 +126,7 @@ const mainServiceItems = [
   { id: 'search' as const, label: 'Search', icon: 'M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z' },
   { id: 'media' as const, label: 'Media', icon: 'M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z' },
   { id: 'scraper' as const, label: 'Scraper', icon: 'M21 12a9 9 0 01-9 9m9-9a9 9 0 00-9-9m9 9H3m9 9a9 9 0 01-9-9m9 9c1.657 0 3-4.03 3-9s-1.343-9-3-9m0 18c-1.657 0-3-4.03-3-9s1.343-9 3-9m-9 9a9 9 0 019-9' },
-  { id: 'ai' as const, label: 'Local AI', icon: 'M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z' },
+  { id: 'ai' as const, label: 'Local AI / History', icon: 'M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z' },
 ];
 
 // Local-AI on/off settings, persisted in localStorage.
@@ -486,22 +487,29 @@ function App() {
       .catch(() => {});
   }, []);
 
-  // KG curator: when a real page loads (and we're not incognito), ask the backend
-  // to fetch + summarize it into EarthMemory. Deduped per-URL (the title event
-  // fires several times per page); the backend no-ops if Ollama isn't running.
-  const curatedUrlRef = useRef<string>('');
+  // KG curator: summarize only what the user ACTUALLY VIEWED. The in-page bridge
+  // (browser_surface) accumulates scrolled-into-view text and emits
+  // `browser-viewed-content`; we gate it (curator on / http(s) / not incognito)
+  // and ask the backend to summarize+journal the viewed text — no server re-fetch.
+  // Deduped by URL + viewed-size bucket so the same page at the same scroll depth
+  // won't re-curate, but reaching more (e.g. comments) refines it. Backend no-ops
+  // if Ollama isn't running.
+  const curatedKeysRef = useRef<Set<string>>(new Set());
   useEffect(() => {
     if (!isTauri()) return;
     let unlisten: (() => void) | undefined;
-    listen<{ tabId: number; title: string; url: string }>('browser-title-changed', ({ payload }) => {
-      const url = payload.url || '';
-      if (!aiSettings.curator || !/^https?:\/\//.test(url) || isIncognito) return;
-      if (curatedUrlRef.current === url) return;
-      curatedUrlRef.current = url;
-      invoke('curate_page', {
+    listen<{ url: string; title: string; text: string; isFinal: boolean }>('browser-viewed-content', ({ payload }) => {
+      const { url, title, text } = payload;
+      if (!aiSettings.curator || !/^https?:\/\//.test(url || '') || isIncognito) return;
+      if (!text || text.length < 200) return;
+      const key = `${url}::${Math.floor(text.length / 2000)}`;
+      if (curatedKeysRef.current.has(key)) return;
+      curatedKeysRef.current.add(key);
+      invoke('curate_viewed_page', {
         profileId: activeProfile?.id ?? 1,
         url,
-        title: payload.title || url,
+        title: title || url,
+        text,
       }).catch(() => {});
     }).then(u => { unlisten = u; });
     return () => unlisten?.();
@@ -1005,6 +1013,13 @@ function App() {
                     <DownloadsButton />
                   </div>
 
+                  <div
+                    className={`transition-all duration-300 ${navbarCollapsed ? 'opacity-0 w-0 overflow-hidden pointer-events-none' : 'opacity-100'}`}
+                    style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
+                  >
+                    <SecurityButton profileId={activeProfile?.id ?? 1} />
+                  </div>
+
                   {/* Incognito Toggle */}
                   <div
                     className={`transition-all duration-300 ${navbarCollapsed ? 'opacity-0 w-0 overflow-hidden pointer-events-none' : 'opacity-100'}`}
@@ -1127,8 +1142,11 @@ function App() {
 
           {/* Main Content */}
           <main className="flex-1 min-h-0 flex flex-col">
-            {/* When browsing a real URL (not earth://), use full screen without padding */}
-            {activeTab?.url && !activeTab.url.startsWith('earth://') ? (
+            {/* When browsing a real URL (not earth://) in Search, use full screen
+                without padding. Gated to the Search service: other services (AI,
+                Memory, Scraper) are DOM pages that must stay scrollable and get
+                their own props even when a web tab is open in the background. */}
+            {activeService === 'search' && activeTab?.url && !activeTab.url.startsWith('earth://') ? (
               <div className="flex-1 min-h-0 flex flex-col">
                 <Home
                   activeService={activeService}
@@ -1357,6 +1375,7 @@ function Home({ activeService, profileId, onOpenUrl, activeTab, onMediaFullscree
         settings={aiSettings}
         onChange={onAiSettingsChange}
         onOpenMemory={() => onSelectService?.('memory')}
+        onOpenUrl={onOpenUrl}
       />
     );
   }
@@ -1434,7 +1453,7 @@ function Home({ activeService, profileId, onOpenUrl, activeTab, onMediaFullscree
   // EarthMemory
   return (
     <div className="max-w-5xl mx-auto">
-      <MemoryManager profileId={profileId} />
+      <MemoryManager profileId={profileId} onOpenUrl={onOpenUrl} />
     </div>
   );
 }

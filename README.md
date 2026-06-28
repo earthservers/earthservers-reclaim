@@ -16,16 +16,38 @@
 
 Reclaim puts you back in control of your digital life. Everything runs **locally** — your browsing, your AI, your data. Nothing leaves your device.
 
-## Highlights
+## Features
 
-- **Browser** — tabbed WebKitGTK browser with a per‑tab page cache (switching tabs doesn't reload), persistent cookies/sessions, and a curated/resolved address bar.
-- **NoScript + privacy** — per‑site JavaScript trust, third‑party cookie/ITP controls, UA spoofing, incognito.
-- **Local AI (Ollama)**
-  - **Knowledge Curator** — quietly summarizes pages you visit into a personal knowledge graph (EarthMemory). Transparent, unbiased, skips incognito.
-  - **AI Assistant** — a private streaming chat, grounded in your own saved pages, media notes, and past conversations. Model auto‑selected by your GPU tier (or pick any installed model).
-- **Password manager + autofill** — Argon2id‑gated vault, login autofill/autosave prompts.
-- **Media downloader** — manually save images/gifs/videos from a page (with descriptions for your AI), plus **yt‑dlp** for streaming sites like YouTube.
-- **EarthSearch** — trusted‑domain management, community trust/bias ratings.
+Everything below runs **on your machine**. The only outbound traffic is the pages you load (and, in Research mode, the searches you run) — your data, AI, and indexes never leave the device.
+
+### 🔎 Search & Browser
+- **Tabbed WebKitGTK browser** — per‑tab page cache (switching tabs doesn't reload), persistent cookies/sessions, curated/resolved address bar.
+- **Password manager + autofill** — an Argon2id‑gated vault (AES‑GCM at rest); detects login forms, offers to save, and autofills credentials.
+- **TOTP authenticator** — store 2FA secrets and generate one‑time codes locally (no phone, no cloud).
+- **Password‑protected bookmarks** — bookmarks are encrypted at rest, with an optional Argon2id password gate for a private set.
+- **NoScript** — JavaScript is blocked by default and trusted **per site** (persistent or session‑only); a web‑process extension blocks untrusted third‑party requests.
+- **Privacy protection** — third‑party cookie blocking, tracking prevention (ITP), user‑agent spoofing, and incognito (ephemeral, nothing on disk).
+- **Your own search engine** — build a private index from the sites *you* curate and **scrape**, plus community trust/bias ratings on domains (EarthSearch). Search your own corpus, not an ad network.
+
+### 🎬 Media (EarthMultiMedia)
+- **Multi‑pane viewing** — single, split (horizontal/vertical), or quad; each pane is an independent native player.
+- **Workspace tabs** — browser‑style media tabs, each with its own queue, panes, and layout.
+- **Queue** — drag‑to‑reorder, **shuffle**, repeat, and consecutive autoplay (next item plays in the pane that just finished).
+- **Drag & drop** — drop files or whole folders; videos fill panes and queue, image folders expand into the queue.
+- **Image slideshow** — shuffle/stagger across panes, fitted on load.
+- **Password‑protected playlists** — playlists are encrypted; lock them behind a media password (+ optional OTP).
+- **Media downloader** — manually save images/gifs/videos with your own descriptions (for the AI), plus **yt‑dlp** for streaming sites like YouTube. You pick the save location.
+
+### 🕸️ Web Scraper
+- **Crawl & index** — create a job (base URL, crawl depth, max pages, optional URL pattern + content selectors); it crawls, extracts readable text, and indexes pages for **local full‑text search**.
+- **Live status** — jobs run on creation (or via ▶ Run), streaming `pending → running → completed` with a live page count.
+- **Opt‑in “Add to AI memory”** — per job, also summarize each scraped page into your knowledge graph so the assistant can use it.
+
+### 🧠 Local AI (Ollama)
+- **Knowledge Curator** — summarizes **what you actually read** (an in‑page viewed‑content bridge captures only text you scrolled into view — comments included only if you reach them), not a blind re‑fetch. Skips homepages/feeds, de‑duplicates, writes a rich summary + a small excerpt. Transparent, unbiased, skips incognito.
+- **AI Assistant** — a private, streaming, multi‑session chat (ChatGPT‑style) grounded in your saved pages, media notes, and past conversations. Model auto‑selected by your GPU tier, or pick any installed model.
+- **🔬 Web Research mode** — agentic **search + read**: the assistant uses local tool‑calling to `web_search` and `fetch_url`, shows each step (🔎 searching / 📄 reading), then streams a grounded answer that **cites the URLs it actually read**. Searches route through a local **SearXNG** instance when available (fully private), or **DuckDuckGo** as a fallback. All reasoning stays on‑device.
+- **Password‑protected tab** — lock the whole Local AI / History tab behind its own unique Argon2id password (separate from the vault, media, and bookmark passwords).
 
 ---
 
@@ -95,6 +117,44 @@ ollama pull qwen2.5:32b      #  24 GB+
 
 The Assistant auto‑recommends a model from your detected VRAM, but you can pick **any installed model** from the dropdown in the **Local AI** tab. If Ollama isn't running, AI features simply stay idle.
 
+### Web Research mode (optional)
+
+Toggle **Research** in the assistant header to let it search the web and read pages before answering.
+
+- **Tool‑capable model required.** Research uses Ollama tool‑calling — use a model that supports it (e.g. `llama3.1:8b`, `qwen2.5:7b/14b/32b`). Models without tool support fall back to a plain answer with a note.
+- **Private search (recommended): SearXNG.** Run a local [SearXNG](https://docs.searxng.org/) with the JSON API enabled and set its URL (default `http://localhost:8888`) in the assistant's search‑settings (⚙). When reachable, all searches stay on your network — the header shows *"Private search via SearXNG ✓"*.
+- **Fallback: DuckDuckGo.** Without SearXNG, searches go through DuckDuckGo's HTML endpoint. Either way, only the search query and the pages the model chooses to read leave your machine; the reasoning is fully local.
+
+#### Running SearXNG (optional, for fully private search)
+
+Easiest is a container. SearXNG ships with the JSON API **disabled**, so enable it after the first start. (On Fedora/Nobara use `podman` — it's preinstalled and drop‑in; just use the full image path `docker.io/searxng/searxng`. On Debian/Ubuntu/macOS use `docker`.)
+
+```bash
+# 1. Start it (host port 8888 -> container 8080, the app's default URL)
+mkdir -p ~/searxng
+podman run -d --name searxng \
+  -p 8888:8080 \
+  -v ~/searxng:/etc/searxng \
+  docker.io/searxng/searxng
+# (Docker users: `docker run -d --name searxng --restart unless-stopped -p 8888:8080 -v ~/searxng:/etc/searxng searxng/searxng`)
+
+# 2. Enable the JSON API + set a secret key in ~/searxng/settings.yml:
+#    server:
+#      secret_key: "<any long random string>"
+#    search:
+#      formats:
+#        - html
+#        - json
+
+# 3. Apply the change
+docker restart searxng
+
+# 4. Verify the JSON API answers
+curl 'http://localhost:8888/search?q=test&format=json' | head -c 200
+```
+
+Then in Reclaim's assistant, open the search‑settings (⚙) and confirm the URL is `http://localhost:8888`. With Research on, the header shows **"Private search via SearXNG ✓"**. (No Docker? See the [SearXNG install docs](https://docs.searxng.org/admin/installation.html) for the script/source install — same two settings: `secret_key` and `formats: [html, json]`.)
+
 ---
 
 ## Run & Compile
@@ -125,45 +185,49 @@ Bundles are written to `apps/reclaim/src-tauri/target/release/bundle/` (`.deb`, 
 ## Architecture
 
 ```
-                                 ┌──────────────────────────────────────────────────┐
-                                 │                REACT UI  (host webview)            │
-                                 │   App.tsx · WebView · LocalAIHub · panels (R-dock) │
-                                 └───────────────┬───────────────────────────────────┘
-                                                 │ Tauri invoke() / emit() events
-                                                 ▼
-┌──────────────────────────────────────────  RUST BACKEND  ──────────────────────────────────────────┐
-│                                                                                                     │
-│  SEARCH / NAVIGATION                                                                                 │
-│   WebView --invoke('navigate')--> router/mod.rs                                                      │
-│        |- RESOLUTION axis: LocalCache -> P2P(.click) -> Federated -> Blockchain(.earth) -> ICANN      │
-│        \- RENDER axis:  .earth -> Servo (separate window)                                            │
-│                          else  -> browser_overlay  (GTK overlay, ONE webview PER TAB,                │
-│                                   shared PERSISTENT WebContext => cookies/sessions on disk)          │
-│                                                                                                     │
-│  PAGE <-> RUST BRIDGE  (injected content script, 'reclaimVault' channel)                            │
-│   page --postMessage--> browser_surface::configure_page_webview                                      │
-│        |- autofill-request / autosave  -> vault (Argon2id + AES-GCM)  -> autofill / save prompts      │
-│        |- media-list (img/gif/video)   -> MediaPanel                                                 │
-│        \- noscript:seen (web-ext .so)  -> per-tab SEEN_ORIGINS -> NoScript shield                     │
-│                                                                                                     │
-│  MEDIA                                                                                               │
-│   MediaPanel --+- download_media(url, description)        -> ~/Downloads/Reclaim + media_downloads   │
-│                \- download_video_ytdlp(pageUrl, desc)     -> yt-dlp ------------> (table w/ notes)   │
-│                                                                                                     │
-│  LOCAL AI  (Ollama @ localhost:11434)                                                               │
-│   CURATOR:    page load -> curate_page -> ai::curate (summarize) -> memory.journal_page -> indexed   │
-│   ASSISTANT:  LocalAIHub -> assistant_chat_stream                                                    │
-│                 |- retrieve_context()  <-- indexed_pages (summaries)                                 │
-│                 |                       <-- media_downloads (your descriptions)                      │
-│                 |                       <-- past conversations (journaled chats)                     │
-│                 |- SYSTEM_PROMPT + context + history -> Ollama /api/chat (stream)                    │
-│                 \- assistant-chunk events -> UI ;  on done -> journal_conversation -> indexed_pages  │
-│                                                                                                     │
-│  STORAGE:  SQLite (earthservers.db)  +  OS keyring (at-rest keys)  +  ~/Downloads/Reclaim            │
-└─────────────────────────────────────────────────────────────────────────────────────────────────┘
+  REACT UI  (host webview) — App.tsx · WebView · LocalAIHub · EarthMultiMedia · WebScraper · panels
+        │  Tauri invoke() / emit() events
+        ▼
+  RUST BACKEND
+  │
+  ├─ SEARCH / NAVIGATION
+  │    WebView ──invoke('navigate')──> router/mod.rs
+  │      ├─ RESOLUTION: LocalCache → P2P(.click) → Federated → Blockchain(.earth) → ICANN
+  │      └─ RENDER:  .earth → Servo (separate window)
+  │                  else   → browser_overlay (GTK overlay, ONE webview PER TAB,
+  │                           shared PERSISTENT WebContext ⇒ cookies/sessions on disk)
+  │
+  ├─ PAGE ⇄ RUST BRIDGE  (injected content scripts)
+  │    page ──postMessage──> browser_surface::configure_page_webview
+  │      ├─ reclaimVault   : autofill-request / autosave → vault (Argon2id + AES-GCM)
+  │      ├─ reclaimVault   : media-list (img/gif/video)  → MediaPanel
+  │      ├─ reclaimCurator : VIEWED text (IntersectionObserver) → browser-viewed-content
+  │      └─ noscript:seen  : web-ext .so → per-tab SEEN_ORIGINS → NoScript shield
+  │
+  ├─ MEDIA (EarthMultiMedia)
+  │    multi-pane native players · workspace tabs · queue (reorder/shuffle/repeat) · slideshow
+  │    downloader: download_media(url, desc) / download_video_ytdlp → ~/Downloads + media_downloads
+  │    encrypted playlists (media password + optional OTP)
+  │
+  ├─ WEB SCRAPER
+  │    create_scraping_job → run_job (crawl: fetch → extract_text → save) → scraped_pages (local search)
+  │      └─ opt-in add_to_ai → ai::summarize → memory.journal_page (knowledge graph)
+  │
+  └─ LOCAL AI  (Ollama @ localhost:11434)
+       CURATOR:   browser-viewed-content → curate_viewed_page → ai::curate_viewed (summarize VIEWED text)
+                    → memory.journal_page → indexed_pages
+       ASSISTANT: LocalAIHub → assistant_chat_stream
+                    ├─ retrieve_context() ← indexed_pages · media_downloads · journaled chats
+                    └─ SYSTEM_PROMPT + context + history → Ollama /api/chat (stream → assistant-chunk)
+       RESEARCH:  assistant_research_stream  (agentic, tool-calling loop, ≤5 steps)
+                    ├─ research::search → SearXNG (local, private) or DuckDuckGo
+                    ├─ research::fetch  → page text (scraper::extract_text)
+                    └─ research-step events → UI ; final answer streamed + sources cited
+
+  STORAGE:  SQLite (earthservers.db)  +  OS keyring (at-rest keys)  +  ~/Downloads/Reclaim
 ```
 
-Everything above runs **on your machine**. The only outbound calls are the page loads you initiate, optional GitHub update checks, and (optionally) Ollama on `localhost`.
+Everything above runs **on your machine**. The only outbound calls are the page loads you initiate, web searches/reads in Research mode (via SearXNG or DuckDuckGo), optional GitHub update checks, and Ollama on `localhost`.
 
 ---
 

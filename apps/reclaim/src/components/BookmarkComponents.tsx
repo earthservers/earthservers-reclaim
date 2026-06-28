@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import { invoke } from '../lib/tauri';
 import { RightDockPanel } from '../lib/rightDock';
+import { VaultAutofill } from './VaultAutofill';
 
 // Native button component using pointerdown (more reliable in WebKitGTK)
 function NativeButton({
@@ -594,6 +595,9 @@ export function BookmarkBar({ profileId, visible = true, onNavigate, onToggleMan
                     >
                       Unlock
                     </button>
+                  </div>
+                  <div className="mt-2">
+                    <VaultAutofill profileId={profileId} appKey="bookmarks" onFill={pw => setPasswordInput(pw)} />
                   </div>
                 </>
               ) : (

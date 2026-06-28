@@ -229,6 +229,229 @@ pub async fn assistant_chat(
     client.chat(&model, &msgs).await
 }
 
+/// Extra system guidance for research mode (appended to SYSTEM_PROMPT). Describes
+/// the tools and how to use them; reinforces the no-fabrication rule.
+const RESEARCH_GUIDE: &str = "\
+You are in RESEARCH MODE and have two tools:
+- web_search(query): search the web for current information (returns title/url/snippet).
+- fetch_url(url): fetch and read the readable text of a page.
+
+Use them whenever the question involves current events, recent facts, or anything you're \
+unsure of. Search first, then fetch the most relevant 1-3 results to read the details. \
+Take as many tool steps as you need (you'll be cut off after a few). When you have enough, \
+write the answer grounded in what you actually read, and cite the source URLs you used. \
+Never fabricate facts, quotes, or sources — only cite pages you actually fetched.";
+
+/// JSON tools array advertised to Ollama for research mode.
+fn research_tools() -> serde_json::Value {
+    serde_json::json!([
+        { "type": "function", "function": {
+            "name": "web_search",
+            "description": "Search the web for current information. Returns results with title, url, and snippet.",
+            "parameters": { "type": "object",
+                "properties": { "query": { "type": "string", "description": "The search query" } },
+                "required": ["query"] } } },
+        { "type": "function", "function": {
+            "name": "fetch_url",
+            "description": "Fetch and read the readable text content of a web page by its URL.",
+            "parameters": { "type": "object",
+                "properties": { "url": { "type": "string", "description": "The URL to fetch" } },
+                "required": ["url"] } } }
+    ])
+}
+
+fn format_search_results(rs: &[crate::research::SearchResult]) -> String {
+    if rs.is_empty() {
+        return "No results.".to_string();
+    }
+    rs.iter()
+        .enumerate()
+        .map(|(i, r)| format!("{}. {}\n   {}\n   {}", i + 1, r.title, r.url, r.snippet))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Stream a final answer from a prepared messages array (no tools — so the model
+/// commits to prose). Emits `assistant-chunk` per token; returns the full text.
+async fn stream_answer(
+    app: &tauri::AppHandle,
+    model: &str,
+    messages: &serde_json::Value,
+) -> Result<String, String> {
+    use tauri::Emitter;
+    let payload = serde_json::json!({ "model": model, "stream": true, "messages": messages });
+    let client = reqwest::Client::new();
+    let mut resp = client
+        .post("http://localhost:11434/api/chat")
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| format!("Ollama isn't reachable: {}", e))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        // Ollama puts a useful message in the body (e.g. model not found) — surface it.
+        let detail = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| v["error"].as_str().map(str::to_string))
+            .unwrap_or(body);
+        return Err(format!("Ollama: {} (HTTP {})", detail.trim(), status));
+    }
+    let mut buf = String::new();
+    let mut full = String::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
+        buf.push_str(&String::from_utf8_lossy(&chunk));
+        while let Some(nl) = buf.find('\n') {
+            let line: String = buf.drain(..=nl).collect();
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                if let Some(c) = v["message"]["content"].as_str() {
+                    if !c.is_empty() {
+                        full.push_str(c);
+                        let _ = app.emit("assistant-chunk", c);
+                    }
+                }
+            }
+        }
+    }
+    Ok(full)
+}
+
+/// Research mode: agentic search + read. Lets the model call `web_search` /
+/// `fetch_url` (Ollama tool-calling) up to a few steps, emitting `research-step`
+/// progress, then streams the final grounded answer (`assistant-chunk` /
+/// `assistant-done`). Falls back to a plain answer if the model lacks tool
+/// support. Honors `journal` (Q + answer + sources → EarthMemory).
+#[tauri::command(rename_all = "camelCase")]
+pub async fn assistant_research_stream(
+    app: tauri::AppHandle,
+    state: State<'_, Mutex<AppState>>,
+    profile_id: i64,
+    message: String,
+    history: Vec<ChatMsg>,
+    model: Option<String>,
+    journal: bool,
+    searxng_url: Option<String>,
+) -> Result<(), String> {
+    use tauri::Emitter;
+
+    let db_path = {
+        let s = state.lock().map_err(|e| e.to_string())?;
+        s.db_path.clone()
+    };
+    let client = OllamaClient::new();
+    if !client.is_running().await {
+        return Err("Ollama isn't running — start it with `ollama serve`.".to_string());
+    }
+    let model = resolve_model(model).await;
+
+    // Build messages: persona + research guide + local-knowledge context, history, user.
+    let context = retrieve_context(&db_path, profile_id, &message);
+    let system = format!(
+        "{}\n\n{}\n\n--- User's saved knowledge ---\n{}",
+        SYSTEM_PROMPT,
+        RESEARCH_GUIDE,
+        if context.trim().is_empty() {
+            "(nothing relevant found for this message)".to_string()
+        } else {
+            context
+        }
+    );
+    let mut messages: Vec<serde_json::Value> =
+        vec![serde_json::json!({ "role": "system", "content": system })];
+    for h in history.iter().rev().take(12).rev() {
+        let role = if h.role == "assistant" { "assistant" } else { "user" };
+        messages.push(serde_json::json!({ "role": role, "content": h.content }));
+    }
+    messages.push(serde_json::json!({ "role": "user", "content": message }));
+
+    let tools = research_tools();
+    let mut sources: Vec<String> = Vec::new();
+
+    // Agentic loop — search/read up to 5 steps.
+    for step in 0..5 {
+        let msg = match client
+            .chat_with_tools(&model, &serde_json::Value::Array(messages.clone()), Some(&tools))
+            .await
+        {
+            Ok(m) => m,
+            Err(e) => {
+                if step == 0 {
+                    let _ = app.emit(
+                        "research-step",
+                        "⚠ this model can't use tools — answering without web search (try llama3.1 or qwen2.5)",
+                    );
+                    break;
+                }
+                return Err(e);
+            }
+        };
+
+        let tool_calls = msg
+            .get("tool_calls")
+            .and_then(|t| t.as_array())
+            .cloned()
+            .unwrap_or_default();
+        if tool_calls.is_empty() {
+            break; // model is ready to answer
+        }
+
+        // Record the assistant's tool-call turn, then run each requested tool.
+        messages.push(msg.clone());
+        for tc in &tool_calls {
+            let name = tc["function"]["name"].as_str().unwrap_or("");
+            let args = &tc["function"]["arguments"];
+            let result = match name {
+                "web_search" => {
+                    let q = args["query"].as_str().unwrap_or("").to_string();
+                    let _ = app.emit("research-step", format!("🔎 searching: {}", q));
+                    match crate::research::search(&q, searxng_url.as_deref()).await {
+                        Ok(rs) => {
+                            for r in &rs {
+                                sources.push(r.url.clone());
+                            }
+                            format_search_results(&rs)
+                        }
+                        Err(e) => format!("(search failed: {})", e),
+                    }
+                }
+                "fetch_url" => {
+                    let u = args["url"].as_str().unwrap_or("").to_string();
+                    let _ = app.emit("research-step", format!("📄 reading: {}", u));
+                    match crate::research::fetch(&u).await {
+                        Ok(t) => {
+                            sources.push(u.clone());
+                            t
+                        }
+                        Err(e) => format!("(fetch failed: {})", e),
+                    }
+                }
+                other => format!("(unknown tool: {})", other),
+            };
+            messages.push(serde_json::json!({ "role": "tool", "name": name, "content": result }));
+        }
+    }
+
+    // Final streamed answer using everything gathered.
+    let full = stream_answer(&app, &model, &serde_json::Value::Array(messages)).await?;
+    let _ = app.emit("assistant-done", ());
+
+    if journal && !full.trim().is_empty() {
+        let mut seen = std::collections::HashSet::new();
+        let cites: Vec<String> = sources.into_iter().filter(|s| seen.insert(s.clone())).collect();
+        let journaled = if cites.is_empty() {
+            full.clone()
+        } else {
+            format!("{}\n\nSources:\n{}", full, cites.join("\n"))
+        };
+        journal_conversation(&state, profile_id, &message, &journaled);
+    }
+    Ok(())
+}
+
 /// Streaming chat: emits `assistant-chunk` (token text) events as the model
 /// generates, then `assistant-done`. Optionally journals the finished exchange.
 #[tauri::command(rename_all = "camelCase")]
@@ -263,7 +486,14 @@ pub async fn assistant_chat_stream(
         .await
         .map_err(|e| format!("Ollama isn't reachable: {}", e))?;
     if !resp.status().is_success() {
-        return Err(format!("ollama chat: HTTP {}", resp.status()));
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        // Ollama puts a useful message in the body (e.g. model not found) — surface it.
+        let detail = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| v["error"].as_str().map(str::to_string))
+            .unwrap_or(body);
+        return Err(format!("Ollama: {} (HTTP {})", detail.trim(), status));
     }
 
     let mut buf = String::new();

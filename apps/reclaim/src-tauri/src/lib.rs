@@ -26,6 +26,8 @@ mod router;
 mod vault;
 mod media_downloads;
 mod assistant;
+mod research;
+mod ai_lock;
 
 use std::sync::Mutex;
 use tauri::{
@@ -534,6 +536,40 @@ async fn curate_page(
                 let _ = app.emit("memory-updated", ());
             }
             Err(e) => eprintln!("[curator] {url}: {e}"),
+        }
+    });
+    Ok(())
+}
+
+/// Curate from VIEWED page text (sent by the in-page viewed-content bridge)
+/// instead of re-fetching. Same no-op gating as `curate_page`; summarizes only
+/// what the user actually scrolled through.
+#[tauri::command(rename_all = "camelCase")]
+async fn curate_viewed_page(
+    app: tauri::AppHandle,
+    state: State<'_, Mutex<AppState>>,
+    profile_id: i64,
+    url: String,
+    title: String,
+    text: String,
+) -> Result<(), String> {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Ok(());
+    }
+    if privacy::PrivacyManager::is_incognito(profile_id) {
+        return Ok(());
+    }
+    let db_path = {
+        let state = state.lock().map_err(|e| e.to_string())?;
+        state.db_path.clone()
+    };
+    tauri::async_runtime::spawn(async move {
+        match ai::curate_viewed(&db_path, profile_id, &url, &title, &text).await {
+            Ok(()) => {
+                use tauri::Emitter;
+                let _ = app.emit("memory-updated", ());
+            }
+            Err(e) => eprintln!("[curator/viewed] {url}: {e}"),
         }
     });
     Ok(())
@@ -1666,8 +1702,27 @@ async fn get_media_stats(
 
 // ==================== Web Scraper Commands ====================
 
+/// Run a scraping job in the background. The crawl updates the job's status
+/// (running -> completed/failed) and pages_scraped in the DB; a
+/// `scraping-jobs-changed` event is emitted at start and finish so the UI can
+/// refresh. The manager is cloned out so we never hold the AppState lock across
+/// the (long-running) crawl.
+fn spawn_scraping_run(app: tauri::AppHandle, manager: scraper::ScraperManager, job_id: i64) {
+    tauri::async_runtime::spawn(async move {
+        use tauri::Emitter;
+        let _ = app.emit("scraping-jobs-changed", ());
+        if let Err(e) = manager.run_job(job_id).await {
+            eprintln!("[scraper] job {job_id} failed: {e}");
+            let pages = manager.get_job(job_id).map(|j| j.pages_scraped).unwrap_or(0);
+            let _ = manager.update_job_status(job_id, "failed", pages);
+        }
+        let _ = app.emit("scraping-jobs-changed", ());
+    });
+}
+
 #[tauri::command(rename_all = "camelCase")]
 async fn create_scraping_job(
+    app: tauri::AppHandle,
     state: State<'_, Mutex<AppState>>,
     profile_id: i64,
     name: String,
@@ -1676,19 +1731,42 @@ async fn create_scraping_job(
     max_depth: i32,
     max_pages: i32,
     content_selectors: Vec<ContentSelector>,
+    add_to_ai: Option<bool>,
 ) -> Result<i64, String> {
-    let state = state.lock().map_err(|e| e.to_string())?;
-    state.scraper_manager
-        .create_job(
-            profile_id,
-            &name,
-            &base_url,
-            url_pattern.as_deref(),
-            max_depth,
-            max_pages,
-            content_selectors,
-        )
-        .map_err(|e| e.to_string())
+    let (job_id, manager) = {
+        let state = state.lock().map_err(|e| e.to_string())?;
+        let id = state.scraper_manager
+            .create_job(
+                profile_id,
+                &name,
+                &base_url,
+                url_pattern.as_deref(),
+                max_depth,
+                max_pages,
+                content_selectors,
+                add_to_ai.unwrap_or(false),
+            )
+            .map_err(|e| e.to_string())?;
+        (id, state.scraper_manager.clone())
+    };
+    // Start scraping immediately — a newly created job shouldn't sit "pending".
+    spawn_scraping_run(app, manager, job_id);
+    Ok(job_id)
+}
+
+/// (Re)run an existing scraping job.
+#[tauri::command(rename_all = "camelCase")]
+async fn run_scraping_job(
+    app: tauri::AppHandle,
+    state: State<'_, Mutex<AppState>>,
+    job_id: i64,
+) -> Result<(), String> {
+    let manager = {
+        let state = state.lock().map_err(|e| e.to_string())?;
+        state.scraper_manager.clone()
+    };
+    spawn_scraping_run(app, manager, job_id);
+    Ok(())
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -2197,9 +2275,10 @@ pub fn run() {
                         use std::time::Duration;
                         use controls_server::{broadcast_player_status, PlayerStatus};
 
-                        let active_player_id = String::from("pane-0");
-
                         loop {
+                            // The focused pane is set from the frontend; read it
+                            // each tick so the controls follow the active pane.
+                            let active_player_id = controls_server::get_active_player_id();
                             // Get status from the active player
                             if let Ok(status) = media_player::player_get_status_internal(&active_player_id).await {
                                 broadcast_player_status(PlayerStatus {
@@ -2355,6 +2434,7 @@ pub fn run() {
             get_indexed_pages,
             index_page,
             curate_page,
+            curate_viewed_page,
             search_memory,
             get_favorite_pages,
             toggle_page_favorite,
@@ -2449,12 +2529,21 @@ pub fn run() {
             assistant::assistant_models,
             assistant::assistant_chat,
             assistant::assistant_chat_stream,
+            assistant::assistant_research_stream,
+            research::web_search,
+            research::fetch_url,
+            research::research_status,
+            ai_lock::ai_lock_has_password,
+            ai_lock::ai_lock_verify_password,
+            ai_lock::ai_lock_set_password,
+            ai_lock::ai_lock_remove_password,
             media_downloads::download_media,
             media_downloads::list_media_downloads,
             media_downloads::ytdlp_available,
             media_downloads::download_video_ytdlp,
             browser_surface::browser_collect_media,
             create_scraping_job,
+            run_scraping_job,
             get_scraping_jobs,
             get_scraping_job,
             delete_scraping_job,
@@ -2471,6 +2560,11 @@ pub fn run() {
             vault::verify_password_manager_master,
             vault::set_password_manager_master,
             vault::lock_password_manager,
+            vault::vault_has_app_password,
+            vault::vault_get_app_password,
+            vault::vault_set_app_password,
+            vault::change_password_manager_master,
+            vault::change_otp_master,
             vault::get_password_entries,
             vault::add_password_entry,
             vault::update_password_entry,
@@ -2495,6 +2589,7 @@ pub fn run() {
             router::router_clear_cache,
             // Embedded browser surface (GTK/X11 reparented WebKitGTK) controls
             browser_surface::open_download,
+            browser_surface::open_download_location,
             browser_surface::browser_surface_set_bounds,
             browser_surface::browser_surface_show,
             browser_surface::browser_surface_hide,
@@ -2599,6 +2694,7 @@ pub fn run() {
             media_player::player_list,
             media_player::player_set_window_handle,
             media_player::player_expose,
+            media_player::set_active_media_player,
             media_player::get_window_xid,
             // Video surface for embedded playback
             video_surface::create_video_surface,

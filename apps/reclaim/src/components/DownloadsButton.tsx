@@ -99,12 +99,21 @@ export function DownloadsButton() {
                   </span>
                   {d.done ? (
                     d.ok ? (
-                      <button
-                        onClick={() => invoke('open_download', { path: d.path }).catch(() => {})}
-                        className="text-xs text-[var(--primary-color)] hover:underline flex-shrink-0"
-                      >
-                        Open
-                      </button>
+                      <div className="flex items-center gap-2 flex-shrink-0">
+                        <button
+                          onClick={() => invoke('open_download', { path: d.path }).catch(() => {})}
+                          className="text-xs text-[var(--primary-color)] hover:underline"
+                        >
+                          Open
+                        </button>
+                        <button
+                          onClick={() => invoke('open_download_location', { path: d.path }).catch(() => {})}
+                          className="text-xs text-gray-400 hover:text-white hover:underline"
+                          title="Show in folder"
+                        >
+                          Folder
+                        </button>
+                      </div>
                     ) : (
                       <span className="text-xs text-red-400 flex-shrink-0">Failed</span>
                     )

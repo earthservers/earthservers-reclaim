@@ -17,6 +17,8 @@ interface GStreamerVideoPlayerProps {
   onStatusChange?: (status: PlayerStatusExport) => void; // For parent to track player state
   className?: string;
   hideControls?: boolean; // Hide built-in controls (for stacked controls in parent)
+  startPositionMs?: number; // Seek here right after load (used to restore a tab's playback position)
+  isActive?: boolean; // Whether this is the focused pane — gates global keyboard/control events
 }
 
 // Exported status for parent components to use
@@ -88,12 +90,26 @@ export function GStreamerVideoPlayer({
   onError,
   onStatusChange,
   className = '',
+  startPositionMs = 0,
+  isActive = true,
 }: GStreamerVideoPlayerProps) {
+  // Only the focused pane should respond to global keyboard shortcuts and the
+  // app-wide media-* events; otherwise arrow-seek / play-pause hit every pane.
+  const isActiveRef = useRef(isActive);
+  isActiveRef.current = isActive;
   const containerRef = useRef<HTMLDivElement>(null);
   const videoAreaRef = useRef<HTMLDivElement>(null);
   const progressRef = useRef<HTMLDivElement>(null);
+  // Latest desired restore position, read inside the (source-keyed) load effect
+  // without re-triggering it — it changes as the live position is tracked.
+  const startPositionMsRef = useRef(startPositionMs);
+  startPositionMsRef.current = startPositionMs;
   const statusPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const surfaceCreatedRef = useRef(false);
+  // Retry count for transient surface-creation failures. Without retry, a single
+  // failure (e.g. X11 contention when several panes/controls are created at once)
+  // falls straight through to the "plays in its own window" path — the detach.
+  const surfaceRetryRef = useRef(0);
   const [state, setState] = useState<VideoState>({
     isPlaying: false,
     currentTime: 0,
@@ -178,6 +194,16 @@ export function GStreamerVideoPlayer({
           // Surface exists! Update its position and mark as ready
           console.log('[GStreamer] Reusing existing video surface for player:', playerId);
           await invoke('update_video_surface', { playerId, bounds });
+          // RE-ATTACH the window handle. The surface outlives the player (close /
+          // remove-from-queue does player_remove but only HIDES the surface), so a
+          // reused surface may now front a brand-new, handle-less player. Without
+          // re-attaching, the reloaded video renders into its own top-level window
+          // (the "pane detaches" bug after remove → re-add). set_window_handle
+          // get-or-creates the player, so the handle is in place before load.
+          const reuseXid = await invoke<number>('get_video_surface_xid', { playerId }).catch(() => 0);
+          if (reuseXid && reuseXid > 0) {
+            await invoke('player_set_window_handle', { playerId, handle: reuseXid }).catch(() => {});
+          }
           // Repaint the (possibly paused) current frame into the resized surface.
           // Re-mapping + resizing an X11 window clears it and the resize lands
           // async, so a single expose often paints into an unsettled window =>
@@ -217,18 +243,41 @@ export function GStreamerVideoPlayer({
         console.log('[GStreamer] create_video_surface returned XID:', xid ? `0x${xid.toString(16)}` : 'null');
 
         if (xid && xid > 0) {
-          surfaceCreatedRef.current = true;
-          // Set the window handle on the player for VideoOverlay rendering
+          // Set the window handle on the player for VideoOverlay rendering BEFORE
+          // marking the surface ready. The media-load effect is gated on
+          // surfaceCreatedRef/embeddedMode; if we flipped the flag first, playback
+          // could start before the handle was attached and GStreamer would render
+          // into its OWN top-level window (the "pane detaches into a window" bug,
+          // most visible when several panes mount at once).
           console.log('[GStreamer] Setting window handle on player...');
           await invoke('player_set_window_handle', { playerId, handle: xid });
+          surfaceCreatedRef.current = true;
           console.log('[GStreamer] Video surface created and handle set successfully');
           setState(s => ({ ...s, embeddedMode: true, embeddedError: null }));
         } else {
-          console.error('[GStreamer] Invalid XID returned:', xid);
-          setState(s => ({ ...s, embeddedError: 'Invalid XID returned from surface creation' }));
+          // Transient bad XID — retry before giving up (giving up pops the video
+          // out into its own window).
+          if (surfaceRetryRef.current < 4) {
+            surfaceRetryRef.current += 1;
+            console.warn(`[GStreamer] invalid XID, retry ${surfaceRetryRef.current} for`, playerId);
+            setTimeout(setupVideoSurface, 200);
+          } else {
+            console.error('[GStreamer] Invalid XID returned:', xid);
+            setState(s => ({ ...s, embeddedError: 'Invalid XID returned from surface creation' }));
+          }
         }
       } catch (err) {
         const errorMsg = String(err);
+        // Genuine non-X11 environments fall back immediately; otherwise this is
+        // likely transient X11 contention (several surfaces/controls created at
+        // once) — retry a few times so the pane embeds instead of detaching.
+        const hardFail = errorMsg.includes('Wayland') || errorMsg.includes('X11');
+        if (!hardFail && surfaceRetryRef.current < 4) {
+          surfaceRetryRef.current += 1;
+          console.warn(`[GStreamer] surface setup failed, retry ${surfaceRetryRef.current} for ${playerId}:`, errorMsg);
+          setTimeout(setupVideoSurface, 200);
+          return;
+        }
         console.error('[GStreamer] Video surface creation failed:', errorMsg);
         setState(s => ({
           ...s,
@@ -417,9 +466,22 @@ export function GStreamerVideoPlayer({
           // Small delay to let pipeline initialize before playing
           await new Promise(resolve => setTimeout(resolve, 100));
 
-          // Always play for now to debug - autoPlay should be true from parent
-          await invoke('player_play', { playerId });
-          console.log('[GStreamer] Play command sent');
+          // Restore a saved playback position (tab switch) before (re)starting.
+          const startMs = startPositionMsRef.current;
+          if (startMs > 0) {
+            await invoke('player_seek', { playerId, positionMs: Math.floor(startMs) }).catch(() => {});
+          }
+
+          // Resume in the saved play/pause state. autoPlay === false means the
+          // tab was paused when the user switched away — keep it paused at the
+          // restored position; otherwise play (the default for opening media).
+          if (autoPlay === false) {
+            await invoke('player_pause', { playerId });
+            console.log('[GStreamer] Restored paused at', startMs, 'ms');
+          } else {
+            await invoke('player_play', { playerId });
+            console.log('[GStreamer] Play command sent');
+          }
         }
 
         setState(s => ({ ...s, isLoading: false }));
@@ -632,16 +694,17 @@ export function GStreamerVideoPlayer({
 
   // Listen for external control events (from floating controls and stacked controls)
   useEffect(() => {
-    // Global events (for floating controls)
-    const handlePlayPause = () => togglePlay();
+    // Global events (from the toolbar / keyboard). Only the focused pane reacts,
+    // so these don't fan out to every pane at once.
+    const handlePlayPause = () => { if (isActiveRef.current) togglePlay(); };
     const handleStop = async () => {
-      if (state.gstreamerAvailable) {
+      if (isActiveRef.current && state.gstreamerAvailable) {
         await invoke('player_stop', { playerId });
       }
     };
-    const handleSeek = (e: CustomEvent) => seek(e.detail.time * 1000);
-    const handleVolume = (e: CustomEvent) => setVolume(e.detail.volume);
-    const handleMute = () => toggleMute();
+    const handleSeek = (e: CustomEvent) => { if (isActiveRef.current) seek(e.detail.time * 1000); };
+    const handleVolume = (e: CustomEvent) => { if (isActiveRef.current) setVolume(e.detail.volume); };
+    const handleMute = () => { if (isActiveRef.current) toggleMute(); };
 
     // Player-specific events (for stacked controls in multi-pane mode)
     const handlePlayerPlayPause = (e: CustomEvent) => {
@@ -687,6 +750,9 @@ export function GStreamerVideoPlayer({
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+      // Only the focused pane handles shortcuts — otherwise arrow-seek/space hit
+      // every pane simultaneously.
+      if (!isActiveRef.current) return;
 
       switch (e.key) {
         case ' ':

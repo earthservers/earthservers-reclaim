@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { invoke } from '../lib/tauri';
+import { invoke, isTauri, listen } from '../lib/tauri';
 
 // Types
 interface ContentSelector {
@@ -21,6 +21,7 @@ interface ScrapingJob {
   last_run_at: string | null;
   pages_scraped: number;
   created_at: string;
+  add_to_ai?: boolean;
 }
 
 interface ScrapedPage {
@@ -62,6 +63,32 @@ export function WebScraper({ profileId }: WebScraperProps) {
   useEffect(() => {
     loadJobs();
   }, [loadJobs]);
+
+  // Refresh when the backend reports a job started/finished.
+  useEffect(() => {
+    if (!isTauri()) return;
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    listen('scraping-jobs-changed', () => loadJobs()).then(u => { if (cancelled) u(); else unlisten = u; });
+    return () => { cancelled = true; unlisten?.(); };
+  }, [loadJobs]);
+
+  // While a job is actively crawling, poll so the page count ticks up live.
+  useEffect(() => {
+    const active = jobs.some(j => j.status === 'running' || j.status === 'pending');
+    if (!active) return;
+    const t = setInterval(() => loadJobs(), 2000);
+    return () => clearInterval(t);
+  }, [jobs, loadJobs]);
+
+  const handleRunJob = async (jobId: number) => {
+    try {
+      await invoke('run_scraping_job', { jobId });
+      loadJobs();
+    } catch (err) {
+      console.error('Failed to run scraping job:', err);
+    }
+  };
 
   const handleDeleteJob = async (jobId: number) => {
     if (!confirm('Are you sure you want to delete this scraping job and all scraped pages?')) return;
@@ -204,6 +231,7 @@ export function WebScraper({ profileId }: WebScraperProps) {
               key={job.id}
               job={job}
               onView={() => handleViewPages(job)}
+              onRun={() => job.id && handleRunJob(job.id)}
               onDelete={() => job.id && handleDeleteJob(job.id)}
               isSelected={selectedJob?.id === job.id}
             />
@@ -282,11 +310,12 @@ export function WebScraper({ profileId }: WebScraperProps) {
 interface ScrapingJobCardProps {
   job: ScrapingJob;
   onView: () => void;
+  onRun: () => void;
   onDelete: () => void;
   isSelected: boolean;
 }
 
-function ScrapingJobCard({ job, onView, onDelete, isSelected }: ScrapingJobCardProps) {
+function ScrapingJobCard({ job, onView, onRun, onDelete, isSelected }: ScrapingJobCardProps) {
   const getStatusColor = (status: string) => {
     switch (status) {
       case 'completed': return 'text-green-400 bg-green-400/10';
@@ -348,6 +377,25 @@ function ScrapingJobCard({ job, onView, onDelete, isSelected }: ScrapingJobCardP
         </div>
 
         <div className="flex items-center gap-2">
+          {job.status === 'running' || job.status === 'pending' ? (
+            <span className="p-2 text-[var(--primary-color)]" title="Scraping…">
+              <svg className="w-5 h-5 animate-spin" fill="none" viewBox="0 0 24 24">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+              </svg>
+            </span>
+          ) : (
+            <button
+              onClick={onRun}
+              className="p-2 text-[var(--text-muted-color)] hover:text-green-400 hover:bg-green-400/10 rounded-lg transition-colors"
+              title="Run / re-run scraping job"
+            >
+              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+              </svg>
+            </button>
+          )}
           <button
             onClick={onView}
             className="p-2 text-[var(--text-muted-color)] hover:text-[var(--primary-color)] hover:bg-[var(--primary-color)]/10 rounded-lg transition-colors"
@@ -386,6 +434,7 @@ function CreateScrapingJobModal({ profileId, onClose, onCreated }: CreateScrapin
   const [urlPattern, setUrlPattern] = useState('');
   const [maxDepth, setMaxDepth] = useState(2);
   const [maxPages, setMaxPages] = useState(100);
+  const [addToAi, setAddToAi] = useState(false);
   const [selectors, setSelectors] = useState<ContentSelector[]>([]);
   const [newSelectorName, setNewSelectorName] = useState('');
   const [newSelectorValue, setNewSelectorValue] = useState('');
@@ -422,6 +471,7 @@ function CreateScrapingJobModal({ profileId, onClose, onCreated }: CreateScrapin
         maxDepth: maxDepth,
         maxPages: maxPages,
         contentSelectors: selectors,
+        addToAi: addToAi,
       });
 
       onCreated();
@@ -528,6 +578,23 @@ function CreateScrapingJobModal({ profileId, onClose, onCreated }: CreateScrapin
               />
             </div>
           </div>
+
+          {/* Add to AI memory (opt-in) */}
+          <label className="flex items-start gap-3 p-3 rounded-lg border border-gray-700 cursor-pointer hover:border-gray-600">
+            <input
+              type="checkbox"
+              checked={addToAi}
+              onChange={(e) => setAddToAi(e.target.checked)}
+              className="mt-0.5 accent-[var(--primary-color)]"
+            />
+            <span className="text-sm">
+              <span className="font-medium text-[var(--text-color)]">Add to AI memory</span>
+              <span className="block text-xs text-[var(--text-muted-color)] mt-0.5">
+                Also save a summary of each scraped page into Local AI / History so the
+                assistant can use it. Off by default; summaries need Ollama running.
+              </span>
+            </span>
+          </label>
 
           {/* Content Selectors */}
           <div>

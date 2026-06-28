@@ -90,19 +90,63 @@ pub(crate) mod imp {
                 .map(|s| s.to_string())
                 .unwrap_or_default();
 
-            // Pick a destination under ~/Downloads and announce the download.
+            // Ask the user WHERE to save (mandatory). The download is held until
+            // they pick a location; cancelling aborts it (nothing is written).
+            // decide_destination fires on the GTK main thread, so a modal
+            // FileChooser run() here is safe.
             {
                 let app = app.clone();
                 let url = url.clone();
                 download.connect_decide_destination(move |dl, suggested| {
+                    use gtk::prelude::*;
+                    use webkit2gtk::DownloadExt;
+
                     let home = std::env::var("HOME").unwrap_or_default();
                     let dir = format!("{}/Downloads", home);
                     let _ = std::fs::create_dir_all(&dir);
-                    dl.set_destination(&format!("file://{}/{}", dir, suggested));
-                    let _ = app.emit(
-                        "download-started",
-                        DownloadStarted { id, url: url.clone(), filename: suggested.to_string() },
+
+                    let dialog = gtk::FileChooserDialog::new(
+                        Some("Save Download As"),
+                        None::<&gtk::Window>,
+                        gtk::FileChooserAction::Save,
                     );
+                    dialog.add_button("Cancel", gtk::ResponseType::Cancel);
+                    dialog.add_button("Save", gtk::ResponseType::Accept);
+                    dialog.set_do_overwrite_confirmation(true);
+                    dialog.set_current_name(suggested);
+                    let _ = dialog.set_current_folder(std::path::Path::new(&dir));
+                    dialog.set_modal(true);
+                    dialog.set_keep_above(true);
+
+                    let response = dialog.run();
+                    let chosen = if response == gtk::ResponseType::Accept {
+                        dialog.filename()
+                    } else {
+                        None
+                    };
+                    dialog.close();
+
+                    match chosen {
+                        Some(path) => {
+                            let filename = path
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_else(|| suggested.to_string());
+                            // Build a properly percent-encoded file:// URI (spaces
+                            // and unicode in the chosen name would otherwise corrupt
+                            // a hand-built URI).
+                            let dest_uri = gtk::gio::File::for_path(&path).uri();
+                            dl.set_destination(dest_uri.as_str());
+                            let _ = app.emit(
+                                "download-started",
+                                DownloadStarted { id, url: url.clone(), filename },
+                            );
+                        }
+                        None => {
+                            // User cancelled — abort so nothing downloads silently.
+                            dl.cancel();
+                        }
+                    }
                     true
                 });
             }
@@ -607,6 +651,15 @@ pub(crate) mod imp {
 
     #[derive(Clone, serde::Serialize)]
     #[serde(rename_all = "camelCase")]
+    struct ViewedContentEvent {
+        url: String,
+        title: String,
+        text: String,
+        is_final: bool,
+    }
+
+    #[derive(Clone, serde::Serialize)]
+    #[serde(rename_all = "camelCase")]
     struct AutosaveEvent {
         origin: String,
         username: String,
@@ -628,6 +681,95 @@ pub(crate) mod imp {
         origin: String,
         items: Vec<MediaItem>,
     }
+
+    /// Viewed-content bridge for the Knowledge Curator. Injected into every top
+    /// frame: it watches text blocks with an IntersectionObserver and accumulates
+    /// only the ones actually scrolled into view (≥50% visible) — so comments and
+    /// other late/below-the-fold content are captured ONLY if the user reached
+    /// them. The accumulated viewed text is posted to Rust over the
+    /// `reclaimCurator` channel when the page is hidden / navigated away (final),
+    /// plus a debounced incremental flush while reading. The curator then
+    /// summarizes what was actually read, instead of re-fetching the whole page.
+    const CURATOR_USER_SCRIPT: &str = r#"
+(function(){
+  try {
+    if (window.top !== window) return;            // top frame only
+    if (!/^https?:$/.test(location.protocol)) return;
+    if (window.__reclaimCuratorInit) return; window.__reclaimCuratorInit = true;
+    var ch = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.reclaimCurator;
+    if (!ch) return;
+
+    var seen = new Set();
+    var observed = new WeakSet();
+    var lastSentLen = 0;
+    var flushTimer = null;
+    var curUrl = location.href;
+    var SEL = 'p,li,h1,h2,h3,h4,h5,h6,article,blockquote,dd,figcaption,pre,td,[class*="comment"],[id*="comment"]';
+
+    function textOf(el){ try { return (el.innerText||'').trim(); } catch(e){ return ''; } }
+
+    // Reset the viewed set on SPA navigation (URL change without a reload) so one
+    // page's summary never mixes in text from the previous page.
+    function maybeReset(){
+      if (location.href !== curUrl){
+        flush(true);                 // finalize the page we're leaving
+        curUrl = location.href; seen = new Set(); observed = new WeakSet(); lastSentLen = 0;
+      }
+    }
+
+    var io = new IntersectionObserver(function(entries){
+      var got = false;
+      for (var i=0;i<entries.length;i++){
+        var e = entries[i];
+        if (e.isIntersecting && e.intersectionRatio >= 0.5){
+          var t = textOf(e.target);
+          if (t.length >= 40 && !seen.has(t)){ seen.add(t); got = true; }
+          io.unobserve(e.target);
+        }
+      }
+      if (got) schedule();
+    }, { threshold: [0.5] });
+
+    function observeAll(){
+      try {
+        maybeReset();
+        var els = document.querySelectorAll(SEL);
+        for (var i=0;i<els.length;i++){
+          var el = els[i];
+          if (observed.has(el)) continue;
+          observed.add(el);
+          io.observe(el);
+        }
+      } catch(e){}
+    }
+
+    function build(){
+      var arr = [], total = 0;
+      seen.forEach(function(t){ if (total <= 20000){ arr.push(t); total += t.length; } });
+      return arr.join('\n\n').slice(0, 20000);
+    }
+
+    function flush(isFinal){
+      try {
+        var text = build();
+        if (text.length < 200) return;
+        if (!isFinal && text.length <= lastSentLen + 300) return;  // not enough new
+        lastSentLen = text.length;
+        ch.postMessage(JSON.stringify({ url: location.href, title: document.title||'', text: text, final: !!isFinal }));
+      } catch(e){}
+    }
+
+    function schedule(){ if (flushTimer) clearTimeout(flushTimer); flushTimer = setTimeout(function(){ flush(false); }, 6000); }
+
+    observeAll();
+    var mo = new MutationObserver(function(){ if (mo._t) clearTimeout(mo._t); mo._t = setTimeout(observeAll, 1000); });
+    try { mo.observe(document.documentElement, { childList:true, subtree:true }); } catch(e){}
+
+    document.addEventListener('visibilitychange', function(){ if (document.visibilityState === 'hidden') flush(true); });
+    window.addEventListener('pagehide', function(){ flush(true); });
+  } catch(e){}
+})();
+"#;
 
     /// Injected into every page. Detects a login form, asks Rust for saved
     /// credentials (`autofill-request`), exposes `__reclaimFill` for Rust to fill
@@ -795,6 +937,29 @@ pub(crate) mod imp {
         }
     }
 
+    /// Receive accumulated VIEWED text from the curator content script and relay
+    /// it to the frontend, which applies the curator gating (toggle / incognito /
+    /// dedup) and calls `curate_viewed_page`.
+    fn handle_curator_message(app: &tauri::AppHandle, jr: &webkit2gtk::JavascriptResult) {
+        use tauri::Emitter;
+        let json = jr.js_value().map(|v| v.to_string()).unwrap_or_default();
+        #[derive(serde::Deserialize)]
+        struct Msg {
+            url: String,
+            #[serde(default)]
+            title: String,
+            text: String,
+            #[serde(rename = "final", default)]
+            is_final: bool,
+        }
+        if let Ok(m) = serde_json::from_str::<Msg>(&json) {
+            let _ = app.emit(
+                "browser-viewed-content",
+                ViewedContentEvent { url: m.url, title: m.title, text: m.text, is_final: m.is_final },
+            );
+        }
+    }
+
     pub(crate) fn set_current_tab(tab_id: i64) {
         if let Ok(mut g) = CURRENT_TAB.lock() {
             *g = Some(tab_id);
@@ -898,6 +1063,7 @@ pub(crate) mod imp {
         // command layer (which knows the profile + unlock state).
         let ucm = webkit2gtk::UserContentManager::new();
         ucm.register_script_message_handler("reclaimVault");
+        ucm.register_script_message_handler("reclaimCurator");
         {
             use webkit2gtk::{UserContentInjectedFrames, UserScript, UserScriptInjectionTime};
             let script = UserScript::new(
@@ -908,11 +1074,26 @@ pub(crate) mod imp {
                 &[],
             );
             ucm.add_script(&script);
+            // Viewed-content bridge — top frame only, runs at document end.
+            let curator = UserScript::new(
+                CURATOR_USER_SCRIPT,
+                UserContentInjectedFrames::TopFrame,
+                UserScriptInjectionTime::End,
+                &[],
+                &[],
+            );
+            ucm.add_script(&curator);
         }
         {
             let a = app.clone();
             ucm.connect_script_message_received(Some("reclaimVault"), move |_ucm, jr| {
                 handle_vault_message(&a, jr);
+            });
+        }
+        {
+            let a = app.clone();
+            ucm.connect_script_message_received(Some("reclaimCurator"), move |_ucm, jr| {
+                handle_curator_message(&a, jr);
             });
         }
 
@@ -936,21 +1117,31 @@ pub(crate) mod imp {
         {
             let a = app.clone();
             webview.connect_user_message_received(move |_v, msg| {
-                if msg.name().as_deref() == Some("noscript:seen") {
-                    let parsed = msg.parameters().and_then(|p| {
-                        p.get::<(String, bool)>()
-                            .or_else(|| p.get::<String>().map(|o| (o, false)))
-                    });
-                    if let Some((origin, first_party)) = parsed {
-                        record_seen_origin(tab_id, origin.clone(), first_party);
-                        // Only push live to the panel when THIS tab is the active
-                        // one — a background tab's late reports shouldn't appear.
-                        let cur = CURRENT_TAB.lock().ok().and_then(|g| *g).unwrap_or(-1);
-                        if tab_id == cur {
-                            use tauri::Emitter;
-                            let _ = a.emit("noscript-origin", NoscriptOrigin { origin, first_party });
+                match msg.name().as_deref() {
+                    // A new web-process extension just initialized with an empty
+                    // trusted set — re-broadcast the current trust so it enforces
+                    // correctly from the first request. Without this, scripts on a
+                    // trusted site break on every newly-opened tab.
+                    Some("noscript:ready") => {
+                        push_trust_to_extensions();
+                    }
+                    Some("noscript:seen") => {
+                        let parsed = msg.parameters().and_then(|p| {
+                            p.get::<(String, bool)>()
+                                .or_else(|| p.get::<String>().map(|o| (o, false)))
+                        });
+                        if let Some((origin, first_party)) = parsed {
+                            record_seen_origin(tab_id, origin.clone(), first_party);
+                            // Only push live to the panel when THIS tab is the active
+                            // one — a background tab's late reports shouldn't appear.
+                            let cur = CURRENT_TAB.lock().ok().and_then(|g| *g).unwrap_or(-1);
+                            if tab_id == cur {
+                                use tauri::Emitter;
+                                let _ = a.emit("noscript-origin", NoscriptOrigin { origin, first_party });
+                            }
                         }
                     }
+                    _ => {}
                 }
                 false
             });
@@ -1408,21 +1599,28 @@ pub(crate) mod imp {
                 {
                     let a = app.clone();
                     webview.connect_user_message_received(move |_v, msg| {
-                        if msg.name().as_deref() == Some("noscript:seen") {
-                            // Tolerate both the (origin, first_party) tuple and a
-                            // bare origin string (older extension build).
-                            let parsed = msg.parameters().and_then(|p| {
-                                p.get::<(String, bool)>()
-                                    .or_else(|| p.get::<String>().map(|o| (o, false)))
-                            });
-                            if let Some((origin, first_party)) = parsed {
-                                // Legacy X11 single-surface path: attribute to the
-                                // current tab.
-                                let cur = CURRENT_TAB.lock().ok().and_then(|g| *g).unwrap_or(-1);
-                                record_seen_origin(cur, origin.clone(), first_party);
-                                use tauri::Emitter;
-                                let _ = a.emit("noscript-origin", NoscriptOrigin { origin, first_party });
+                        match msg.name().as_deref() {
+                            // New web-process extension came up empty — re-push trust.
+                            Some("noscript:ready") => {
+                                push_trust_to_extensions();
                             }
+                            Some("noscript:seen") => {
+                                // Tolerate both the (origin, first_party) tuple and a
+                                // bare origin string (older extension build).
+                                let parsed = msg.parameters().and_then(|p| {
+                                    p.get::<(String, bool)>()
+                                        .or_else(|| p.get::<String>().map(|o| (o, false)))
+                                });
+                                if let Some((origin, first_party)) = parsed {
+                                    // Legacy X11 single-surface path: attribute to the
+                                    // current tab.
+                                    let cur = CURRENT_TAB.lock().ok().and_then(|g| *g).unwrap_or(-1);
+                                    record_seen_origin(cur, origin.clone(), first_party);
+                                    use tauri::Emitter;
+                                    let _ = a.emit("noscript-origin", NoscriptOrigin { origin, first_party });
+                                }
+                            }
+                            _ => {}
                         }
                         false
                     });
@@ -1754,11 +1952,35 @@ pub async fn get_html() -> Result<String, String> {
     imp::get_html().await
 }
 
+/// Resolve a stored download path (which may be a percent-encoded `file://` URI
+/// from WebKit) to a real filesystem path.
+fn download_fs_path(path: &str) -> std::path::PathBuf {
+    if path.starts_with("file://") {
+        if let Ok(url) = url::Url::parse(path) {
+            if let Ok(p) = url.to_file_path() {
+                return p;
+            }
+        }
+        // Fallback: strip the scheme literally.
+        return std::path::PathBuf::from(path.trim_start_matches("file://"));
+    }
+    std::path::PathBuf::from(path)
+}
+
 /// Open a finished download with the system default handler.
 #[tauri::command(rename_all = "camelCase")]
 pub async fn open_download(path: String) -> Result<(), String> {
-    let p = path.strip_prefix("file://").unwrap_or(&path);
+    let p = download_fs_path(&path);
     open::that(p).map_err(|e| e.to_string())
+}
+
+/// Reveal a finished download in the system file manager (opens its containing
+/// folder). Used by the "Folder" action in the downloads menu.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn open_download_location(path: String) -> Result<(), String> {
+    let p = download_fs_path(&path);
+    let dir = p.parent().ok_or_else(|| "No containing folder".to_string())?;
+    open::that(dir).map_err(|e| e.to_string())
 }
 
 // ---- Frontend control commands ----
