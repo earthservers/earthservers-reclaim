@@ -7,6 +7,7 @@ import VideoPlayer from './VideoPlayer';
 import ImageViewer from './ImageViewer';
 import GStreamerPlayer from './GStreamerPlayer';
 import GStreamerVideoPlayer, { PlayerStatusExport } from './GStreamerVideoPlayer';
+import { VaultAutofill } from '../VaultAutofill';
 
 // Types
 export type MediaType = 'video' | 'image' | 'audio';
@@ -168,6 +169,12 @@ const mediaStateCache: {
 // return (its dialog hidden behind the native video surfaces), blacking out and
 // blocking the whole UI while videos keep playing.
 let mediaPasswordPrompted = false;
+
+// Profiles whose media tab has been unlocked THIS app session. Module-scoped so it
+// survives the component's remounts (the tab remounts every time you return to it);
+// resets to locked on app restart, like the other password gates. Incognito does
+// NOT bypass this — the gate is enforced whatever the privacy mode.
+const mediaUnlockedProfiles = new Set<number>();
 
 export function EarthMultiMedia({ profileId, initialSource, initialType, onFullscreenChange }: EarthMultiMediaProps & { onFullscreenChange?: (isFullscreen: boolean) => void }) {
   // State
@@ -664,6 +671,12 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
   const [showMediaPassword, setShowMediaPassword] = useState(false);
   const [passwordError, setPasswordError] = useState('');
   const [isSettingPassword, setIsSettingPassword] = useState(false);
+  // Access gate: when a media password is set, the tab is locked until it's
+  // entered (per session). null = still checking.
+  const [mediaLocked, setMediaLocked] = useState<boolean | null>(null);
+  const [unlockInput, setUnlockInput] = useState('');
+  const [unlockError, setUnlockError] = useState('');
+  const [isUnlocking, setIsUnlocking] = useState(false);
 
   // Toggle fullscreen mode using Fullscreen API
   const toggleFullscreen = useCallback(async () => {
@@ -1316,6 +1329,10 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
     try {
       const settings = await invoke<PrivacySettings>('get_media_privacy_settings', { profileId });
       setPrivacySettings(settings);
+      // Access gate: if a password is set and protection is on, lock the tab until
+      // it's entered this session. This is enforced regardless of incognito.
+      const gated = !!settings.password_hash && settings.require_password;
+      setMediaLocked(gated && !mediaUnlockedProfiles.has(profileId));
       // Show the password setup modal if no password is set — but only ONCE per
       // session. It's a full-screen overlay; re-prompting on every return to the
       // Media tab blacks out and blocks the UI (the dialog hides behind the
@@ -1326,6 +1343,29 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
       }
     } catch (err) {
       console.error('Failed to load privacy settings:', err);
+      setMediaLocked(false); // don't trap the user if settings can't be read
+    }
+  };
+
+  // Verify the media password and unlock the tab for this session.
+  const handleUnlockMedia = async () => {
+    setUnlockError('');
+    if (!unlockInput) { setUnlockError('Enter your media password'); return; }
+    setIsUnlocking(true);
+    try {
+      const ok = await invoke<boolean>('verify_media_password', { profileId, password: unlockInput });
+      if (ok) {
+        mediaUnlockedProfiles.add(profileId);
+        setMediaLocked(false);
+        setUnlockInput('');
+      } else {
+        setUnlockError('Incorrect password');
+      }
+    } catch (err) {
+      console.error('Failed to verify media password:', err);
+      setUnlockError('Could not verify password');
+    } finally {
+      setIsUnlocking(false);
     }
   };
 
@@ -1702,6 +1742,51 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
   // Get current media title
   const currentMedia = mediaItems[activePane];
   const currentTitle = currentMedia?.title || (currentMedia?.source ? currentMedia.source.split('/').pop() : 'No media loaded');
+
+  // While we're still checking the gate, render nothing heavy — this avoids
+  // flashing the media UI/surfaces for a frame before a locked tab resolves.
+  if (mediaLocked === null) {
+    return <div className="h-full bg-[var(--background-color)]" />;
+  }
+
+  // Access gate: when the media password is set, lock the tab until it's entered.
+  // Rendered as an early return so no media surfaces/players are mounted while
+  // locked. Enforced in every privacy mode, including incognito.
+  if (mediaLocked) {
+    return (
+      <div className="flex flex-col items-center justify-center h-full bg-[var(--background-color)] p-6">
+        <svg className="w-12 h-12 text-[var(--primary-color)] mb-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+        </svg>
+        <h1 className="text-xl font-bold text-white">Media is locked</h1>
+        <p className="text-sm text-[var(--text-muted-color)] mt-1 mb-4 text-center max-w-xs">
+          Enter your media password to access your media, history, and playlists.
+        </p>
+        <div className="w-72">
+          <input
+            type="password"
+            autoFocus
+            placeholder="Media password"
+            value={unlockInput}
+            onChange={(e) => setUnlockInput(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') handleUnlockMedia(); }}
+            className="w-full bg-gray-800 border border-gray-600 rounded px-3 py-2 text-sm text-white outline-none focus:border-[var(--primary-color)]"
+          />
+          {unlockError && <p className="text-red-400 text-xs mt-2">{unlockError}</p>}
+          <button
+            onClick={handleUnlockMedia}
+            disabled={isUnlocking}
+            className="mt-3 w-full px-3 py-2 text-sm rounded-lg bg-[var(--primary-color)] text-white hover:opacity-90 disabled:opacity-40"
+          >
+            {isUnlocking ? 'Unlocking…' : 'Unlock'}
+          </button>
+          <div className="mt-2 flex justify-center">
+            <VaultAutofill profileId={profileId} appKey="media" onFill={(pw) => setUnlockInput(pw)} />
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div

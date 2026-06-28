@@ -3,11 +3,30 @@
 
 use rusqlite::{Connection, Result, params};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{RwLock, LazyLock};
 
-/// Per-profile incognito state - in-memory only, not persisted across restarts
+// ==================== Incognito state ====================
+//
+// "Incognito mode" is a PER-PROFILE flag (the toggle in the toolbar). It is now
+// PERSISTED in the `incognito_state` table so a profile you put in incognito stays
+// in incognito across restarts.
+//
+// A "dedicated incognito profile" is a profile named "Incognito" (the always-
+// available private profile, also protected from deletion). It is FORCED into
+// incognito: `is_incognito` always returns true for it and the toggle can't turn
+// it off. So the two concepts share ONE flag — the dedicated profile just pins it on.
+//
+// The in-memory maps below are a write-through cache over the DB, loaded once at
+// startup (`init_incognito_persistence`) so `is_incognito` stays a cheap lookup
+// (it's called on hot paths like history/AI gating).
+
+/// Cache of each profile's persisted incognito flag.
 static INCOGNITO_PROFILES: LazyLock<RwLock<HashMap<i64, bool>>> = LazyLock::new(|| RwLock::new(HashMap::new()));
+/// Profile ids that are FORCED incognito (the dedicated "Incognito" profile).
+static FORCED_INCOGNITO: LazyLock<RwLock<HashSet<i64>>> = LazyLock::new(|| RwLock::new(HashSet::new()));
+/// DB path for persisting the flag; set once at startup.
+static INCOGNITO_DB: LazyLock<RwLock<Option<String>>> = LazyLock::new(|| RwLock::new(None));
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryEntry {
@@ -49,36 +68,131 @@ impl PrivacyManager {
 
     // ==================== Per-Profile Incognito Mode ====================
 
-    /// Check if incognito mode is currently active for a specific profile
+    /// Wire up incognito persistence at startup: remember the DB path, create the
+    /// state table, load every persisted flag into the cache, and force any
+    /// dedicated "Incognito" profile permanently on. Call once after the profile
+    /// tables are initialized.
+    pub fn init_incognito_persistence(db_path: &str) {
+        if let Ok(mut p) = INCOGNITO_DB.write() {
+            *p = Some(db_path.to_string());
+        }
+
+        let conn = match Connection::open(db_path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[incognito] could not open DB for persistence: {}", e);
+                return;
+            }
+        };
+        let _ = conn.execute(
+            "CREATE TABLE IF NOT EXISTS incognito_state (
+                profile_id   INTEGER PRIMARY KEY,
+                is_incognito INTEGER NOT NULL DEFAULT 0
+            )",
+            [],
+        );
+
+        // Load persisted flags into the cache.
+        if let Ok(mut stmt) = conn.prepare("SELECT profile_id, is_incognito FROM incognito_state") {
+            if let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)? != 0))) {
+                if let Ok(mut cache) = INCOGNITO_PROFILES.write() {
+                    for row in rows.flatten() {
+                        cache.insert(row.0, row.1);
+                    }
+                }
+            }
+        }
+
+        // Force every dedicated "Incognito" profile permanently on. Collect ids
+        // first so the prepared statement's borrow of `conn` ends before we touch
+        // the static caches (and before `conn` drops at end of scope).
+        let forced_ids: Vec<i64> = {
+            let mut ids = Vec::new();
+            if let Ok(mut stmt) = conn.prepare("SELECT id FROM profiles WHERE LOWER(TRIM(name)) = 'incognito'") {
+                if let Ok(rows) = stmt.query_map([], |r| r.get::<_, i64>(0)) {
+                    ids.extend(rows.flatten());
+                }
+            }
+            ids
+        };
+        for id in forced_ids {
+            Self::mark_incognito_profile(id);
+        }
+    }
+
+    /// Best-effort persist of a single profile's flag to the DB.
+    fn persist_incognito(profile_id: i64, enabled: bool) {
+        let path = INCOGNITO_DB.read().ok().and_then(|p| p.clone());
+        if let Some(path) = path {
+            if let Ok(conn) = Connection::open(&path) {
+                let _ = conn.execute(
+                    "INSERT INTO incognito_state (profile_id, is_incognito) VALUES (?1, ?2)
+                     ON CONFLICT(profile_id) DO UPDATE SET is_incognito = ?2",
+                    params![profile_id, if enabled { 1 } else { 0 }],
+                );
+            }
+        }
+    }
+
+    /// Whether a profile is forced incognito (the dedicated Incognito profile).
+    pub fn is_forced_incognito(profile_id: i64) -> bool {
+        FORCED_INCOGNITO.read().map(|s| s.contains(&profile_id)).unwrap_or(false)
+    }
+
+    /// Mark a profile as the dedicated Incognito profile: forced on forever. Used
+    /// at startup and whenever such a profile is created mid-session.
+    pub fn mark_incognito_profile(profile_id: i64) {
+        if let Ok(mut s) = FORCED_INCOGNITO.write() {
+            s.insert(profile_id);
+        }
+        if let Ok(mut cache) = INCOGNITO_PROFILES.write() {
+            cache.insert(profile_id, true);
+        }
+        Self::persist_incognito(profile_id, true);
+    }
+
+    /// Check if incognito mode is currently active for a specific profile. The
+    /// dedicated Incognito profile always reports true.
     pub fn is_incognito(profile_id: i64) -> bool {
+        if Self::is_forced_incognito(profile_id) {
+            return true;
+        }
         let profiles = INCOGNITO_PROFILES.read().unwrap();
         *profiles.get(&profile_id).unwrap_or(&false)
     }
 
     /// Enable incognito mode for a specific profile
     pub fn enable_incognito(profile_id: i64) {
-        let mut profiles = INCOGNITO_PROFILES.write().unwrap();
-        profiles.insert(profile_id, true);
+        Self::set_incognito(profile_id, true);
     }
 
-    /// Disable incognito mode for a specific profile
+    /// Disable incognito mode for a specific profile (no-op for the forced profile)
     pub fn disable_incognito(profile_id: i64) {
-        let mut profiles = INCOGNITO_PROFILES.write().unwrap();
-        profiles.insert(profile_id, false);
+        Self::set_incognito(profile_id, false);
     }
 
-    /// Set incognito mode for a specific profile
+    /// Set incognito mode for a specific profile. The dedicated Incognito profile
+    /// can't be turned off — requests to disable it are ignored (stays on).
     pub fn set_incognito(profile_id: i64, enabled: bool) {
-        let mut profiles = INCOGNITO_PROFILES.write().unwrap();
-        profiles.insert(profile_id, enabled);
+        let effective = enabled || Self::is_forced_incognito(profile_id);
+        {
+            let mut profiles = INCOGNITO_PROFILES.write().unwrap();
+            profiles.insert(profile_id, effective);
+        }
+        Self::persist_incognito(profile_id, effective);
     }
 
-    /// Toggle incognito mode for a specific profile, returns new state
+    /// Toggle incognito mode for a specific profile, returns new state. The
+    /// dedicated Incognito profile stays on (toggle is a no-op returning true).
     pub fn toggle_incognito(profile_id: i64) -> bool {
-        let mut profiles = INCOGNITO_PROFILES.write().unwrap();
-        let current = *profiles.get(&profile_id).unwrap_or(&false);
-        let new_state = !current;
-        profiles.insert(profile_id, new_state);
+        if Self::is_forced_incognito(profile_id) {
+            return true;
+        }
+        let new_state = {
+            let profiles = INCOGNITO_PROFILES.read().unwrap();
+            !*profiles.get(&profile_id).unwrap_or(&false)
+        };
+        Self::set_incognito(profile_id, new_state);
         new_state
     }
 

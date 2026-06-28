@@ -25,10 +25,25 @@ export function ProfileManager({ onProfileChange }: ProfileManagerProps) {
   const [isCreating, setIsCreating] = useState(false);
   const [newProfileName, setNewProfileName] = useState('');
   const [newProfileIcon, setNewProfileIcon] = useState('user');
+  const [newProfilePin, setNewProfilePin] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [dropdownPosition, setDropdownPosition] = useState({ top: 0, right: 0 });
   const buttonRef = useRef<HTMLButtonElement>(null);
+  // Profiles that are protected (Default / Incognito) — wipe-only, never deletable.
+  const [protectedIds, setProtectedIds] = useState<Set<number>>(new Set());
+  // The in-progress destructive action (delete or wipe). Its modal collects the
+  // 4-digit delete code; if the profile has none yet, the code entered also SETS it.
+  const [dangerAction, setDangerAction] = useState<{
+    profile: Profile;
+    mode: 'delete' | 'wipe';
+    needsPinSetup: boolean;
+  } | null>(null);
+  const [pinInput, setPinInput] = useState('');
+  const [dangerError, setDangerError] = useState('');
+  const [dangerBusy, setDangerBusy] = useState(false);
+
+  const isFourDigits = (s: string) => /^\d{4}$/.test(s);
 
   // Load profiles on mount
   useEffect(() => {
@@ -45,6 +60,19 @@ export function ProfileManager({ onProfileChange }: ProfileManagerProps) {
       setProfiles(profileList);
       setActiveProfile(active);
       setError(null);
+
+      // Resolve which profiles are protected (wipe-only) so the row shows the
+      // right action. Failures default to "not protected" (delete still gated by code).
+      const flags = await Promise.all(
+        profileList.map(p =>
+          p.id != null
+            ? invoke<boolean>('profile_is_protected', { profileId: p.id }).catch(() => false)
+            : Promise.resolve(false)
+        )
+      );
+      const ids = new Set<number>();
+      profileList.forEach((p, i) => { if (p.id != null && flags[i]) ids.add(p.id); });
+      setProtectedIds(ids);
     } catch (err) {
       setError(`Failed to load profiles: ${err}`);
     } finally {
@@ -57,15 +85,21 @@ export function ProfileManager({ onProfileChange }: ProfileManagerProps) {
       setError('Profile name is required');
       return;
     }
+    if (!isFourDigits(newProfilePin)) {
+      setError('Set a 4-digit delete code (needed later to delete or wipe this profile)');
+      return;
+    }
 
     try {
       const profile = await invoke<Profile>('create_profile', {
         name: newProfileName.trim(),
         icon: newProfileIcon,
+        deletePin: newProfilePin,
       });
       setProfiles([...profiles, profile]);
       setNewProfileName('');
       setNewProfileIcon('user');
+      setNewProfilePin('');
       setIsCreating(false);
       setError(null);
     } catch (err) {
@@ -88,27 +122,63 @@ export function ProfileManager({ onProfileChange }: ProfileManagerProps) {
     }
   };
 
-  const handleDeleteProfile = async (profileId: number) => {
-    if (profiles.length <= 1) {
+  // Open the confirm modal for a destructive action. Protected profiles
+  // (Default/Incognito) can only be WIPED; others are DELETED outright.
+  const startDangerAction = async (profile: Profile) => {
+    if (profile.id == null) return;
+    const mode: 'delete' | 'wipe' = protectedIds.has(profile.id) ? 'wipe' : 'delete';
+    if (mode === 'delete' && profiles.length <= 1) {
       setError('Cannot delete the only profile');
       return;
     }
-
-    const confirmed = window.confirm(
-      'Are you sure you want to delete this profile? All associated data will be permanently deleted.'
-    );
-
-    if (!confirmed) return;
-
+    setError(null);
+    setPinInput('');
+    setDangerError('');
+    let needsPinSetup = false;
     try {
-      await invoke('delete_profile', { profileId });
-      setProfiles(profiles.filter(p => p.id !== profileId));
-      if (activeProfile?.id === profileId) {
-        loadProfiles(); // Reload to get new active profile
+      needsPinSetup = !(await invoke<boolean>('profile_has_delete_pin', { profileId: profile.id }));
+    } catch {
+      needsPinSetup = false;
+    }
+    setDangerAction({ profile, mode, needsPinSetup });
+  };
+
+  const confirmDangerAction = async () => {
+    if (!dangerAction || dangerAction.profile.id == null) return;
+    const { profile, mode, needsPinSetup } = dangerAction;
+    setDangerError('');
+    if (!isFourDigits(pinInput)) {
+      setDangerError('Enter a 4-digit code');
+      return;
+    }
+    setDangerBusy(true);
+    try {
+      // No code yet → the code entered here becomes the profile's delete code.
+      if (needsPinSetup) {
+        await invoke('set_profile_delete_pin', { profileId: profile.id, pin: pinInput });
+      }
+      await invoke(mode === 'delete' ? 'delete_profile' : 'wipe_profile', {
+        profileId: profile.id,
+        pin: pinInput,
+      });
+      setDangerAction(null);
+      setPinInput('');
+      if (mode === 'delete') {
+        setProfiles(profiles.filter(p => p.id !== profile.id));
+        if (activeProfile?.id === profile.id) {
+          await loadProfiles(); // reload to pick up the newly-promoted active profile
+          const newActive = await invoke<Profile | null>('get_active_profile').catch(() => null);
+          if (newActive) onProfileChange?.(newActive);
+        }
+      } else {
+        // Wipe keeps the profile; reload so any cached views refresh.
+        loadProfiles();
       }
       setError(null);
     } catch (err) {
-      setError(`Failed to delete profile: ${err}`);
+      setDangerError(String(err).replace(/^.*?:\s*/, ''));
+    } finally {
+      setDangerBusy(false);
     }
   };
 
@@ -204,21 +274,39 @@ export function ProfileManager({ onProfileChange }: ProfileManagerProps) {
                     )}
                   </div>
                 </button>
-                {!profile.is_active && profiles.length > 1 && (
-                  <button
-                    onClick={() => profile.id && handleDeleteProfile(profile.id)}
-                    className="p-1 text-gray-500 hover:text-red-400 transition-colors"
-                    title="Delete profile"
-                  >
-                    <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                      <path
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                        strokeWidth={2}
-                        d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"
-                      />
-                    </svg>
-                  </button>
+                {profile.id != null && (
+                  protectedIds.has(profile.id) ? (
+                    <button
+                      onClick={() => startDangerAction(profile)}
+                      className="p-1 text-gray-500 hover:text-amber-400 transition-colors"
+                      title="Wipe profile data (the Default & Incognito profiles can't be deleted)"
+                    >
+                      {/* refresh / fresh-start icon for wipe */}
+                      <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          strokeWidth={2}
+                          d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"
+                        />
+                      </svg>
+                    </button>
+                  ) : profiles.length > 1 ? (
+                    <button
+                      onClick={() => startDangerAction(profile)}
+                      className="p-1 text-gray-500 hover:text-red-400 transition-colors"
+                      title="Delete profile"
+                    >
+                      <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          strokeWidth={2}
+                          d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"
+                        />
+                      </svg>
+                    </button>
+                  ) : null
                 )}
               </div>
             ))}
@@ -252,10 +340,26 @@ export function ProfileManager({ onProfileChange }: ProfileManagerProps) {
                     </button>
                   ))}
                 </div>
+                <div>
+                  <input
+                    type="password"
+                    inputMode="numeric"
+                    maxLength={4}
+                    placeholder="4-digit delete code"
+                    value={newProfilePin}
+                    onChange={(e) => setNewProfilePin(e.target.value.replace(/\D/g, '').slice(0, 4))}
+                    onKeyDown={(e) => e.key === 'Enter' && handleCreateProfile()}
+                    className="w-full px-3 py-2 bg-white/5 border border-white/10 rounded-lg text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-earth-teal tracking-[0.4em]"
+                  />
+                  <p className="text-[11px] text-gray-500 mt-1">
+                    Required to delete or wipe this profile later. Keep it safe — there's no recovery.
+                  </p>
+                </div>
                 <div className="flex gap-2">
                   <button
                     onClick={handleCreateProfile}
-                    className="flex-1 px-3 py-2 bg-earth-teal text-white rounded-lg hover:opacity-90 transition-opacity"
+                    disabled={!newProfileName.trim() || !isFourDigits(newProfilePin)}
+                    className="flex-1 px-3 py-2 bg-earth-teal text-white rounded-lg hover:opacity-90 transition-opacity disabled:opacity-40"
                   >
                     Create
                   </button>
@@ -263,6 +367,7 @@ export function ProfileManager({ onProfileChange }: ProfileManagerProps) {
                     onClick={() => {
                       setIsCreating(false);
                       setNewProfileName('');
+                      setNewProfilePin('');
                       setError(null);
                     }}
                     className="px-3 py-2 text-gray-400 hover:text-white transition-colors"
@@ -282,6 +387,64 @@ export function ProfileManager({ onProfileChange }: ProfileManagerProps) {
                 Create New Profile
               </button>
             )}
+          </div>
+        </div>,
+        document.body
+      )}
+
+      {/* Destructive-action confirm modal (delete / wipe), gated by 4-digit code */}
+      {dangerAction && createPortal(
+        <div
+          className="fixed inset-0 z-[10000] flex items-center justify-center bg-black/60 backdrop-blur-sm"
+          onClick={() => { if (!dangerBusy) { setDangerAction(null); setPinInput(''); } }}
+        >
+          <div
+            className="w-[22rem] bg-gray-900 border border-white/10 rounded-xl shadow-2xl p-5"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 className="text-white font-semibold text-base mb-1">
+              {dangerAction.mode === 'delete' ? 'Delete profile' : 'Wipe profile data'}
+              {' '}— {dangerAction.profile.name}
+            </h3>
+            <p className="text-xs text-gray-400 mb-3">
+              {dangerAction.mode === 'delete'
+                ? 'This permanently removes the profile and ALL of its data (history, bookmarks, domains, media, saved passwords & 2FA codes). This cannot be undone.'
+                : 'This permanently erases ALL of this profile’s data (history, bookmarks, domains, media, saved passwords & 2FA codes) but keeps the profile itself. This cannot be undone.'}
+            </p>
+            <p className="text-xs text-gray-300 mb-2">
+              {dangerAction.needsPinSetup
+                ? 'This profile has no delete code yet. Enter a 4-digit code to set it and confirm:'
+                : 'Enter this profile’s 4-digit delete code to confirm:'}
+            </p>
+            <input
+              type="password"
+              inputMode="numeric"
+              maxLength={4}
+              autoFocus
+              value={pinInput}
+              onChange={(e) => setPinInput(e.target.value.replace(/\D/g, '').slice(0, 4))}
+              onKeyDown={(e) => { if (e.key === 'Enter') confirmDangerAction(); }}
+              placeholder="••••"
+              className="w-full px-3 py-2 bg-white/5 border border-white/10 rounded-lg text-white text-center text-lg tracking-[0.5em] placeholder-gray-600 focus:outline-none focus:ring-2 focus:ring-red-500"
+            />
+            {dangerError && <p className="text-red-400 text-xs mt-2">{dangerError}</p>}
+            <div className="flex gap-2 mt-4">
+              <button
+                onClick={confirmDangerAction}
+                disabled={dangerBusy || !isFourDigits(pinInput)}
+                className={`flex-1 px-3 py-2 rounded-lg text-white transition-opacity disabled:opacity-40 ${
+                  dangerAction.mode === 'delete' ? 'bg-red-600 hover:bg-red-500' : 'bg-amber-600 hover:bg-amber-500'
+                }`}
+              >
+                {dangerBusy ? 'Working…' : dangerAction.mode === 'delete' ? 'Delete forever' : 'Wipe data'}
+              </button>
+              <button
+                onClick={() => { if (!dangerBusy) { setDangerAction(null); setPinInput(''); } }}
+                className="px-3 py-2 text-gray-400 hover:text-white transition-colors"
+              >
+                Cancel
+              </button>
+            </div>
           </div>
         </div>,
         document.body

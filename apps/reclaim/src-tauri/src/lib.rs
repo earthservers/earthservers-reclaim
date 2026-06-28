@@ -92,11 +92,19 @@ async fn create_profile(
     state: State<'_, Mutex<AppState>>,
     name: String,
     icon: Option<String>,
+    delete_pin: String,
 ) -> Result<Profile, String> {
     let state = state.lock().map_err(|e| e.to_string())?;
-    state.profile_manager
-        .create_profile(&name, icon.as_deref())
-        .map_err(|e| e.to_string())
+    let profile = state.profile_manager
+        .create_profile(&name, icon.as_deref(), &delete_pin)
+        .map_err(format_profile_pin_err)?;
+    // A profile named "Incognito" is the dedicated, always-private profile.
+    if name.trim().eq_ignore_ascii_case("incognito") {
+        if let Some(id) = profile.id {
+            PrivacyManager::mark_incognito_profile(id);
+        }
+    }
+    Ok(profile)
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -127,11 +135,72 @@ async fn update_profile(
 async fn delete_profile(
     state: State<'_, Mutex<AppState>>,
     profile_id: i64,
+    pin: String,
 ) -> Result<(), String> {
     let state = state.lock().map_err(|e| e.to_string())?;
     state.profile_manager
-        .delete_profile(profile_id)
-        .map_err(|e| format!("Cannot delete profile: {}", e))
+        .delete_profile(profile_id, &pin)
+        .map_err(format_profile_pin_err)
+}
+
+/// Wipe ALL of a profile's data but keep the profile itself. The only destructive
+/// option for the protected Default/Incognito profiles; gated by the delete code.
+#[tauri::command(rename_all = "camelCase")]
+async fn wipe_profile(
+    state: State<'_, Mutex<AppState>>,
+    profile_id: i64,
+    pin: String,
+) -> Result<(), String> {
+    let state = state.lock().map_err(|e| e.to_string())?;
+    state.profile_manager
+        .wipe_profile(profile_id, &pin)
+        .map_err(format_profile_pin_err)
+}
+
+/// Whether a profile is protected (Default/Incognito — wipe-only, never deletable).
+#[tauri::command(rename_all = "camelCase")]
+async fn profile_is_protected(
+    state: State<'_, Mutex<AppState>>,
+    profile_id: i64,
+) -> Result<bool, String> {
+    let state = state.lock().map_err(|e| e.to_string())?;
+    state.profile_manager
+        .is_protected_profile(profile_id)
+        .map_err(|e| e.to_string())
+}
+
+/// Whether a profile already has a 4-digit delete code set.
+#[tauri::command(rename_all = "camelCase")]
+async fn profile_has_delete_pin(
+    state: State<'_, Mutex<AppState>>,
+    profile_id: i64,
+) -> Result<bool, String> {
+    let state = state.lock().map_err(|e| e.to_string())?;
+    state.profile_manager
+        .has_delete_pin(profile_id)
+        .map_err(|e| e.to_string())
+}
+
+/// Set (or change) a profile's 4-digit delete code.
+#[tauri::command(rename_all = "camelCase")]
+async fn set_profile_delete_pin(
+    state: State<'_, Mutex<AppState>>,
+    profile_id: i64,
+    pin: String,
+) -> Result<(), String> {
+    let state = state.lock().map_err(|e| e.to_string())?;
+    state.profile_manager
+        .set_delete_pin(profile_id, &pin)
+        .map_err(format_profile_pin_err)
+}
+
+/// rusqlite surfaces our user-facing messages as `InvalidParameterName("…")`;
+/// unwrap those to the bare message and pass everything else through.
+fn format_profile_pin_err(e: rusqlite::Error) -> String {
+    match e {
+        rusqlite::Error::InvalidParameterName(m) => m,
+        other => other.to_string(),
+    }
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -187,6 +256,13 @@ fn set_incognito(profile_id: i64, enabled: bool) {
 #[tauri::command(rename_all = "camelCase")]
 fn get_incognito_profiles() -> Vec<i64> {
     PrivacyManager::get_incognito_profiles()
+}
+
+/// Whether a profile is FORCED incognito (the dedicated Incognito profile) — so
+/// the UI can show the toggle as locked-on.
+#[tauri::command(rename_all = "camelCase")]
+fn incognito_is_forced(profile_id: i64) -> bool {
+    PrivacyManager::is_forced_incognito(profile_id)
 }
 
 // ==================== Identity Commands (Hardware Fingerprinting) ====================
@@ -2088,6 +2164,9 @@ pub fn run() {
 
             // Initialize database tables
             profile_manager.init().expect("Failed to initialize profile tables");
+            // Restore persisted per-profile incognito flags and force the dedicated
+            // Incognito profile permanently on. Must run after profile tables exist.
+            PrivacyManager::init_incognito_persistence(&db_path_str);
             knowledge_graph.init().expect("Failed to initialize knowledge graph");
             theme_manager.init().expect("Failed to initialize theme tables");
             search_manager.init().expect("Failed to initialize search tables");
@@ -2387,6 +2466,10 @@ pub fn run() {
             switch_profile,
             update_profile,
             delete_profile,
+            wipe_profile,
+            profile_is_protected,
+            profile_has_delete_pin,
+            set_profile_delete_pin,
             get_privacy_settings,
             update_privacy_settings,
             export_profile,
@@ -2395,6 +2478,7 @@ pub fn run() {
             toggle_incognito,
             set_incognito,
             get_incognito_profiles,
+            incognito_is_forced,
             // Identity commands (hardware fingerprinting)
             get_hardware_info,
             get_device_fingerprint,

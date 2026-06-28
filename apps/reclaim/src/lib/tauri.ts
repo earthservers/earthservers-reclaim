@@ -319,6 +319,11 @@ const mockCommands: Record<string, (args?: any) => any> = {
   switch_profile: () => mockProfile,
   update_profile: (args: any) => ({ ...mockProfile, ...args }),
   delete_profile: () => undefined,
+  wipe_profile: () => undefined,
+  // "Default" is protected (wipe-only) in the mock too.
+  profile_is_protected: (args: any) => args?.profileId === mockProfile.id,
+  profile_has_delete_pin: () => false,
+  set_profile_delete_pin: () => undefined,
 
   // Per-profile incognito commands
   get_incognito_status: (args: any) => {
@@ -335,6 +340,7 @@ const mockCommands: Record<string, (args?: any) => any> = {
     mockIncognitoProfiles[args.profileId] = args.enabled;
     return undefined;
   },
+  incognito_is_forced: () => false,
   get_incognito_profiles: () => {
     return Object.entries(mockIncognitoProfiles)
       .filter(([_, isIncognito]) => isIncognito)

@@ -9,6 +9,7 @@ interface IncognitoToggleProps {
 
 export function IncognitoToggle({ profileId, onStatusChange }: IncognitoToggleProps) {
   const [isIncognito, setIsIncognito] = useState(false);
+  const [isForced, setIsForced] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
   const [showTooltip, setShowTooltip] = useState(false);
   const [tooltipPosition, setTooltipPosition] = useState({ top: 0, right: 0 });
@@ -21,7 +22,11 @@ export function IncognitoToggle({ profileId, onStatusChange }: IncognitoTogglePr
 
   const loadStatus = async () => {
     try {
-      const status = await invoke<boolean>('get_incognito_status', { profileId });
+      const [status, forced] = await Promise.all([
+        invoke<boolean>('get_incognito_status', { profileId }),
+        invoke<boolean>('incognito_is_forced', { profileId }).catch(() => false),
+      ]);
+      setIsForced(forced);
       setIsIncognito(status);
     } catch (err) {
       console.error('Failed to get incognito status:', err);
@@ -31,6 +36,8 @@ export function IncognitoToggle({ profileId, onStatusChange }: IncognitoTogglePr
   };
 
   const handleToggle = async () => {
+    // The dedicated Incognito profile is always private — the toggle is locked on.
+    if (isForced) return;
     try {
       const newStatus = await invoke<boolean>('toggle_incognito', { profileId });
       setIsIncognito(newStatus);
@@ -89,12 +96,14 @@ export function IncognitoToggle({ profileId, onStatusChange }: IncognitoTogglePr
         }}
         onMouseEnter={handleMouseEnter}
         onMouseLeave={handleMouseLeave}
-        className={`p-2.5 rounded-xl transition-all cursor-pointer relative z-50 ${
+        className={`p-2.5 rounded-xl transition-all relative z-50 ${
+          isForced ? 'cursor-default' : 'cursor-pointer'
+        } ${
           isIncognito
             ? 'bg-purple-600/30 border-2 border-purple-500 text-purple-300 shadow-lg shadow-purple-500/20'
             : 'bg-white/10 border border-white/20 text-white/80 hover:bg-white/15 hover:text-white'
         }`}
-        title={isIncognito ? 'Exit Incognito Mode' : 'Enter Incognito Mode'}
+        title={isForced ? 'This profile is always in Incognito Mode' : isIncognito ? 'Exit Incognito Mode' : 'Enter Incognito Mode'}
         style={{ WebkitAppRegion: 'no-drag', pointerEvents: 'auto' } as React.CSSProperties}
       >
         {isIncognito ? (
@@ -132,7 +141,12 @@ export function IncognitoToggle({ profileId, onStatusChange }: IncognitoTogglePr
           className="fixed px-3 py-2 bg-gray-900 border border-white/10 rounded-lg text-sm whitespace-nowrap pointer-events-none z-[9999] shadow-xl"
           style={{ top: tooltipPosition.top, right: tooltipPosition.right }}
         >
-          {isIncognito ? (
+          {isForced ? (
+            <div className="text-purple-300">
+              <div className="font-medium">Incognito Profile</div>
+              <div className="text-xs text-gray-400">This profile is always private — can't be turned off</div>
+            </div>
+          ) : isIncognito ? (
             <div className="text-purple-300">
               <div className="font-medium">Incognito Mode Active</div>
               <div className="text-xs text-gray-400">Click to exit incognito mode</div>
