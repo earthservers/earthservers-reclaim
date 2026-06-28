@@ -1,0 +1,21 @@
+[package]
+name = "earth-noscript-ext"
+version = "0.1.0"
+edition = "2021"
+authors = ["EarthServers Team"]
+license = "MIT"
+description = "WebKit web-process extension: per-origin NoScript blocking for Earth Reclaim"
+
+# Built as a shared library that WebKit loads into its web process. The reclaim
+# app points WebContext::set_web_extensions_directory at the dir holding this .so.
+# Standalone (NOT a workspace member): it links gtk-3 via gtk 0.16, which would
+# conflict with the app's gtk 0.18 in a shared graph. Safe because it runs in
+# WebKit's separate web process.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+webkit2gtk-webextension = { version = "0.16", features = ["v2_28", "gio"] }
+glib = "0.16"
+gio = "0.16"
+url = "2"

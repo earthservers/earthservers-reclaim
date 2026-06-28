@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- Disable caching in dev mode -->
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+    <meta http-equiv="Pragma" content="no-cache" />
+    <meta http-equiv="Expires" content="0" />
+    <title>Reclaim</title>
+    <style>
+      /* Critical CSS - inline to prevent flash of white background */
+      html, body {
+        margin: 0;
+        padding: 0;
+        background: #0a0a0f !important;
+        background-color: #0a0a0f !important;
+        min-height: 100vh;
+      }
+      #root {
+        background: #0a0a0f;
+        min-height: 100vh;
+      }
+      @keyframes spin {
+        to { transform: rotate(360deg); }
+      }
+      .loading-spinner {
+        width: 24px;
+        height: 24px;
+        border: 2px solid rgba(255,255,255,0.2);
+        border-top-color: #3b82f6;
+        border-radius: 50%;
+        animation: spin 0.8s linear infinite;
+        margin-bottom: 1rem;
+      }
+    </style>
+  </head>
+  <body style="background: #0a0a0f !important; background-color: #0a0a0f !important;">
+    <div id="root" style="background: #0a0a0f;">
+      <!-- Loading indicator - will be replaced when React mounts -->
+      <div id="loading-indicator" style="display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; color: white; font-family: system-ui, sans-serif;">
+        <div class="loading-spinner"></div>
+        <div style="font-size: 2rem; font-weight: bold; margin-bottom: 0.5rem;">Reclaim</div>
+        <div id="loading-status" style="color: #888;">Loading...</div>
+      </div>
+    </div>
+    <script>
+      // Auto-refresh fallback if React doesn't mount within 3 seconds
+      // This handles cases where WebKitGTK loads before Vite dev server is ready
+      window.__reclaimMounted = false;
+      window.__reclaimMarkMounted = function() {
+        window.__reclaimMounted = true;
+        console.log('[Reclaim] App mounted successfully');
+        sessionStorage.removeItem('__reclaimReloadCount');
+      };
+
+      // Check if we're in a reload loop and break it
+      var reloadCount = parseInt(sessionStorage.getItem('__reclaimReloadCount') || '0');
+      console.log('[Reclaim] Reload count:', reloadCount);
+
+      if (reloadCount > 2) {
+        console.error('[Reclaim] Too many reload attempts, stopping');
+        sessionStorage.removeItem('__reclaimReloadCount');
+        document.getElementById('loading-status').textContent = 'Failed to load. Please restart the app.';
+      } else {
+        setTimeout(function() {
+          if (!window.__reclaimMounted) {
+            var status = document.getElementById('loading-status');
+            if (status) {
+              status.textContent = 'Connecting to dev server...';
+            }
+            // Wait another 1.5 seconds then force reload
+            setTimeout(function() {
+              if (!window.__reclaimMounted) {
+                console.warn('[Reclaim] React did not mount in time, forcing reload...');
+                sessionStorage.setItem('__reclaimReloadCount', String(reloadCount + 1));
+                // Force hard reload to bypass cache
+                location.reload();
+              }
+            }, 1500);
+          }
+        }, 3000);
+      }
+    </script>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

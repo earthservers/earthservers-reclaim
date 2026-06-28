@@ -1,0 +1,108 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  font-family: Inter, system-ui, Avenir, Helvetica, Arial, sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
+
+  color-scheme: dark;
+  color: rgba(255, 255, 255, 0.87);
+  background: linear-gradient(135deg, #0a0a0f 0%, #1a1a2e 50%, #16213e 100%);
+
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+
+  /* Default theme CSS variables for before React loads */
+  --color-primary: #0fab89;
+  --color-secondary: #e91e63;
+  --color-accent: #0178C6;
+  --color-text: #f0f0f0;
+  --color-background: #0a0a0f;
+  --color-card: #1a1a2e;
+  --color-navbar: #0a0a0f;
+  --card-opacity: 0.8;
+  --navbar-opacity: 0.9;
+  --background-gradient: linear-gradient(135deg, #0a0a0f 0%, #1a1a2e 100%);
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  overflow: hidden;
+}
+
+body {
+  display: flex;
+  background: var(--background-gradient, linear-gradient(135deg, #0a0a0f 0%, #1a1a2e 100%));
+}
+
+#root {
+  width: 100%;
+  min-height: 100vh;
+}
+
+/* Fallback for bg-theme-gradient class */
+.bg-theme-gradient {
+  background: var(--background-gradient, linear-gradient(135deg, #0a0a0f 0%, #1a1a2e 100%)) !important;
+}
+
+/* WebKitGTK fix: backdrop-filter can break click events */
+/* Force all buttons and interactive elements to be clickable */
+button, a, input, select, [role="button"], .cursor-pointer {
+  position: relative;
+  z-index: 1;
+  -webkit-transform: translateZ(0);
+  transform: translateZ(0);
+  pointer-events: auto !important;
+}
+
+/* Ensure all buttons work in WebKitGTK */
+button {
+  position: relative;
+  z-index: 10;
+  pointer-events: auto !important;
+  -webkit-transform: translateZ(0);
+  transform: translateZ(0);
+  cursor: pointer;
+}
+
+/* Ensure navbar buttons work in WebKitGTK */
+nav button {
+  position: relative;
+  z-index: 20;
+  pointer-events: auto !important;
+}
+
+/* Fix for clickable divs (like tabs) */
+div[class*="cursor-pointer"], [onClick] {
+  pointer-events: auto !important;
+  -webkit-transform: translateZ(0);
+  transform: translateZ(0);
+}
+
+/* Fix for WebKitGTK backdrop-blur breaking clicks */
+/* IMPORTANT: backdrop-filter breaks click events in WebKitGTK on Linux */
+/* Disable it entirely when running in Tauri */
+.backdrop-blur-xl, .backdrop-blur-sm, .backdrop-blur-md, .backdrop-blur {
+  -webkit-backface-visibility: hidden;
+  backface-visibility: hidden;
+  /* Disable backdrop-filter for WebKitGTK compatibility */
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+
+/* Ensure SVG icons don't block clicks */
+svg {
+  pointer-events: none;
+}
+
+/* Force all interactive elements to receive events */
+* {
+  -webkit-tap-highlight-color: transparent;
+}

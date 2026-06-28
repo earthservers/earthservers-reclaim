@@ -58,8 +58,8 @@ npm install -g pnpm
 
 1. **Clone the repository**
 ```bash
-git clone https://github.com/earthservers/earthservers-local.git
-cd earthservers-local
+git clone https://github.com/earthservers/earthservers-reclaim.git
+cd earthservers-reclaim
 ```
 
 2. **Install dependencies**
@@ -117,7 +117,7 @@ pnpm desktop:build
 ## Project Structure
 
 ```
-earthservers-local/
+earthservers-reclaim/
 ├── apps/
 │   └── desktop/          # Main Tauri application
 │       ├── src/          # React frontend
@@ -281,6 +281,6 @@ pnpm install
 
 ## Getting Help
 
-- **Issues**: https://github.com/earthservers/earthservers-local/issues
+- **Issues**: https://github.com/earthservers/earthservers-reclaim/issues
 - **Discord**: [Coming Soon]
 - **Docs**: https://docs.earthservers.earth

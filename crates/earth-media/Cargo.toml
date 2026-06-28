@@ -1,0 +1,26 @@
+[package]
+name = "earth-media"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Hardware-accelerated media player for Earth Reclaim using GStreamer"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+
+# GStreamer - using playbin directly (not gstreamer-player) to avoid GTK overlays
+gstreamer = { workspace = true }
+gstreamer-video = { workspace = true }
+gstreamer-pbutils = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# GTK for video widget embedding (optional, for future use)
+gtk = { version = "0.18", optional = true }
+
+[features]
+default = []
+gtk-embed = ["gtk"]

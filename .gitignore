@@ -17,6 +17,12 @@ out/
 .DS_Store
 *.pem
 
+# Tauri signing keys (NEVER COMMIT!)
+*.key
+*.key.pub
+.tauri/
+*-private-key*
+
 # Environment files (keep .env.development and .env.production)
 .env*.local
 .env.local

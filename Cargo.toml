@@ -1,0 +1,57 @@
+[workspace]
+members = [
+    "apps/reclaim/src-tauri",
+    "crates/earth-media",
+    "crates/earth-servo",
+    "crates/earth-ipc",
+]
+resolver = "2"
+
+# The NoScript web extension links gtk-3 via the older webkit2gtk-webextension
+# (gtk 0.16) bindings, which conflicts with the app's gtk 0.18. It loads into
+# WebKit's SEPARATE web process, so it must be its OWN crate, built independently
+# (cargo build --manifest-path crates/earth-noscript-ext/Cargo.toml).
+exclude = [
+    "crates/earth-noscript-ext",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["EarthServers Team"]
+license = "MIT"
+
+[workspace.dependencies]
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Async runtime
+tokio = { version = "1", features = ["full", "process", "sync"] }
+
+# Tauri
+tauri = "2.1"
+tauri-build = "2.0"
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# Database
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# GStreamer for media
+gstreamer = "0.23"
+gstreamer-video = "0.23"
+gstreamer-player = "0.23"
+gstreamer-pbutils = "0.23"
+
+# IPC
+interprocess = "2.2"
+
+# Lazy static for global state
+lazy_static = "1.5"

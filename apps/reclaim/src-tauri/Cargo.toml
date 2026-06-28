@@ -1,0 +1,96 @@
+[package]
+name = "reclaim"
+version = "0.1.0"
+description = "Earth Reclaim - Privacy-first browser with local AI"
+authors = ["EarthServers"]
+license = "MIT"
+repository = ""
+edition = "2021"
+
+[lib]
+name = "reclaim_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.5", features = [] }
+
+[dependencies]
+# Tauri and plugins
+tauri = { version = "2.9", features = ["protocol-asset", "devtools", "tray-icon", "unstable"] }
+tauri-plugin-shell = "2.3"
+tauri-plugin-dialog = "2.4"
+tauri-plugin-fs = "2.4"
+tauri-plugin-http = "2.5"
+tauri-plugin-updater = "2.9"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json"] }
+
+# Database
+rusqlite = { version = "0.30", features = ["bundled"] }
+
+# Search (optional, may remove later)
+meilisearch-sdk = "0.24"
+
+# Crypto for EarthMultiMedia
+sha2 = "0.10"
+rand = "0.8"
+hmac = "0.12"
+chrono = "0.4"
+aes-gcm = "0.10"
+base64 = "0.21"
+# Vault master-password hashing (memory-hard, salted)
+argon2 = "0.5"
+
+# Web Scraper
+regex = "1"
+url = "2"
+
+# Hardware fingerprinting for anonymous ratings
+sysinfo = "0.30"
+machine-uid = "0.3"
+hex = "0.4"
+# OS keyring (Secret Service) for a random local-data encryption key — pure-Rust
+# zbus backend so there's no libdbus/openssl C build dependency.
+keyring = { version = "3", default-features = false, features = ["sync-secret-service", "crypto-rust"] }
+
+# Utilities
+lazy_static = "1.4"
+async-trait = "0.1"
+open = "5"
+log = "0.4"
+env_logger = "0.11"
+thiserror = "1.0"
+
+# WebSocket for controls server
+tokio-tungstenite = "0.21"
+futures-util = "0.3"
+
+# Our workspace crates
+earth-servo = { path = "../../../crates/earth-servo" }
+earth-media = { path = "../../../crates/earth-media" }
+earth-ipc = { path = "../../../crates/earth-ipc" }
+
+# Window handle for X11 XID extraction (video embedding)
+raw-window-handle = "0.6"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# X11 for window operations
+x11 = { version = "2.21", features = ["xlib"] }
+# GTK for creating video rendering windows
+gtk = "0.18"
+gdk = "0.18"
+glib = "0.18"
+# WebKitGTK for HTML controls in X11 window
+webkit2gtk = "2.0"
+
+[features]
+# This feature is used for production builds or when a dev server is not specified
+custom-protocol = ["tauri/custom-protocol"]

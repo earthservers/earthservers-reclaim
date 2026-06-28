@@ -17,30 +17,87 @@ pub async fn submit_rating(
     if req.bias_level < 1 || req.bias_level > 4 {
         return Err(StatusCode::BAD_REQUEST);
     }
+    if let Some(independence) = req.independence_level {
+        if independence < 1 || independence > 4 {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
+
+    // Check rate limiting by device fingerprint (15 ratings per hour)
+    if let Some(ref fingerprint) = req.device_fingerprint {
+        let hour_ago = chrono::Utc::now() - chrono::Duration::hours(1);
+        let count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM domain_ratings WHERE device_fingerprint = $1 AND created_at > $2"
+        )
+        .bind(fingerprint)
+        .bind(hour_ago)
+        .fetch_one(&pool)
+        .await
+        .map_err(|e| {
+            tracing::error!("Database error during rate limit check: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+        if count.0 >= 15 {
+            tracing::warn!("Rate limit exceeded for device fingerprint");
+            return Err(StatusCode::TOO_MANY_REQUESTS);
+        }
+    }
 
     // Insert or update rating
-    let rating = sqlx::query_as!(
-        Rating,
-        r#"
-        INSERT INTO domain_ratings (domain_url, user_hash, trust_level, bias_level, comment)
-        VALUES ($1, $2, $3, $4, $5)
-        ON CONFLICT (domain_url, user_hash)
-        DO UPDATE SET
-            trust_level = $3,
-            bias_level = $4,
-            comment = $5,
-            updated_at = NOW()
-        RETURNING id, domain_url, user_hash, trust_level, bias_level, comment, created_at, updated_at
-        "#,
-        req.domain_url,
-        req.user_hash,
-        req.trust_level,
-        req.bias_level,
-        req.comment,
-    )
-    .fetch_one(&pool)
-    .await
-    .map_err(|e| {
+    // Uses device_fingerprint for deduplication if available, otherwise falls back to user_hash
+    let rating = if req.device_fingerprint.is_some() {
+        sqlx::query_as!(
+            Rating,
+            r#"
+            INSERT INTO domain_ratings (domain_url, user_hash, device_fingerprint, trust_level, bias_level, independence_level, comment)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            ON CONFLICT (domain_url, device_fingerprint) WHERE device_fingerprint IS NOT NULL
+            DO UPDATE SET
+                user_hash = $2,
+                trust_level = $4,
+                bias_level = $5,
+                independence_level = $6,
+                comment = $7,
+                updated_at = NOW()
+            RETURNING id, domain_url, user_hash, device_fingerprint, trust_level, bias_level, independence_level, comment, created_at, updated_at
+            "#,
+            req.domain_url,
+            req.user_hash,
+            req.device_fingerprint,
+            req.trust_level,
+            req.bias_level,
+            req.independence_level,
+            req.comment,
+        )
+        .fetch_one(&pool)
+        .await
+    } else {
+        sqlx::query_as!(
+            Rating,
+            r#"
+            INSERT INTO domain_ratings (domain_url, user_hash, device_fingerprint, trust_level, bias_level, independence_level, comment)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            ON CONFLICT (domain_url, user_hash)
+            DO UPDATE SET
+                trust_level = $4,
+                bias_level = $5,
+                independence_level = $6,
+                comment = $7,
+                updated_at = NOW()
+            RETURNING id, domain_url, user_hash, device_fingerprint, trust_level, bias_level, independence_level, comment, created_at, updated_at
+            "#,
+            req.domain_url,
+            req.user_hash,
+            req.device_fingerprint,
+            req.trust_level,
+            req.bias_level,
+            req.independence_level,
+            req.comment,
+        )
+        .fetch_one(&pool)
+        .await
+    }.map_err(|e| {
         tracing::error!("Database error: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
@@ -62,9 +119,11 @@ pub async fn get_domain_rating(
             domain_url,
             avg_trust_level,
             avg_bias_level,
+            avg_independence_level,
             total_ratings,
             trust_distribution,
-            bias_distribution
+            bias_distribution,
+            independence_distribution
         FROM domain_rating_aggregates
         WHERE domain_url = $1
         "#,
@@ -90,7 +149,7 @@ pub async fn get_domain_reviews(
     let ratings = sqlx::query_as!(
         Rating,
         r#"
-        SELECT id, domain_url, user_hash, trust_level, bias_level, comment, created_at, updated_at
+        SELECT id, domain_url, user_hash, device_fingerprint, trust_level, bias_level, independence_level, comment, created_at, updated_at
         FROM domain_ratings
         WHERE domain_url = $1
         ORDER BY created_at DESC
@@ -159,15 +218,16 @@ pub async fn report_rating(
 }
 
 async fn refresh_aggregates(pool: &PgPool, domain_url: &str) -> Result<(), StatusCode> {
-    // Calculate and update aggregates
+    // Calculate and update aggregates including independence distribution
     sqlx::query!(
         r#"
         INSERT INTO domain_rating_aggregates
-            (domain_url, avg_trust_level, avg_bias_level, total_ratings, trust_distribution, bias_distribution)
+            (domain_url, avg_trust_level, avg_bias_level, avg_independence_level, total_ratings, trust_distribution, bias_distribution, independence_distribution)
         SELECT
             $1 as domain_url,
             COALESCE(AVG(trust_level::float), 0) as avg_trust_level,
             COALESCE(AVG(bias_level::float), 0) as avg_bias_level,
+            COALESCE(AVG(independence_level::float), 0) as avg_independence_level,
             COUNT(*) as total_ratings,
             COALESCE(
                 jsonb_object_agg(
@@ -182,13 +242,22 @@ async fn refresh_aggregates(pool: &PgPool, domain_url: &str) -> Result<(), Statu
                     bias_count
                 ) FILTER (WHERE bias_level IS NOT NULL),
                 '{}'::jsonb
-            ) as bias_distribution
+            ) as bias_distribution,
+            COALESCE(
+                jsonb_object_agg(
+                    independence_level::text,
+                    independence_count
+                ) FILTER (WHERE independence_level IS NOT NULL),
+                '{}'::jsonb
+            ) as independence_distribution
         FROM (
             SELECT
                 trust_level,
                 bias_level,
+                independence_level,
                 COUNT(*) OVER (PARTITION BY trust_level) as trust_count,
-                COUNT(*) OVER (PARTITION BY bias_level) as bias_count
+                COUNT(*) OVER (PARTITION BY bias_level) as bias_count,
+                COUNT(*) OVER (PARTITION BY independence_level) as independence_count
             FROM domain_ratings
             WHERE domain_url = $1
         ) sub
@@ -197,9 +266,11 @@ async fn refresh_aggregates(pool: &PgPool, domain_url: &str) -> Result<(), Statu
         DO UPDATE SET
             avg_trust_level = EXCLUDED.avg_trust_level,
             avg_bias_level = EXCLUDED.avg_bias_level,
+            avg_independence_level = EXCLUDED.avg_independence_level,
             total_ratings = EXCLUDED.total_ratings,
             trust_distribution = EXCLUDED.trust_distribution,
             bias_distribution = EXCLUDED.bias_distribution,
+            independence_distribution = EXCLUDED.independence_distribution,
             updated_at = NOW()
         "#,
         domain_url
