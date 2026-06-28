@@ -1,5 +1,4 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { createPortal } from 'react-dom';
 import { invoke } from '../lib/tauri';
 import { RightDockPanel } from '../lib/rightDock';
 import { VaultAutofill } from './VaultAutofill';
@@ -138,7 +137,8 @@ interface BookmarkBarProps {
   profileId: number;
   visible?: boolean;
   onNavigate?: (url: string) => void;
-  onToggleManager?: () => void;
+  // Open the Bookmark Manager. Pass a folder id to open it with that folder selected.
+  onToggleManager?: (folderId?: number) => void;
 }
 
 interface BookmarkManagerProps {
@@ -146,6 +146,8 @@ interface BookmarkManagerProps {
   isOpen: boolean;
   onClose: () => void;
   onNavigate?: (url: string) => void;
+  // When the manager is opened, pre-select this folder (e.g. clicked from the bar).
+  initialFolderId?: number | null;
 }
 
 interface AddBookmarkModalProps {
@@ -182,7 +184,6 @@ export function BookmarkBar({ profileId, visible = true, onNavigate, onToggleMan
   const bookmarkListButtonRef = useRef<HTMLButtonElement>(null);
   const privateButtonRef = useRef<HTMLButtonElement>(null);
   const folderButtonRefs = useRef<Record<number, HTMLButtonElement | null>>({});
-  const [folderDropdownPosition, setFolderDropdownPosition] = useState({ top: 0, left: 0 });
 
   // Drag and drop state
   const [draggedBookmark, setDraggedBookmark] = useState<Bookmark | null>(null);
@@ -452,17 +453,10 @@ export function BookmarkBar({ profileId, visible = true, onNavigate, onToggleMan
                 ref={(el) => { folderButtonRefs.current[folder.id] = el; }}
                 onClick={(e) => {
                   e.stopPropagation();
-                  const btn = folderButtonRefs.current[folder.id];
-                  if (btn) {
-                    const rect = btn.getBoundingClientRect();
-                    setFolderDropdownPosition({
-                      top: rect.bottom + 4,
-                      left: rect.left,
-                    });
-                  }
-                  setOpenFolderId(openFolderId === folder.id ? null : folder.id);
-                  setShowBookmarkList(false);
+                  // Open the Bookmark Manager focused on this folder instead of a
+                  // floating dropdown (which the web page would cover).
                   setShowPrivateBookmarks(false);
+                  onToggleManager?.(folder.id);
                 }}
                 onDragOver={(e) => handleDragOverFolder(e, folder.id)}
                 onDrop={(e) => handleDropOnFolder(e, folder.id)}
@@ -543,7 +537,7 @@ export function BookmarkBar({ profileId, visible = true, onNavigate, onToggleMan
         </div>
 
         <button
-          onClick={onToggleManager}
+          onClick={() => onToggleManager?.()}
           className="px-2 py-1 text-xs text-gray-400 hover:text-white transition-colors"
         >
           Manage
@@ -568,56 +562,6 @@ export function BookmarkBar({ profileId, visible = true, onNavigate, onToggleMan
           </button>
         </div>
       </div>
-
-      {/* Folder Dropdown - Portal */}
-      {openFolderId !== null && createPortal(
-        <div
-          className="fixed z-[9999] bg-gray-900 border border-gray-700 rounded-lg shadow-2xl py-1 min-w-[220px] max-w-[300px]"
-          style={{ top: folderDropdownPosition.top, left: folderDropdownPosition.left }}
-          onClick={(e) => e.stopPropagation()}
-        >
-          {(() => {
-            const folder = folders.find(f => f.id === openFolderId);
-            const folderBookmarks = folder ? getBookmarksInFolder(folder.id) : [];
-            if (!folder) return null;
-            return (
-              <>
-                <div className="px-3 py-2 border-b border-gray-700 flex items-center justify-between">
-                  <span className="text-xs font-semibold text-[var(--primary-color)] flex items-center gap-1.5">
-                    <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
-                    </svg>
-                    {folder.name}
-                  </span>
-                  <span className="text-xs text-gray-500">{folderBookmarks.length}</span>
-                </div>
-                <div className="max-h-[300px] overflow-y-auto">
-                  {folderBookmarks.map(bookmark => (
-                    <button
-                      key={bookmark.id}
-                      onClick={() => navigateTo(bookmark.url)}
-                      className="bookmark-item w-full flex items-center gap-2 px-3 py-2 hover:bg-gray-700/50 transition-colors text-left"
-                    >
-                      {bookmark.favicon ? (
-                        <img src={bookmark.favicon} className="w-4 h-4 flex-shrink-0" alt="" />
-                      ) : (
-                        <span className="w-4 h-4 flex items-center justify-center text-[10px] text-[var(--primary-color)] flex-shrink-0 bg-gray-700/50 rounded">
-                          {bookmark.title.charAt(0).toUpperCase()}
-                        </span>
-                      )}
-                      <div className="flex-1 min-w-0">
-                        <div className="text-sm text-[var(--text-color)] truncate">{bookmark.title}</div>
-                        <div className="text-xs text-gray-500 truncate">{bookmark.url}</div>
-                      </div>
-                    </button>
-                  ))}
-                </div>
-              </>
-            );
-          })()}
-        </div>,
-        document.body
-      )}
 
       {/* Private Bookmarks - right-side panel */}
       <RightDockPanel
@@ -833,7 +777,7 @@ export function BookmarkBar({ profileId, visible = true, onNavigate, onToggleMan
 }
 
 // ==================== BookmarkManager ====================
-export function BookmarkManager({ profileId, isOpen, onClose, onNavigate }: BookmarkManagerProps) {
+export function BookmarkManager({ profileId, isOpen, onClose, onNavigate, initialFolderId }: BookmarkManagerProps) {
   const [bookmarks, setBookmarks] = useState<Bookmark[]>([]);
   const [folders, setFolders] = useState<BookmarkFolder[]>([]);
   const [selectedFolder, setSelectedFolder] = useState<number | null>(null);
@@ -848,6 +792,12 @@ export function BookmarkManager({ profileId, isOpen, onClose, onNavigate }: Book
       loadFolders();
     }
   }, [isOpen, profileId]);
+
+  // When opened (or asked to focus a specific folder), select that folder so the
+  // manager shows its contents — e.g. clicking a folder in the bookmarks bar.
+  useEffect(() => {
+    if (isOpen) setSelectedFolder(initialFolderId ?? null);
+  }, [isOpen, initialFolderId]);
 
   const loadBookmarks = async () => {
     try {

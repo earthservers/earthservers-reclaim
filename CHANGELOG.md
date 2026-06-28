@@ -5,6 +5,16 @@ All notable changes to Earth Reclaim are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.5] - 2026-06-28
+
+### Fixed
+- **Clicking a folder in the bookmarks bar** now opens the Bookmark Manager with
+  that folder selected, instead of a dropdown that was cut off behind the web page.
+- **Restarting now restores the page you ended on.** Navigating from a search
+  (e.g. DuckDuckGo) to a result then restarting brought back the search page,
+  because only the tab's title — not its live URL — was being persisted. The tab's
+  URL is now saved as you navigate, so the last page is restored.
+
 ## [1.0.4] - 2026-06-28
 
 ### Added

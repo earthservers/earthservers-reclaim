@@ -152,6 +152,7 @@ function App() {
   const [showAbout, setShowAbout] = useState(false);
   const [navbarCollapsed, setNavbarCollapsed] = useState(false);
   const [showBookmarkManager, setShowBookmarkManager] = useState(false);
+  const [managerFolderId, setManagerFolderId] = useState<number | null>(null);
   const [showBookmarkBar, setShowBookmarkBar] = useState(true);
   const [activeTab, setActiveTab] = useState<Tab | null>(null);
   const [showNotes, setShowNotes] = useState(false);
@@ -575,12 +576,15 @@ function App() {
     let unlisten: (() => void) | undefined;
     listen<{ tabId: number; title: string; url: string }>('browser-title-changed', ({ payload }) => {
       if (!payload.title || payload.tabId < 0) return;
-      invoke('update_tab', { tabId: payload.tabId, title: payload.title }).catch(() => {});
       // Track the page's live URL too so the URL bar follows in-page navigation
       // (links/redirects), not just the address the tab was opened with. Only
       // accept real http(s) URLs; navigating to the same URL is a no-op reload-
       // skip downstream, so this won't loop.
       const liveUrl = /^https?:\/\//.test(payload.url) ? payload.url : undefined;
+      // Persist BOTH title and the live URL so a restart restores the page the tab
+      // actually ended on (e.g. a result clicked from a DuckDuckGo search), not the
+      // original search URL the tab was opened with.
+      invoke('update_tab', { tabId: payload.tabId, title: payload.title, url: liveUrl }).catch(() => {});
       setActiveTab(prev =>
         prev && prev.id === payload.tabId
           ? { ...prev, title: payload.title, url: liveUrl ?? prev.url }
@@ -1092,7 +1096,7 @@ function App() {
               <BookmarkBar
                 profileId={activeProfile?.id ?? 1}
                 onNavigate={handleOpenUrl}
-                onToggleManager={() => setShowBookmarkManager(true)}
+                onToggleManager={(folderId) => { setManagerFolderId(folderId ?? null); setShowBookmarkManager(true); }}
               />
               {/* Toggle Bookmark Bar visibility */}
               <button
@@ -1258,6 +1262,7 @@ function App() {
           <BookmarkManager
             profileId={activeProfile?.id ?? 1}
             isOpen={showBookmarkManager}
+            initialFolderId={managerFolderId}
             onClose={() => setShowBookmarkManager(false)}
             onNavigate={(url) => console.log('Navigate to:', url)}
           />
