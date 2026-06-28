@@ -27,35 +27,64 @@ function NativeButton({
   onDragEnd?: () => void;
 }) {
   const buttonRef = useRef<HTMLButtonElement>(null);
+  // Set while a native drag is in progress so the pointerup doesn't fire a click.
+  const draggingRef = useRef(false);
 
   useEffect(() => {
     const button = buttonRef.current;
     if (!button) return;
 
-    // Use pointerdown - fires before click and is more reliable in WebKitGTK
+    // Draggable buttons must NOT preventDefault on pointerdown — doing so cancels
+    // native HTML5 drag-and-drop (so onDragStart would never fire). Instead we tell
+    // a click from a drag by pointer movement, and fire onClick on pointerup only
+    // when the pointer didn't move (and no drag started).
+    if (draggable) {
+      let down = false, moved = false, startX = 0, startY = 0;
+      const onDown = (e: PointerEvent) => {
+        if (e.button !== 0) return;
+        down = true; moved = false; draggingRef.current = false;
+        startX = e.clientX; startY = e.clientY;
+      };
+      const onMove = (e: PointerEvent) => {
+        if (!down) return;
+        if (Math.abs(e.clientX - startX) > 4 || Math.abs(e.clientY - startY) > 4) moved = true;
+      };
+      const onUp = (e: PointerEvent) => {
+        if (e.button !== 0) { down = false; return; }
+        const wasClick = down && !moved && !draggingRef.current;
+        down = false;
+        if (wasClick) requestAnimationFrame(() => onClick());
+      };
+      button.addEventListener('pointerdown', onDown);
+      window.addEventListener('pointermove', onMove);
+      window.addEventListener('pointerup', onUp);
+      return () => {
+        button.removeEventListener('pointerdown', onDown);
+        window.removeEventListener('pointermove', onMove);
+        window.removeEventListener('pointerup', onUp);
+      };
+    }
+
+    // Non-draggable: original reliable-click behavior for WebKitGTK.
     const handlePointerDown = (e: PointerEvent) => {
-      // Don't trigger click on drag start
       if (e.button !== 0) return; // Only left click
       e.preventDefault();
       e.stopPropagation();
       e.stopImmediatePropagation();
       requestAnimationFrame(() => onClick());
     };
-
     const handleTouchStart = (e: TouchEvent) => {
       e.preventDefault();
       e.stopPropagation();
       requestAnimationFrame(() => onClick());
     };
-
     button.addEventListener('pointerdown', handlePointerDown, { capture: true });
     button.addEventListener('touchstart', handleTouchStart, { capture: true, passive: false });
-
     return () => {
       button.removeEventListener('pointerdown', handlePointerDown, { capture: true });
       button.removeEventListener('touchstart', handleTouchStart, { capture: true });
     };
-  }, [onClick]);
+  }, [onClick, draggable]);
 
   return (
     <button
@@ -64,10 +93,10 @@ function NativeButton({
       className={className}
       title={title}
       draggable={draggable}
-      onDragStart={onDragStart}
+      onDragStart={(e) => { draggingRef.current = true; onDragStart?.(e); }}
       onDragOver={onDragOver}
       onDrop={onDrop}
-      onDragEnd={onDragEnd}
+      onDragEnd={() => { draggingRef.current = false; onDragEnd?.(); }}
       style={{ pointerEvents: 'auto', WebkitUserSelect: 'none', userSelect: 'none' }}
     >
       {children}
@@ -128,6 +157,14 @@ interface AddBookmarkModalProps {
   onSave?: (bookmark: Bookmark) => void;
 }
 
+// Cross-component refresh: bookmark views (toolbar, manager, star button) live in
+// separate component trees, so a mutation in one must notify the others. Any
+// add/update/delete dispatches this; every list subscribes and reloads.
+const BOOKMARKS_CHANGED = 'reclaim:bookmarks-changed';
+export function emitBookmarksChanged() {
+  try { window.dispatchEvent(new Event(BOOKMARKS_CHANGED)); } catch { /* no window */ }
+}
+
 // ==================== BookmarkBar ====================
 export function BookmarkBar({ profileId, visible = true, onNavigate, onToggleManager }: BookmarkBarProps) {
   const [bookmarks, setBookmarks] = useState<Bookmark[]>([]);
@@ -179,6 +216,22 @@ export function BookmarkBar({ profileId, visible = true, onNavigate, onToggleMan
     }
   }, [profileId, visible]);
 
+  // Reload when a bookmark is added/edited/deleted anywhere (e.g. the manager or
+  // a save modal), so the toolbar stays in sync without needing a remount.
+  useEffect(() => {
+    const handler = () => { loadBookmarks(); loadFolders(); };
+    window.addEventListener(BOOKMARKS_CHANGED, handler);
+    return () => window.removeEventListener(BOOKMARKS_CHANGED, handler);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [profileId]);
+
+  // Re-gate private bookmarks when the profile changes (switching profiles logs
+  // you out of every feature password).
+  useEffect(() => {
+    setPrivateUnlocked(false);
+    setShowPrivateBookmarks(false);
+  }, [profileId]);
+
   const loadBookmarks = async () => {
     try {
       const data = await invoke<Bookmark[]>('get_all_bookmarks', { profileId: profileId });
@@ -187,7 +240,8 @@ export function BookmarkBar({ profileId, visible = true, onNavigate, onToggleMan
       // Get toolbar bookmarks that are NOT in a folder
       const toolbarBookmarks = userBookmarks.filter(b => (b.location === 'toolbar' || !b.location) && !b.folder_id);
       setAllBookmarks(userBookmarks);
-      setBookmarks(toolbarBookmarks.slice(0, 14));
+      // Show all toolbar bookmarks; the bar scrolls horizontally when they overflow.
+      setBookmarks(toolbarBookmarks);
       // Load private bookmarks separately
       const privateData = userBookmarks.filter(b => b.location === 'private');
       setPrivateBookmarks(privateData);
@@ -288,10 +342,11 @@ export function BookmarkBar({ profileId, visible = true, onNavigate, onToggleMan
     if (draggedBookmark) {
       try {
         await invoke('update_bookmark', {
-          bookmark_id: draggedBookmark.id,
-          folder_id: folderId,
+          bookmarkId: draggedBookmark.id,
+          folderId,
         });
         loadBookmarks();
+        emitBookmarksChanged();
       } catch (err) {
         console.error('Failed to move bookmark to folder:', err);
       }
@@ -314,15 +369,16 @@ export function BookmarkBar({ profileId, visible = true, onNavigate, onToggleMan
       const folder = await invoke<BookmarkFolder>('create_bookmark_folder', {
         profileId,
         name: newFolderName.trim(),
-        parent_id: null,
+        parentId: null,
       });
       // Move both bookmarks into the folder
       for (const bookmark of folderCreateBookmarks) {
         await invoke('update_bookmark', {
-          bookmark_id: bookmark.id,
-          folder_id: folder.id,
+          bookmarkId: bookmark.id,
+          folderId: folder.id,
         });
       }
+      emitBookmarksChanged();
       setShowCreateFolderModal(false);
       setFolderCreateBookmarks([]);
       setNewFolderName('');
@@ -349,23 +405,19 @@ export function BookmarkBar({ profileId, visible = true, onNavigate, onToggleMan
     }
   };
 
-  // Close dropdowns on outside click
+  // Close the floating FOLDER dropdown on outside click. The bookmark list and
+  // private-bookmarks views are right-dock panels now (rendered at the document
+  // root) — they manage their own open/close (X button / single-open), so this
+  // handler must NOT close them, otherwise any click inside the panel (text box,
+  // autofill) would be treated as "outside" and instantly dismiss it.
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
       const target = e.target as HTMLElement;
-      // Don't close if clicking inside a dropdown area
-      if (target.closest('.bookmark-dropdown')) {
+      if (target.closest('.bookmark-dropdown') || target.closest('.bookmark-item')) {
         return;
       }
-      // Don't close if clicking on a bookmark item
-      if (target.closest('.bookmark-item')) {
-        return;
-      }
-      setShowBookmarkList(false);
-      setShowPrivateBookmarks(false);
       setOpenFolderId(null);
     };
-    // Use click event in capture phase so it runs after button handlers
     document.addEventListener('click', handleClickOutside);
     return () => document.removeEventListener('click', handleClickOutside);
   }, []);
@@ -374,7 +426,7 @@ export function BookmarkBar({ profileId, visible = true, onNavigate, onToggleMan
 
   return (
     <div className="flex items-center gap-1 px-2 py-1 bg-[var(--navbar-color)] border-b border-gray-700/30 flex-1 overflow-hidden">
-      <div className="flex items-center gap-1 overflow-x-auto scrollbar-none flex-1">
+      <div className="flex items-center gap-1 overflow-x-auto scrollbar-none flex-1 min-w-0">
         {/* Mandatory EarthSearch bookmark - always first */}
         <button
           onClick={() => navigateTo(earthSearchBookmark.url)}
@@ -720,59 +772,47 @@ export function BookmarkBar({ profileId, visible = true, onNavigate, onToggleMan
       </RightDockPanel>
 
       {/* Create Folder Modal - Using Portal to render at document root */}
-      {showCreateFolderModal && createPortal(
-        <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/80">
-          <div
-            className="w-full max-w-sm bg-gray-900 border border-gray-700 rounded-lg shadow-2xl mx-4"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="flex items-center justify-between p-4 border-b border-gray-700">
-              <h3 className="text-sm font-semibold text-[var(--text-color)]">Create Folder</h3>
-              <button
-                onClick={() => {
-                  setShowCreateFolderModal(false);
-                  setFolderCreateBookmarks([]);
-                }}
-                className="p-1 hover:bg-gray-700 rounded transition-colors"
-              >
-                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                </svg>
-              </button>
+      {/* Create-folder prompt (from dropping one bookmark on another). Rendered as
+          a right-dock panel, not a centered modal — the native browser surface
+          renders above the DOM, so a centered overlay would be hidden behind the
+          page. The right dock insets the surface so this stays visible/clickable. */}
+      {showCreateFolderModal && (
+        <RightDockPanel
+          id="bookmark-create-folder"
+          open={showCreateFolderModal}
+          title="Create Folder"
+          subtitle="Group these bookmarks into a new folder"
+          onClose={() => { setShowCreateFolderModal(false); setFolderCreateBookmarks([]); }}
+        >
+          <div className="px-1 space-y-3">
+            <div>
+              <label className="block text-xs text-gray-400 mb-1">Folder Name</label>
+              <input
+                type="text"
+                value={newFolderName}
+                onChange={(e) => setNewFolderName(e.target.value)}
+                onKeyDown={(e) => e.key === 'Enter' && createFolderFromBookmarks()}
+                className="w-full px-3 py-2 bg-gray-800 border border-gray-600 rounded text-sm focus:outline-none focus:border-[var(--primary-color)]"
+                placeholder="Enter folder name..."
+                autoFocus
+              />
             </div>
-            <div className="p-4 space-y-3">
-              <div>
-                <label className="block text-xs text-gray-400 mb-1">Folder Name</label>
-                <input
-                  type="text"
-                  value={newFolderName}
-                  onChange={(e) => setNewFolderName(e.target.value)}
-                  onKeyDown={(e) => e.key === 'Enter' && createFolderFromBookmarks()}
-                  className="w-full px-3 py-2 bg-gray-800 border border-gray-600 rounded text-sm focus:outline-none focus:border-[var(--primary-color)]"
-                  placeholder="Enter folder name..."
-                  autoFocus
-                />
-              </div>
-              <div className="text-xs text-gray-400">
-                This folder will contain:
-                <ul className="mt-1 space-y-1">
-                  {folderCreateBookmarks.map(b => (
-                    <li key={b.id} className="flex items-center gap-2 text-[var(--text-color)]">
-                      <span className="w-3 h-3 bg-gray-700 rounded flex items-center justify-center text-[8px]">
-                        {b.title.charAt(0).toUpperCase()}
-                      </span>
-                      {b.title}
-                    </li>
-                  ))}
-                </ul>
-              </div>
+            <div className="text-xs text-gray-400">
+              This folder will contain:
+              <ul className="mt-1 space-y-1">
+                {folderCreateBookmarks.map(b => (
+                  <li key={b.id} className="flex items-center gap-2 text-[var(--text-color)]">
+                    <span className="w-3 h-3 bg-gray-700 rounded flex items-center justify-center text-[8px]">
+                      {b.title.charAt(0).toUpperCase()}
+                    </span>
+                    {b.title}
+                  </li>
+                ))}
+              </ul>
             </div>
-            <div className="flex justify-end gap-2 p-4 border-t border-gray-700">
+            <div className="flex justify-end gap-2 pt-2">
               <button
-                onClick={() => {
-                  setShowCreateFolderModal(false);
-                  setFolderCreateBookmarks([]);
-                }}
+                onClick={() => { setShowCreateFolderModal(false); setFolderCreateBookmarks([]); }}
                 className="px-3 py-1.5 text-xs hover:bg-gray-700 rounded transition-colors"
               >
                 Cancel
@@ -786,8 +826,7 @@ export function BookmarkBar({ profileId, visible = true, onNavigate, onToggleMan
               </button>
             </div>
           </div>
-        </div>,
-        document.body
+        </RightDockPanel>
       )}
     </div>
   );
@@ -847,6 +886,7 @@ export function BookmarkManager({ profileId, isOpen, onClose, onNavigate }: Book
     try {
       await invoke('delete_bookmark', { bookmarkId: bookmarkId });
       loadBookmarks();
+      emitBookmarksChanged();
     } catch (err) {
       console.error('Failed to delete bookmark:', err);
     }
@@ -858,7 +898,7 @@ export function BookmarkManager({ profileId, isOpen, onClose, onNavigate }: Book
       await invoke('create_bookmark_folder', {
         profileId,
         name: newFolderName,
-        parent_id: null,
+        parentId: null,
       });
       setNewFolderName('');
       setShowAddFolder(false);
@@ -1101,11 +1141,12 @@ export function AddBookmarkModal({ profileId, isOpen, onClose, initialUrl, initi
         profileId,
         title: title.trim(),
         url: url.trim(),
-        folder_id: folderId,
+        folderId,
         tags: tags.split(',').map(t => t.trim()).filter(Boolean),
         notes: notes.trim() || null,
       });
       onSave?.(bookmark);
+      emitBookmarksChanged();
       onClose();
     } catch (err) {
       console.error('Failed to add bookmark:', err);
@@ -1216,121 +1257,112 @@ function EditBookmarkModal({ bookmark, folders, onClose, onSave }: {
   const handleSave = async () => {
     try {
       await invoke('update_bookmark', {
-        bookmark_id: bookmark.id,
+        bookmarkId: bookmark.id,
         title,
         url,
-        folder_id: folderId,
+        folderId,
         tags: tags.split(',').map(t => t.trim()).filter(Boolean),
         notes: notes.trim() || null,
         location,
       });
       onSave();
+      emitBookmarksChanged();
     } catch (err) {
       console.error('Failed to update bookmark:', err);
     }
   };
 
   return (
-    <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/80">
-      <div className="w-full max-w-md bg-gray-900 border border-gray-700 rounded-lg shadow-2xl">
-        <div className="flex items-center justify-between p-4 border-b border-gray-700">
-          <h3 className="text-lg font-semibold text-[var(--text-color)]">Edit Bookmark</h3>
-          <button onClick={onClose} className="p-1 hover:bg-gray-700 rounded transition-colors">
-            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-            </svg>
-          </button>
+    <RightDockPanel id="bookmark-edit" open={true} title="Edit Bookmark" onClose={onClose}>
+      <div className="px-1 space-y-4">
+        <div>
+          <label className="block text-sm text-gray-400 mb-1">Title</label>
+          <input
+            type="text"
+            value={title}
+            onChange={(e) => setTitle(e.target.value)}
+            className="w-full px-3 py-2 bg-gray-800 border border-gray-600 rounded focus:outline-none focus:border-[var(--primary-color)]"
+          />
         </div>
-        <div className="p-4 space-y-4">
-          <div>
-            <label className="block text-sm text-gray-400 mb-1">Title</label>
-            <input
-              type="text"
-              value={title}
-              onChange={(e) => setTitle(e.target.value)}
-              className="w-full px-3 py-2 bg-gray-800 border border-gray-600 rounded focus:outline-none focus:border-[var(--primary-color)]"
-            />
-          </div>
-          <div>
-            <label className="block text-sm text-gray-400 mb-1">URL</label>
-            <input
-              type="text"
-              value={url}
-              onChange={(e) => setUrl(e.target.value)}
-              className="w-full px-3 py-2 bg-gray-800 border border-gray-600 rounded focus:outline-none focus:border-[var(--primary-color)]"
-            />
-          </div>
-          <div>
-            <label className="block text-sm text-gray-400 mb-1">Folder</label>
-            <select
-              value={folderId || ''}
-              onChange={(e) => setFolderId(e.target.value ? parseInt(e.target.value) : null)}
-              className="w-full px-3 py-2 bg-gray-800 border border-gray-600 rounded focus:outline-none focus:border-[var(--primary-color)]"
+        <div>
+          <label className="block text-sm text-gray-400 mb-1">URL</label>
+          <input
+            type="text"
+            value={url}
+            onChange={(e) => setUrl(e.target.value)}
+            className="w-full px-3 py-2 bg-gray-800 border border-gray-600 rounded focus:outline-none focus:border-[var(--primary-color)]"
+          />
+        </div>
+        <div>
+          <label className="block text-sm text-gray-400 mb-1">Folder</label>
+          <select
+            value={folderId || ''}
+            onChange={(e) => setFolderId(e.target.value ? parseInt(e.target.value) : null)}
+            className="w-full px-3 py-2 bg-gray-800 border border-gray-600 rounded focus:outline-none focus:border-[var(--primary-color)]"
+          >
+            <option value="">No folder</option>
+            {folders.map(f => (
+              <option key={f.id} value={f.id}>{f.name}</option>
+            ))}
+          </select>
+        </div>
+        <div>
+          <label className="block text-sm text-gray-400 mb-1">Location</label>
+          <div className="grid grid-cols-3 gap-2">
+            <button
+              type="button"
+              onClick={() => setLocation('toolbar')}
+              className={`px-3 py-2 text-xs rounded border transition-colors ${
+                location === 'toolbar'
+                  ? 'bg-[var(--primary-color)]/20 border-[var(--primary-color)] text-[var(--primary-color)]'
+                  : 'bg-gray-800 border-gray-600 hover:border-gray-500'
+              }`}
             >
-              <option value="">No folder</option>
-              {folders.map(f => (
-                <option key={f.id} value={f.id}>{f.name}</option>
-              ))}
-            </select>
-          </div>
-          <div>
-            <label className="block text-sm text-gray-400 mb-1">Location</label>
-            <div className="grid grid-cols-3 gap-2">
-              <button
-                type="button"
-                onClick={() => setLocation('toolbar')}
-                className={`px-3 py-2 text-xs rounded border transition-colors ${
-                  location === 'toolbar'
-                    ? 'bg-[var(--primary-color)]/20 border-[var(--primary-color)] text-[var(--primary-color)]'
-                    : 'bg-gray-800 border-gray-600 hover:border-gray-500'
-                }`}
-              >
-                Toolbar
-              </button>
-              <button
-                type="button"
-                onClick={() => setLocation('list')}
-                className={`px-3 py-2 text-xs rounded border transition-colors ${
-                  location === 'list'
-                    ? 'bg-[var(--primary-color)]/20 border-[var(--primary-color)] text-[var(--primary-color)]'
-                    : 'bg-gray-800 border-gray-600 hover:border-gray-500'
-                }`}
-              >
-                List Only
-              </button>
-              <button
-                type="button"
-                onClick={() => setLocation('private')}
-                className={`px-3 py-2 text-xs rounded border transition-colors ${
-                  location === 'private'
-                    ? 'bg-yellow-500/20 border-yellow-500 text-yellow-400'
-                    : 'bg-gray-800 border-gray-600 hover:border-gray-500'
-                }`}
-              >
-                Private
-              </button>
-            </div>
-          </div>
-          <div>
-            <label className="block text-sm text-gray-400 mb-1">Tags</label>
-            <input
-              type="text"
-              value={tags}
-              onChange={(e) => setTags(e.target.value)}
-              className="w-full px-3 py-2 bg-gray-800 border border-gray-600 rounded focus:outline-none focus:border-[var(--primary-color)]"
-            />
-          </div>
-          <div>
-            <label className="block text-sm text-gray-400 mb-1">Notes</label>
-            <textarea
-              value={notes}
-              onChange={(e) => setNotes(e.target.value)}
-              className="w-full px-3 py-2 bg-gray-800 border border-gray-600 rounded focus:outline-none focus:border-[var(--primary-color)] resize-none"
-              rows={3}
-            />
+              Toolbar
+            </button>
+            <button
+              type="button"
+              onClick={() => setLocation('list')}
+              className={`px-3 py-2 text-xs rounded border transition-colors ${
+                location === 'list'
+                  ? 'bg-[var(--primary-color)]/20 border-[var(--primary-color)] text-[var(--primary-color)]'
+                  : 'bg-gray-800 border-gray-600 hover:border-gray-500'
+              }`}
+            >
+              List Only
+            </button>
+            <button
+              type="button"
+              onClick={() => setLocation('private')}
+              className={`px-3 py-2 text-xs rounded border transition-colors ${
+                location === 'private'
+                  ? 'bg-yellow-500/20 border-yellow-500 text-yellow-400'
+                  : 'bg-gray-800 border-gray-600 hover:border-gray-500'
+              }`}
+            >
+              Private
+            </button>
           </div>
         </div>
-        <div className="flex justify-end gap-2 p-4 border-t border-gray-700">
+        <div>
+          <label className="block text-sm text-gray-400 mb-1">Tags</label>
+          <input
+            type="text"
+            value={tags}
+            onChange={(e) => setTags(e.target.value)}
+            className="w-full px-3 py-2 bg-gray-800 border border-gray-600 rounded focus:outline-none focus:border-[var(--primary-color)]"
+          />
+        </div>
+        <div>
+          <label className="block text-sm text-gray-400 mb-1">Notes</label>
+          <textarea
+            value={notes}
+            onChange={(e) => setNotes(e.target.value)}
+            className="w-full px-3 py-2 bg-gray-800 border border-gray-600 rounded focus:outline-none focus:border-[var(--primary-color)] resize-none"
+            rows={3}
+          />
+        </div>
+        <div className="flex justify-end gap-2 pt-2">
           <button onClick={onClose} className="px-4 py-2 text-sm hover:bg-gray-700 rounded transition-colors">
             Cancel
           </button>
@@ -1339,7 +1371,7 @@ function EditBookmarkModal({ bookmark, folders, onClose, onSave }: {
           </button>
         </div>
       </div>
-    </div>
+    </RightDockPanel>
   );
 }
 
@@ -1391,7 +1423,7 @@ export function QuickBookmarkModal({
     try {
       if (existingBookmark) {
         await invoke('update_bookmark', {
-          bookmark_id: existingBookmark.id,
+          bookmarkId: existingBookmark.id,
           title: title.trim(),
           url,
           location,
@@ -1402,13 +1434,14 @@ export function QuickBookmarkModal({
           profileId,
           title: title.trim(),
           url,
-          folder_id: null,
+          folderId: null,
           tags: tags.split(',').map(t => t.trim()).filter(Boolean),
           notes: null,
           location,
         });
       }
       onSave?.();
+      emitBookmarksChanged();
       onClose();
     } catch (err) {
       console.error('Failed to save bookmark:', err);
@@ -1420,6 +1453,7 @@ export function QuickBookmarkModal({
       try {
         await invoke('delete_bookmark', { bookmarkId: existingBookmark.id });
         onDelete?.();
+        emitBookmarksChanged();
         onClose();
       } catch (err) {
         console.error('Failed to delete bookmark:', err);
@@ -1548,6 +1582,9 @@ export function useBookmarks(profileId: number) {
 
   useEffect(() => {
     loadBookmarks();
+    const handler = () => loadBookmarks();
+    window.addEventListener(BOOKMARKS_CHANGED, handler);
+    return () => window.removeEventListener(BOOKMARKS_CHANGED, handler);
   }, [loadBookmarks]);
 
   const isBookmarked = useCallback(async (url: string): Promise<number | null> => {
@@ -1564,11 +1601,12 @@ export function useBookmarks(profileId: number) {
         profileId,
         title,
         url,
-        folder_id: options?.folderId || null,
+        folderId: options?.folderId || null,
         tags: options?.tags || [],
         notes: null,
       });
       loadBookmarks();
+      emitBookmarksChanged();
       return bookmark;
     } catch (err) {
       console.error('Failed to add bookmark:', err);
@@ -1580,6 +1618,7 @@ export function useBookmarks(profileId: number) {
     try {
       await invoke('delete_bookmark', { bookmarkId: bookmarkId });
       loadBookmarks();
+      emitBookmarksChanged();
     } catch (err) {
       console.error('Failed to remove bookmark:', err);
     }

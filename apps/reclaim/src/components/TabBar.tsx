@@ -656,10 +656,10 @@ export function TabBar({ profileId, onTabChange, refreshTrigger }: TabBarProps) 
         </NativeClickableDiv>
       ))}
 
-      {/* Regular tabs */}
-      <div className="flex flex-1 overflow-x-auto scrollbar-none">
+      {/* Regular tabs — scrolls horizontally when tabs overflow the width */}
+      <div className="flex flex-1 overflow-x-auto scrollbar-none min-w-0">
         {regularTabs.map((tab, index) => (
-          <div key={tab.id} className="flex relative">
+          <div key={tab.id} className="flex relative flex-shrink-0">
             {/* Drop indicator before this tab */}
             {draggingTab && !isDragOutMode && dropTargetIndex === index && (
               <div className="absolute left-0 top-0 bottom-0 w-0.5 bg-[var(--primary-color)] z-20 -ml-0.5" />

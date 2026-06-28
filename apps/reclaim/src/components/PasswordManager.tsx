@@ -52,6 +52,12 @@ export function PasswordManager({ profileId, isOpen, onClose }: PasswordManagerP
     }
   }, [isOpen, profileId]);
 
+  // Switching profiles logs you out of the vault — re-lock so the master is
+  // required again (the backend session is cleared on switch too).
+  useEffect(() => {
+    setIsUnlocked(false);
+  }, [profileId]);
+
   // Refresh the list when the panel opens while unlocked — an autosave (or another
   // tab) may have added an entry while it was closed, leaving the list stale.
   useEffect(() => {
@@ -344,23 +350,26 @@ function PasswordEntryCard({
   };
 
   return (
-    <div className="flex items-center gap-3 p-3 bg-gray-800/50 hover:bg-gray-700/50 rounded-lg transition-colors group">
-      <div className="w-10 h-10 flex items-center justify-center bg-[var(--primary-color)]/20 text-[var(--primary-color)] rounded-lg">
+    <div className="relative flex items-center gap-3 p-3 bg-gray-800/50 hover:bg-gray-700/50 rounded-lg transition-colors group">
+      <div className="w-10 h-10 flex-shrink-0 flex items-center justify-center bg-[var(--primary-color)]/20 text-[var(--primary-color)] rounded-lg">
         {getCategoryIcon(entry.category)}
       </div>
 
       <div className="flex-1 min-w-0">
-        <div className="flex items-center gap-2">
-          <span className="font-medium text-[var(--text-color)] truncate">{entry.title}</span>
-          <span className="text-xs text-gray-500 bg-gray-700 px-1.5 py-0.5 rounded">{entry.category}</span>
+        <div className="flex items-center gap-2 min-w-0">
+          <span className="flex-1 min-w-0 font-medium text-[var(--text-color)] truncate">{entry.title}</span>
+          <span className="flex-shrink-0 whitespace-nowrap text-xs text-gray-500 bg-gray-700 px-1.5 py-0.5 rounded">{entry.category}</span>
         </div>
-        <div className="text-sm text-gray-400 truncate">{entry.username}</div>
+        {entry.username && <div className="text-sm text-gray-400 truncate">{entry.username}</div>}
         {entry.url && (
-          <div className="text-xs text-gray-500 break-all">{entry.url}</div>
+          <div className="text-xs text-gray-500 truncate">{entry.url}</div>
         )}
       </div>
 
-      <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+      {/* Actions are absolutely positioned so they don't reserve layout width
+          (which was squeezing the title/url to ~half). They overlay the right
+          edge on hover. */}
+      <div className="absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity bg-gray-700/90 backdrop-blur-sm rounded-lg px-1 shadow-lg">
         {/* Copy Username */}
         <button
           onClick={() => onCopy(entry.username, `username-${entry.id}`)}

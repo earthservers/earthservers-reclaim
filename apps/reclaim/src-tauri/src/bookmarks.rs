@@ -51,6 +51,8 @@ pub struct Bookmark {
     pub tags: Vec<String>,
     pub notes: Option<String>,
     pub position: i32,
+    /// Where the bookmark shows: "toolbar" | "list" | "private".
+    pub location: String,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -208,6 +210,7 @@ impl BookmarkManager {
     }
 
     /// Add a new bookmark
+    #[allow(clippy::too_many_arguments)]
     pub fn add_bookmark(
         &self,
         profile_id: i64,
@@ -216,6 +219,7 @@ impl BookmarkManager {
         folder_id: Option<i64>,
         tags: Vec<String>,
         notes: Option<&str>,
+        location: &str,
     ) -> Result<Bookmark> {
         let conn = Connection::open(&self.db_path)?;
         let now = chrono_now();
@@ -231,9 +235,9 @@ impl BookmarkManager {
             .unwrap_or(-1);
 
         conn.execute(
-            "INSERT INTO bookmarks (profile_id, title, url, folder_id, tags, notes, position, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
-            params![profile_id, enc(title), enc(url), folder_id, enc(&tags_json), notes.map(enc), max_pos + 1, now],
+            "INSERT INTO bookmarks (profile_id, title, url, folder_id, tags, notes, position, location, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
+            params![profile_id, enc(title), enc(url), folder_id, enc(&tags_json), notes.map(enc), max_pos + 1, location, now],
         )?;
 
         let id = conn.last_insert_rowid();
@@ -249,6 +253,7 @@ impl BookmarkManager {
             tags,
             notes: notes.map(String::from),
             position: max_pos + 1,
+            location: location.to_string(),
             created_at: now.clone(),
             updated_at: now,
         })
@@ -266,7 +271,7 @@ impl BookmarkManager {
         let conn = Connection::open(&self.db_path)?;
         let mut stmt = conn.prepare(
             "SELECT b.id, b.profile_id, b.title, b.url, b.favicon, b.folder_id, f.name as folder_name,
-                    b.tags, b.notes, b.position, b.created_at, b.updated_at
+                    b.tags, b.notes, b.position, b.created_at, b.updated_at, b.location
              FROM bookmarks b
              LEFT JOIN bookmark_folders f ON b.folder_id = f.id
              WHERE b.profile_id = ?1
@@ -290,6 +295,7 @@ impl BookmarkManager {
                 position: row.get(9)?,
                 created_at: row.get(10)?,
                 updated_at: row.get(11)?,
+                location: row.get(12)?,
             })
         })?;
 
@@ -303,7 +309,7 @@ impl BookmarkManager {
         let mut stmt = if folder_id.is_some() {
             conn.prepare(
                 "SELECT b.id, b.profile_id, b.title, b.url, b.favicon, b.folder_id, f.name as folder_name,
-                        b.tags, b.notes, b.position, b.created_at, b.updated_at
+                        b.tags, b.notes, b.position, b.created_at, b.updated_at, b.location
                  FROM bookmarks b
                  LEFT JOIN bookmark_folders f ON b.folder_id = f.id
                  WHERE b.profile_id = ?1 AND b.folder_id = ?2
@@ -312,7 +318,7 @@ impl BookmarkManager {
         } else {
             conn.prepare(
                 "SELECT b.id, b.profile_id, b.title, b.url, b.favicon, b.folder_id, NULL as folder_name,
-                        b.tags, b.notes, b.position, b.created_at, b.updated_at
+                        b.tags, b.notes, b.position, b.created_at, b.updated_at, b.location
                  FROM bookmarks b
                  WHERE b.profile_id = ?1 AND b.folder_id IS NULL
                  ORDER BY b.position ASC"
@@ -337,6 +343,7 @@ impl BookmarkManager {
                 position: row.get(9)?,
                 created_at: row.get(10)?,
                 updated_at: row.get(11)?,
+                location: row.get(12)?,
             })
         };
 
@@ -366,6 +373,7 @@ impl BookmarkManager {
     }
 
     /// Update a bookmark
+    #[allow(clippy::too_many_arguments)]
     pub fn update_bookmark(
         &self,
         bookmark_id: i64,
@@ -375,6 +383,7 @@ impl BookmarkManager {
         tags: Option<Vec<String>>,
         notes: Option<Option<&str>>,
         favicon: Option<&str>,
+        location: Option<&str>,
     ) -> Result<Bookmark> {
         let conn = Connection::open(&self.db_path)?;
         let now = chrono_now();
@@ -388,14 +397,15 @@ impl BookmarkManager {
         let new_tags = tags.unwrap_or(current.tags.clone());
         let new_notes = notes.map(|n| n.map(String::from)).unwrap_or(current.notes.clone());
         let new_favicon = favicon.map(String::from).or(current.favicon.clone());
+        let new_location = location.unwrap_or(&current.location);
 
         let tags_json = serde_json::to_string(&new_tags).unwrap_or_else(|_| "[]".to_string());
 
         // current came from get_bookmark (already decrypted); re-encrypt on write.
         conn.execute(
-            "UPDATE bookmarks SET title = ?1, url = ?2, folder_id = ?3, tags = ?4, notes = ?5, favicon = ?6, updated_at = ?7
-             WHERE id = ?8",
-            params![enc(new_title), enc(new_url), new_folder_id, enc(&tags_json), new_notes.as_deref().map(enc), new_favicon, now, bookmark_id],
+            "UPDATE bookmarks SET title = ?1, url = ?2, folder_id = ?3, tags = ?4, notes = ?5, favicon = ?6, location = ?7, updated_at = ?8
+             WHERE id = ?9",
+            params![enc(new_title), enc(new_url), new_folder_id, enc(&tags_json), new_notes.as_deref().map(enc), new_favicon, new_location, now, bookmark_id],
         )?;
 
         self.get_bookmark(bookmark_id)
@@ -406,7 +416,7 @@ impl BookmarkManager {
         let conn = Connection::open(&self.db_path)?;
         conn.query_row(
             "SELECT b.id, b.profile_id, b.title, b.url, b.favicon, b.folder_id, f.name as folder_name,
-                    b.tags, b.notes, b.position, b.created_at, b.updated_at
+                    b.tags, b.notes, b.position, b.created_at, b.updated_at, b.location
              FROM bookmarks b
              LEFT JOIN bookmark_folders f ON b.folder_id = f.id
              WHERE b.id = ?1",
@@ -428,6 +438,7 @@ impl BookmarkManager {
                     position: row.get(9)?,
                     created_at: row.get(10)?,
                     updated_at: row.get(11)?,
+                    location: row.get(12)?,
                 })
             },
         )
@@ -671,6 +682,7 @@ impl BookmarkManager {
                 folder_id,
                 bookmark.tags.clone(),
                 bookmark.notes.as_deref(),
+                "toolbar",
             ).is_ok() {
                 imported += 1;
             }
@@ -725,6 +737,7 @@ impl BookmarkManager {
                                     folder_id,
                                     vec![],
                                     None,
+                                    "toolbar",
                                 ).is_ok() {
                                     imported += 1;
                                 }
@@ -774,6 +787,7 @@ impl BookmarkManager {
                 None, // No folder
                 tags.into_iter().map(String::from).collect(),
                 None, // No notes
+                "toolbar",
             ).is_ok() {
                 seeded += 1;
             }

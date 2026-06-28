@@ -756,6 +756,7 @@ const mockCommands: Record<string, (args?: any) => any> = {
   },
 
   // Password Manager commands
+  lock_all_vaults: () => undefined,
   has_password_manager_master: (args: any) => passwordManagerMaster[args.profile_id] !== undefined,
   verify_password_manager_master: (args: any) => {
     const stored = passwordManagerMaster[args.profile_id];

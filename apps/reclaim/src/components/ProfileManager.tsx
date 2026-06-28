@@ -1,6 +1,6 @@
-import { useState, useEffect, useRef } from 'react';
-import { createPortal } from 'react-dom';
+import { useState, useEffect } from 'react';
 import { invoke } from '../lib/tauri';
+import { RightDockPanel } from '../lib/rightDock';
 
 // Types matching Rust structs
 interface Profile {
@@ -28,8 +28,6 @@ export function ProfileManager({ onProfileChange }: ProfileManagerProps) {
   const [newProfilePin, setNewProfilePin] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
-  const [dropdownPosition, setDropdownPosition] = useState({ top: 0, right: 0 });
-  const buttonRef = useRef<HTMLButtonElement>(null);
   // Profiles that are protected (Default / Incognito) — wipe-only, never deletable.
   const [protectedIds, setProtectedIds] = useState<Set<number>>(new Set());
   // The in-progress destructive action (delete or wipe). Its modal collects the
@@ -209,23 +207,14 @@ export function ProfileManager({ onProfileChange }: ProfileManagerProps) {
     );
   }
 
-  const handleOpenDropdown = () => {
-    if (buttonRef.current) {
-      const rect = buttonRef.current.getBoundingClientRect();
-      setDropdownPosition({
-        top: rect.bottom + 8,
-        right: window.innerWidth - rect.right,
-      });
-    }
-    setIsOpen(!isOpen);
-  };
+  // Whether the danger (delete/wipe) confirm is showing instead of the list.
+  const showDanger = !!dangerAction;
 
   return (
     <div className="relative">
       {/* Profile Button */}
       <button
-        ref={buttonRef}
-        onClick={handleOpenDropdown}
+        onClick={() => setIsOpen(o => !o)}
         className="flex items-center gap-2 px-3 py-2 rounded-lg bg-white/5 border border-white/10 hover:border-earth-teal transition-all"
       >
         <span className="text-lg">{getIconEmoji(activeProfile?.icon ?? null)}</span>
@@ -240,15 +229,71 @@ export function ProfileManager({ onProfileChange }: ProfileManagerProps) {
         </svg>
       </button>
 
-      {/* Dropdown - rendered via portal to escape overflow hidden */}
-      {isOpen && createPortal(
-        <div
-          className="fixed w-72 bg-gray-900/95 border border-white/10 rounded-xl shadow-xl backdrop-blur-md z-[9999]"
-          style={{ top: dropdownPosition.top, right: dropdownPosition.right }}
-        >
+      {/* Right-dock panel. The native browser surface renders above the DOM, so a
+          floating dropdown would be hidden behind the page — the dock insets the
+          surface instead. Content switches between the profile list and the
+          delete/wipe confirm. */}
+      <RightDockPanel
+        id="profile-manager"
+        open={isOpen || showDanger}
+        title={showDanger ? (dangerAction!.mode === 'delete' ? 'Delete profile' : 'Wipe profile data') : 'Profiles'}
+        onClose={() => {
+          if (dangerBusy) return;
+          setDangerAction(null);
+          setPinInput('');
+          setIsOpen(false);
+          setIsCreating(false);
+          setError(null);
+        }}
+      >
+        {showDanger ? (
+          <div className="px-1">
+            <h3 className="text-white font-semibold text-sm mb-1">{dangerAction!.profile.name}</h3>
+            <p className="text-xs text-gray-400 mb-3">
+              {dangerAction!.mode === 'delete'
+                ? 'This permanently removes the profile and ALL of its data (history, bookmarks, domains, media, saved passwords & 2FA codes). This cannot be undone.'
+                : 'This permanently erases ALL of this profile’s data (history, bookmarks, domains, media, saved passwords & 2FA codes) but keeps the profile itself. This cannot be undone.'}
+            </p>
+            <p className="text-xs text-gray-300 mb-2">
+              {dangerAction!.needsPinSetup
+                ? 'This profile has no delete code yet. Enter a 4-digit code to set it and confirm:'
+                : 'Enter this profile’s 4-digit delete code to confirm:'}
+            </p>
+            <input
+              type="password"
+              inputMode="numeric"
+              maxLength={4}
+              autoFocus
+              value={pinInput}
+              onChange={(e) => setPinInput(e.target.value.replace(/\D/g, '').slice(0, 4))}
+              onKeyDown={(e) => { if (e.key === 'Enter') confirmDangerAction(); }}
+              placeholder="••••"
+              className="w-full px-3 py-2 bg-white/5 border border-white/10 rounded-lg text-white text-center text-lg tracking-[0.5em] placeholder-gray-600 focus:outline-none focus:ring-2 focus:ring-red-500"
+            />
+            {dangerError && <p className="text-red-400 text-xs mt-2">{dangerError}</p>}
+            <div className="flex gap-2 mt-4">
+              <button
+                onClick={confirmDangerAction}
+                disabled={dangerBusy || !isFourDigits(pinInput)}
+                className={`flex-1 px-3 py-2 rounded-lg text-white transition-opacity disabled:opacity-40 ${
+                  dangerAction!.mode === 'delete' ? 'bg-red-600 hover:bg-red-500' : 'bg-amber-600 hover:bg-amber-500'
+                }`}
+              >
+                {dangerBusy ? 'Working…' : dangerAction!.mode === 'delete' ? 'Delete forever' : 'Wipe data'}
+              </button>
+              <button
+                onClick={() => { if (!dangerBusy) { setDangerAction(null); setPinInput(''); setDangerError(''); } }}
+                className="px-3 py-2 text-gray-400 hover:text-white transition-colors"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        ) : (
+        <div className="flex flex-col">
           {/* Error Message */}
           {error && (
-            <div className="px-4 py-2 bg-red-500/20 text-red-400 text-sm border-b border-white/10">
+            <div className="px-4 py-2 mb-1 bg-red-500/20 text-red-400 text-sm rounded">
               {error}
             </div>
           )}
@@ -312,8 +357,9 @@ export function ProfileManager({ onProfileChange }: ProfileManagerProps) {
             ))}
           </div>
 
-          {/* Create New Profile */}
-          <div className="border-t border-white/10">
+          {/* Create New Profile — pinned to the top so the profile list (Default,
+              Incognito, then any new profiles) sits below it. */}
+          <div className="border-b border-white/10 order-first">
             {isCreating ? (
               <div className="p-4 space-y-3">
                 <input
@@ -388,80 +434,9 @@ export function ProfileManager({ onProfileChange }: ProfileManagerProps) {
               </button>
             )}
           </div>
-        </div>,
-        document.body
-      )}
-
-      {/* Destructive-action confirm modal (delete / wipe), gated by 4-digit code */}
-      {dangerAction && createPortal(
-        <div
-          className="fixed inset-0 z-[10000] flex items-center justify-center bg-black/60 backdrop-blur-sm"
-          onClick={() => { if (!dangerBusy) { setDangerAction(null); setPinInput(''); } }}
-        >
-          <div
-            className="w-[22rem] bg-gray-900 border border-white/10 rounded-xl shadow-2xl p-5"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <h3 className="text-white font-semibold text-base mb-1">
-              {dangerAction.mode === 'delete' ? 'Delete profile' : 'Wipe profile data'}
-              {' '}— {dangerAction.profile.name}
-            </h3>
-            <p className="text-xs text-gray-400 mb-3">
-              {dangerAction.mode === 'delete'
-                ? 'This permanently removes the profile and ALL of its data (history, bookmarks, domains, media, saved passwords & 2FA codes). This cannot be undone.'
-                : 'This permanently erases ALL of this profile’s data (history, bookmarks, domains, media, saved passwords & 2FA codes) but keeps the profile itself. This cannot be undone.'}
-            </p>
-            <p className="text-xs text-gray-300 mb-2">
-              {dangerAction.needsPinSetup
-                ? 'This profile has no delete code yet. Enter a 4-digit code to set it and confirm:'
-                : 'Enter this profile’s 4-digit delete code to confirm:'}
-            </p>
-            <input
-              type="password"
-              inputMode="numeric"
-              maxLength={4}
-              autoFocus
-              value={pinInput}
-              onChange={(e) => setPinInput(e.target.value.replace(/\D/g, '').slice(0, 4))}
-              onKeyDown={(e) => { if (e.key === 'Enter') confirmDangerAction(); }}
-              placeholder="••••"
-              className="w-full px-3 py-2 bg-white/5 border border-white/10 rounded-lg text-white text-center text-lg tracking-[0.5em] placeholder-gray-600 focus:outline-none focus:ring-2 focus:ring-red-500"
-            />
-            {dangerError && <p className="text-red-400 text-xs mt-2">{dangerError}</p>}
-            <div className="flex gap-2 mt-4">
-              <button
-                onClick={confirmDangerAction}
-                disabled={dangerBusy || !isFourDigits(pinInput)}
-                className={`flex-1 px-3 py-2 rounded-lg text-white transition-opacity disabled:opacity-40 ${
-                  dangerAction.mode === 'delete' ? 'bg-red-600 hover:bg-red-500' : 'bg-amber-600 hover:bg-amber-500'
-                }`}
-              >
-                {dangerBusy ? 'Working…' : dangerAction.mode === 'delete' ? 'Delete forever' : 'Wipe data'}
-              </button>
-              <button
-                onClick={() => { if (!dangerBusy) { setDangerAction(null); setPinInput(''); } }}
-                className="px-3 py-2 text-gray-400 hover:text-white transition-colors"
-              >
-                Cancel
-              </button>
-            </div>
-          </div>
-        </div>,
-        document.body
-      )}
-
-      {/* Click outside to close */}
-      {isOpen && createPortal(
-        <div
-          className="fixed inset-0 z-[9998]"
-          onClick={() => {
-            setIsOpen(false);
-            setIsCreating(false);
-            setError(null);
-          }}
-        />,
-        document.body
-      )}
+        </div>
+        )}
+      </RightDockPanel>
     </div>
   );
 }

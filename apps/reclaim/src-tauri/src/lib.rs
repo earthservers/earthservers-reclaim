@@ -1268,10 +1268,13 @@ async fn add_bookmark(
     folder_id: Option<i64>,
     tags: Vec<String>,
     notes: Option<String>,
+    location: Option<String>,
 ) -> Result<Bookmark, String> {
     let state = state.lock().map_err(|e| e.to_string())?;
+    // Default to the toolbar when the caller doesn't specify a location.
+    let location = location.as_deref().unwrap_or("toolbar");
     state.bookmark_manager
-        .add_bookmark(profile_id, &title, &url, folder_id, tags, notes.as_deref())
+        .add_bookmark(profile_id, &title, &url, folder_id, tags, notes.as_deref(), location)
         .map_err(|e| e.to_string())
 }
 
@@ -1357,6 +1360,7 @@ async fn update_bookmark(
     tags: Option<Vec<String>>,
     notes: Option<Option<String>>,
     favicon: Option<String>,
+    location: Option<String>,
 ) -> Result<Bookmark, String> {
     let state = state.lock().map_err(|e| e.to_string())?;
     state.bookmark_manager
@@ -1368,6 +1372,7 @@ async fn update_bookmark(
             tags,
             notes.as_ref().map(|n| n.as_deref()),
             favicon.as_deref(),
+            location.as_deref(),
         )
         .map_err(|e| e.to_string())
 }
@@ -2678,6 +2683,7 @@ pub fn run() {
             vault::verify_password_manager_master,
             vault::set_password_manager_master,
             vault::lock_password_manager,
+            vault::lock_all_vaults,
             vault::vault_has_app_password,
             vault::vault_get_app_password,
             vault::vault_set_app_password,

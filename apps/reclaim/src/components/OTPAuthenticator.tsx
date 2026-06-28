@@ -133,6 +133,11 @@ export function OTPAuthenticator({ profileId, isOpen, onClose }: OTPAuthenticato
     }
   }, [isOpen, profileId]);
 
+  // Switching profiles logs you out of the authenticator — re-lock it.
+  useEffect(() => {
+    setIsUnlocked(false);
+  }, [profileId]);
+
   const checkMasterPassword = async () => {
     try {
       const hasPass = await invoke<boolean>('has_otp_master', { profileId: profileId });

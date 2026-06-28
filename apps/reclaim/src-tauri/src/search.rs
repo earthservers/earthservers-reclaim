@@ -259,6 +259,7 @@ impl SearchManager {
                 tags TEXT,
                 notes TEXT,
                 position INTEGER DEFAULT 0,
+                location TEXT NOT NULL DEFAULT 'toolbar',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 FOREIGN KEY (profile_id) REFERENCES profiles(id) ON DELETE CASCADE,
@@ -266,6 +267,10 @@ impl SearchManager {
             )",
             [],
         )?;
+
+        // Migration: add the location column ('toolbar' | 'list' | 'private') to
+        // databases created before it existed. Ignore the duplicate-column error.
+        let _ = conn.execute("ALTER TABLE bookmarks ADD COLUMN location TEXT NOT NULL DEFAULT 'toolbar'", []);
 
         // Bookmark indexes
         conn.execute("CREATE INDEX IF NOT EXISTS idx_bookmarks_profile ON bookmarks(profile_id)", [])?;

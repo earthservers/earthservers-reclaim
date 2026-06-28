@@ -14,12 +14,12 @@ import { BrowserProvider } from './contexts/BrowserContext';
 import { AnimationLayer } from './components/AnimationLayer';
 import { DomainManager } from './components/DomainManager';
 import { MemoryManager } from './components/MemoryManager';
-import { EarthMultiMedia } from './components/EarthMultiMedia';
+import { EarthMultiMedia, lockAllMediaSessions } from './components/EarthMultiMedia';
 import { TabBar, Tab, TabBehavior, TAB_BEHAVIOR_OPTIONS } from './components/TabBar';
 import { BookmarkBar, BookmarkManager } from './components/BookmarkComponents';
 import { WebView, BrowserNavBar } from './components/WebView';
 import { PageLoadSpinner } from './components/PageLoadSpinner';
-import { LocalAIHub } from './components/LocalAIHub';
+import { LocalAIHub, lockAllAiSessions } from './components/LocalAIHub';
 import { MediaPanel } from './components/MediaPanel';
 import { RightDockContext, RIGHT_DOCK_WIDTH, RightDockPanel } from './lib/rightDock';
 import { WebScraper } from './components/WebScraper';
@@ -182,7 +182,9 @@ function App() {
   const [tabBehavior, setTabBehavior] = useState<TabBehavior>('new-tab');
   const [tabRefreshTrigger, setTabRefreshTrigger] = useState(0);
   const [mediaFullscreen, setMediaFullscreen] = useState(false);
-  const [windowMaximized, setWindowMaximized] = useState(true); // Default to maximized
+  // Track window maximize state (used by maximize/restore controls). The value
+  // itself is no longer read for corner-rounding (top corners are square now).
+  const [, setWindowMaximized] = useState(true);
 
   // Local-AI on/off toggles, persisted across sessions. The curator gate is read
   // before firing page summarization; the assistant flag is forward-looking.
@@ -311,6 +313,13 @@ function App() {
   }, [activeProfile?.id]);
 
   const handleProfileChange = async (profile: Profile) => {
+    // Re-gate everything on profile switch: lock the password-manager &
+    // authenticator vaults (backend) and clear the media / Local AI session
+    // unlocks so the new profile starts fully locked. The private-bookmarks and
+    // vault UIs re-lock themselves on the profileId change.
+    invoke('lock_all_vaults').catch(() => {});
+    lockAllMediaSessions();
+    lockAllAiSessions();
     setActiveProfile(profile);
     // Load incognito status for the new profile
     try {
@@ -638,10 +647,6 @@ function App() {
               ? 'bg-gradient-to-br from-purple-950 via-gray-900 to-purple-900'
               : 'bg-theme-gradient'
           }`}
-          style={{
-            borderTopLeftRadius: !windowMaximized ? '12px' : 0,
-            borderTopRightRadius: !windowMaximized ? '12px' : 0,
-          }}
         >
           {/* Animated Background Layer - Hide when media fullscreen */}
           {!mediaFullscreen && <ThemedAnimationLayer enabled={!isIncognito} />}
@@ -786,8 +791,6 @@ function App() {
               backgroundColor: isIncognito ? 'rgba(88, 28, 135, 0.9)' : 'var(--color-navbar, #0a0a0f)',
               borderColor: 'rgba(255, 255, 255, 0.15)',
               height: navbarCollapsed ? '28px' : 'auto',
-              borderTopLeftRadius: !windowMaximized ? '12px' : 0,
-              borderTopRightRadius: !windowMaximized ? '12px' : 0,
             }}
             onMouseDown={(e) => {
               // Only start dragging with left mouse button on navbar background
@@ -1205,6 +1208,7 @@ function App() {
                   aiSettings={aiSettings}
                   onAiSettingsChange={updateAiSettings}
                   onSelectService={setActiveService}
+                  isIncognito={isIncognito}
                 />
               </div>
             )}
@@ -1352,9 +1356,10 @@ function App() {
   );
 }
 
-function Home({ activeService, profileId, onOpenUrl, activeTab, onMediaFullscreenChange, chromeHeight, onEngine, rightInset, tabBehavior, onTabBehaviorChange, aiSettings, onAiSettingsChange, onSelectService }: {
+function Home({ activeService, profileId, onOpenUrl, activeTab, onMediaFullscreenChange, chromeHeight, onEngine, rightInset, tabBehavior, onTabBehaviorChange, aiSettings, onAiSettingsChange, onSelectService, isIncognito }: {
   activeService: 'search' | 'memory' | 'media' | 'scraper' | 'ai';
   profileId: number | null;
+  isIncognito?: boolean;
   onOpenUrl?: (url: string) => void;
   activeTab?: Tab | null;
   onMediaFullscreenChange?: (isFullscreen: boolean) => void;
@@ -1376,6 +1381,7 @@ function Home({ activeService, profileId, onOpenUrl, activeTab, onMediaFullscree
         onChange={onAiSettingsChange}
         onOpenMemory={() => onSelectService?.('memory')}
         onOpenUrl={onOpenUrl}
+        isIncognito={isIncognito}
       />
     );
   }

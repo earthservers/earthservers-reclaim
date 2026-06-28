@@ -16,6 +16,7 @@ interface LocalAIHubProps {
   onChange: (next: Partial<AiSettings>) => void;
   onOpenMemory: () => void;             // legacy deep-link; History is now a tab
   onOpenUrl?: (url: string) => void;    // open an indexed page in Search
+  isIncognito?: boolean;                // disabled in incognito / on the Incognito profile
 }
 
 interface ChatMessage { role: 'user' | 'assistant'; content: string; }
@@ -420,6 +421,11 @@ function AiTab({ profileId, settings, onChange }: { profileId: number | null; se
 // profile so unlocking one profile doesn't unlock another.
 const aiUnlockedProfiles = new Set<number>();
 
+/// Clear all AI/History session unlocks (called on profile switch so it re-gates).
+export function lockAllAiSessions() {
+  aiUnlockedProfiles.clear();
+}
+
 // Modal to set / change / remove the AI / History password (its own unique one).
 function AiLockModal({ profileId, hasPw, onClose, onChanged }: { profileId: number; hasPw: boolean; onClose: () => void; onChanged: (hasPw: boolean) => void }) {
   const [mode, setMode] = useState<'set' | 'remove'>('set');
@@ -434,7 +440,13 @@ function AiLockModal({ profileId, hasPw, onClose, onChanged }: { profileId: numb
     if (pw.length < 4) { setErr('Password must be at least 4 characters'); return; }
     if (pw !== confirm) { setErr('Passwords do not match'); return; }
     setBusy(true);
-    try { await invoke('ai_lock_set_password', { profileId, password: pw }); aiUnlockedProfiles.add(profileId); onChanged(true); onClose(); }
+    try {
+      await invoke('ai_lock_set_password', { profileId, password: pw });
+      // Do NOT auto-unlock here — onChanged(true) makes the parent lock the tab
+      // immediately so the gate actually engages (and proves the password works).
+      onChanged(true);
+      onClose();
+    }
     catch (e) { setErr(String(e).replace(/^.*?:\s*/, '')); } finally { setBusy(false); }
   };
   const doRemove = async () => {
@@ -475,7 +487,7 @@ function AiLockModal({ profileId, hasPw, onClose, onChanged }: { profileId: numb
   );
 }
 
-export function LocalAIHub({ profileId, settings, onChange, onOpenUrl }: LocalAIHubProps) {
+export function LocalAIHub({ profileId, settings, onChange, onOpenUrl, isIncognito }: LocalAIHubProps) {
   const [tab, setTab] = useState<'ai' | 'history'>('ai');
   const [locked, setLocked] = useState<boolean | null>(null); // null = still checking
   const [hasPw, setHasPw] = useState(false);
@@ -497,6 +509,26 @@ export function LocalAIHub({ profileId, settings, onChange, onOpenUrl }: LocalAI
       else setUnlockError('Incorrect password');
     } catch { setUnlockError('Could not verify password'); }
   };
+
+  // Lock the tab now: drop this session's unlock so the gate (the `if (locked)`
+  // lock screen below) engages, hiding the AI toggles and history.
+  const lockNow = () => { aiUnlockedProfiles.delete(pid); setLocked(true); };
+
+  // Local AI / History is disabled in incognito mode (and on the Incognito
+  // profile) — nothing is recorded or indexed there, so there's nothing to show.
+  if (isIncognito) {
+    return (
+      <div className="max-w-sm mx-auto py-16 px-4 text-center">
+        <div className="inline-flex w-14 h-14 rounded-full bg-purple-500/15 items-center justify-center mb-4">
+          <svg className="w-7 h-7 text-purple-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21" /></svg>
+        </div>
+        <h1 className="text-xl font-bold text-white">Local AI / History is disabled</h1>
+        <p className="text-sm text-[var(--text-muted-color)] mt-1">
+          This profile is in incognito mode — browsing isn't recorded and the local AI history is turned off. Switch to a normal profile to use it.
+        </p>
+      </div>
+    );
+  }
 
   if (locked === null) {
     return <div className="max-w-5xl mx-auto py-16 px-4 text-center text-sm text-[var(--text-muted-color)]">Checking…</div>;
@@ -537,20 +569,27 @@ export function LocalAIHub({ profileId, settings, onChange, onOpenUrl }: LocalAI
             On-device intelligence. Runs locally, stays private, and never phones home.
           </p>
         </div>
-        <button
-          onClick={() => setShowLockModal(true)}
-          title={hasPw ? 'Change or remove the password for this tab' : 'Password-protect this tab'}
-          className={`shrink-0 flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border text-xs transition-colors ${
-            hasPw ? 'border-[var(--primary-color)]/40 text-[var(--primary-color)] hover:bg-[var(--primary-color)]/10' : 'border-white/10 text-[var(--text-muted-color)] hover:text-white'
-          }`}
-        >
-          {hasPw ? (
-            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" /></svg>
-          ) : (
-            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 11V7a4 4 0 018 0m-4 8v2M6 21h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2z" /></svg>
+        <div className="shrink-0 flex items-center gap-1.5">
+          {hasPw && (
+            <button
+              onClick={() => setShowLockModal(true)}
+              title="Change or remove the password"
+              className="p-1.5 rounded-lg border border-white/10 text-[var(--text-muted-color)] hover:text-white transition-colors"
+            >
+              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /></svg>
+            </button>
           )}
-          {hasPw ? 'Locked' : 'Lock'}
-        </button>
+          <button
+            onClick={() => { if (hasPw) lockNow(); else setShowLockModal(true); }}
+            title={hasPw ? 'Lock this tab now' : 'Password-protect this tab'}
+            className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border text-xs transition-colors ${
+              hasPw ? 'border-[var(--primary-color)]/40 text-[var(--primary-color)] hover:bg-[var(--primary-color)]/10' : 'border-white/10 text-[var(--text-muted-color)] hover:text-white'
+            }`}
+          >
+            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" /></svg>
+            {hasPw ? 'Lock now' : 'Lock'}
+          </button>
+        </div>
       </div>
 
       {/* Tab switcher */}
@@ -573,7 +612,18 @@ export function LocalAIHub({ profileId, settings, onChange, onOpenUrl }: LocalAI
         : <MemoryManager profileId={profileId} onOpenUrl={onOpenUrl} />}
 
       {showLockModal && (
-        <AiLockModal profileId={pid} hasPw={hasPw} onClose={() => setShowLockModal(false)} onChanged={setHasPw} />
+        <AiLockModal
+          profileId={pid}
+          hasPw={hasPw}
+          onClose={() => setShowLockModal(false)}
+          onChanged={(has) => {
+            setHasPw(has);
+            // Newly set/changed password → lock now so the gate engages.
+            // Password removed → no gate, stay open.
+            if (has) lockNow();
+            else { aiUnlockedProfiles.delete(pid); setLocked(false); }
+          }}
+        />
       )}
     </div>
   );

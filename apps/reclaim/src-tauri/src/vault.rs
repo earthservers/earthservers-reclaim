@@ -42,6 +42,13 @@ fn lock_session(profile_id: i64, kind: &str) {
         m.remove(&(profile_id, kind.to_string()));
     }
 }
+/// Lock every unlocked vault for every profile (clears all cached master keys).
+/// Used on profile switch so the new profile starts fully gated.
+fn lock_all_sessions() {
+    if let Ok(mut m) = SESSIONS.lock() {
+        m.clear();
+    }
+}
 
 fn now() -> String {
     chrono::Utc::now().to_rfc3339()
@@ -695,6 +702,14 @@ pub async fn set_password_manager_master(state: State<'_, Mutex<AppState>>, prof
 #[tauri::command(rename_all = "camelCase")]
 pub async fn lock_password_manager(profile_id: i64) -> Result<(), String> {
     lock_session(profile_id, KIND_PASSWORD);
+    Ok(())
+}
+
+/// Lock ALL vaults for ALL profiles (password manager + authenticator). Called on
+/// profile switch so passwords are re-gated.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn lock_all_vaults() -> Result<(), String> {
+    lock_all_sessions();
     Ok(())
 }
 

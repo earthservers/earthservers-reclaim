@@ -5,6 +5,39 @@ All notable changes to Earth Reclaim are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.4] - 2026-06-28
+
+### Added
+- **Local AI / History lock now actually works.** A "Lock now" toggle on the tab
+  locks it immediately (hiding the AI tools and history behind the password);
+  setting a password also locks right away so the gate engages. Previously it only
+  showed "Locked" but never gated access.
+- **Local AI / History is shown as disabled** on the Incognito profile / in
+  incognito mode (nothing is recorded there).
+- **Switching profiles re-locks every feature password** (password manager,
+  authenticator, media, private bookmarks, Local AI/History) so the new profile
+  starts fully gated.
+
+### Fixed
+- **Private bookmarks and toolbar bookmarks now save correctly.** Bookmark
+  "location" (toolbar / list / private) is persisted again — private bookmarks
+  show in the private list, and toolbar bookmarks appear on the bar.
+- **Dragging bookmarks works.** Fixed drag never starting (a pointer handler was
+  cancelling native drag) and the move failing (wrong argument names); you can
+  drop a bookmark on a folder to move it, or on another bookmark to make a folder.
+- **Bookmark toolbar and tab strip scroll** horizontally when they overflow,
+  instead of pushing into other controls.
+- **Modals that were hidden behind the web page are now right-side panels** (the
+  create-folder prompt, Edit Bookmark, the profile dropdown + delete/wipe confirm),
+  so they're visible and clickable while browsing.
+- **Private Bookmarks panel no longer closes when you click inside it** (you can
+  type the password and use autofill).
+- **Password Manager entries** show their full title and URL instead of being
+  truncated to one letter / wrapped onto extra lines.
+- Removed the broken "fake rounded" top corners on the header and incognito banner.
+- The "Create New Profile" button sits at the top of the profile panel; new
+  profiles are listed below Default and Incognito.
+
 ## [1.0.3] - 2026-06-28
 
 > Supersedes 1.0.2, whose release build failed before publishing (the NoScript

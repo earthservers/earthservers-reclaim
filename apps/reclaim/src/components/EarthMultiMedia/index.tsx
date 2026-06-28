@@ -176,6 +176,11 @@ let mediaPasswordPrompted = false;
 // NOT bypass this — the gate is enforced whatever the privacy mode.
 const mediaUnlockedProfiles = new Set<number>();
 
+/// Clear all media session unlocks (called on profile switch so media re-gates).
+export function lockAllMediaSessions() {
+  mediaUnlockedProfiles.clear();
+}
+
 export function EarthMultiMedia({ profileId, initialSource, initialType, onFullscreenChange }: EarthMultiMediaProps & { onFullscreenChange?: (isFullscreen: boolean) => void }) {
   // State
   const [layout, setLayout] = useState<ViewLayout>(() => mediaStateCache.layout ?? 'single');
