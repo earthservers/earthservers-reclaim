@@ -5,6 +5,15 @@ All notable changes to Earth Reclaim are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.6] - 2026-06-28
+
+### Fixed
+- **Media playback and floating controls now work in packaged builds on Wayland.**
+  The app now forces the X11 (GTK) backend, like the dev build does. The media
+  player embeds video via X11 window reparenting, which only works on X11 — on a
+  Wayland session, dropped videos opened in separate top-level windows and the
+  floating controls never appeared. (Set `GDK_BACKEND` yourself to override.)
+
 ## [1.0.5] - 2026-06-28
 
 ### Fixed

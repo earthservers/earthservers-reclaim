@@ -10,6 +10,18 @@ fn main() {
     {
         use std::env;
 
+        // Force the GTK/X11 backend. The media stack (GStreamer video surfaces) and
+        // the floating media controls embed into the app window via X11 window
+        // reparenting, which only works when the Tauri/GTK windows are real X11
+        // surfaces. On a Wayland session they're Wayland surfaces with no X11 parent,
+        // so dropped videos pop out as separate top-level windows and the floating
+        // controls never appear. Dev already runs with GDK_BACKEND=x11; do the same
+        // for packaged builds (XWayland on Wayland sessions). Must be set before GTK
+        // initializes. An explicit GDK_BACKEND override is respected.
+        if env::var("GDK_BACKEND").is_err() {
+            env::set_var("GDK_BACKEND", "x11");
+        }
+
         // Workaround for WebKitGTK GBM buffer allocation issues on some GPUs:
         // disabling the DMA-BUF renderer forces a software-ish path. But that
         // path is exactly what blocks GPU-accelerated media. So when the GPU-accel
