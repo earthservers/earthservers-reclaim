@@ -28,10 +28,11 @@ mod media_downloads;
 mod assistant;
 mod research;
 mod ai_lock;
+mod assets_server;
 
 use std::sync::Mutex;
 use tauri::{
-    Manager, State,
+    Emitter, Manager, State,
     menu::{Menu, MenuItem},
     tray::{TrayIconBuilder, TrayIconEvent, MouseButton, MouseButtonState},
     WebviewUrl, WebviewWindowBuilder,
@@ -263,6 +264,13 @@ fn get_incognito_profiles() -> Vec<i64> {
 #[tauri::command(rename_all = "camelCase")]
 fn incognito_is_forced(profile_id: i64) -> bool {
     PrivacyManager::is_forced_incognito(profile_id)
+}
+
+/// Mirror the media player's shuffle + repeat state (owned by the frontend) into
+/// the controls server, so the floating media controls reflect and stay in sync.
+#[tauri::command(rename_all = "camelCase")]
+fn set_media_playback_flags(is_shuffled: bool, repeat_mode: String) {
+    controls_server::set_playback_flags(is_shuffled, repeat_mode);
 }
 
 // ==================== Identity Commands (Hardware Fingerprinting) ====================
@@ -1254,6 +1262,17 @@ async fn close_unpinned_tabs(
     let state = state.lock().map_err(|e| e.to_string())?;
     state.tab_manager
         .close_unpinned_tabs(profile_id)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn close_all_tabs(
+    state: State<'_, Mutex<AppState>>,
+    profile_id: i64,
+) -> Result<(), String> {
+    let state = state.lock().map_err(|e| e.to_string())?;
+    state.tab_manager
+        .close_all_tabs(profile_id)
         .map_err(|e| e.to_string())
 }
 
@@ -2299,19 +2318,28 @@ pub fn run() {
                 eprintln!("[noscript] extension .so NOT found; build crates/earth-noscript-ext");
             }
 
+            // Serve the embedded frontend over localhost so the raw-WebKitGTK media
+            // controls window can load /media-controls in packaged builds.
+            assets_server::start(app.handle().clone());
+
             // Initialize GStreamer media player states
             app.manage(media_player::MediaPlayerState::new());
             app.manage(media_player::MediaPlayerManagerState::new());
 
             // Start WebSocket server for media controls communication
             // This enables real-time bidirectional communication with floating controls
-            tauri::async_runtime::spawn(async {
+            let controls_app = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
                 if let Err(e) = controls_server::init_controls_server().await {
                     log::error!("Failed to start controls WebSocket server: {}", e);
                 } else {
                     // Set up command handler to forward commands to media player
-                    controls_server::set_controls_command_handler(|cmd| {
+                    controls_server::set_controls_command_handler(move |cmd| {
                         use controls_server::ControlCommand;
+
+                        // App handle so shuffle/repeat/playlist commands (which are
+                        // frontend state) can be forwarded to the main window.
+                        let cmd_app = controls_app.clone();
 
                         // Get the default player ID if not specified
                         let get_player_id = |id: Option<String>| id.unwrap_or_else(|| "pane-0".to_string());
@@ -2371,16 +2399,22 @@ pub fn run() {
                                     }
                                 }
                                 ControlCommand::ToggleShuffle { player_id: _ } => {
-                                    // TODO: Implement shuffle toggle when playlist system is ready
-                                    log::info!("Shuffle toggle requested (not yet implemented)");
+                                    // Shuffle/repeat live in the frontend; forward to the
+                                    // main window, which toggles state and pushes it back
+                                    // (via set_media_playback_flags) for the broadcast.
+                                    let _ = cmd_app.emit("media-control-action", serde_json::json!({ "action": "toggle-shuffle" }));
                                 }
                                 ControlCommand::ToggleRepeat { player_id: _ } => {
-                                    // TODO: Implement repeat toggle when playlist system is ready
-                                    log::info!("Repeat toggle requested (not yet implemented)");
+                                    let _ = cmd_app.emit("media-control-action", serde_json::json!({ "action": "cycle-repeat" }));
                                 }
                                 ControlCommand::TogglePlaylist => {
-                                    // TODO: Emit event to toggle playlist panel in frontend
-                                    log::info!("Playlist toggle requested (not yet implemented)");
+                                    let _ = cmd_app.emit("media-control-action", serde_json::json!({ "action": "toggle-playlist" }));
+                                }
+                                ControlCommand::PreviousVideo => {
+                                    let _ = cmd_app.emit("media-control-action", serde_json::json!({ "action": "prev-video" }));
+                                }
+                                ControlCommand::NextVideo => {
+                                    let _ = cmd_app.emit("media-control-action", serde_json::json!({ "action": "next-video" }));
                                 }
                             }
                         });
@@ -2399,6 +2433,7 @@ pub fn run() {
                             let active_player_id = controls_server::get_active_player_id();
                             // Get status from the active player
                             if let Ok(status) = media_player::player_get_status_internal(&active_player_id).await {
+                                let (is_shuffled, repeat_mode) = controls_server::get_playback_flags();
                                 broadcast_player_status(PlayerStatus {
                                     player_id: active_player_id.clone(),
                                     is_playing: matches!(status.state, earth_media::PlaybackState::Playing),
@@ -2407,8 +2442,8 @@ pub fn run() {
                                     volume: status.volume,
                                     is_muted: status.muted,
                                     title: status.info.title.clone().unwrap_or_default(),
-                                    is_shuffled: false, // TODO: Get from playlist state when implemented
-                                    repeat_mode: "none".to_string(), // TODO: Get from playlist state when implemented
+                                    is_shuffled,
+                                    repeat_mode,
                                 });
                             }
 
@@ -2518,6 +2553,7 @@ pub fn run() {
             set_incognito,
             get_incognito_profiles,
             incognito_is_forced,
+            set_media_playback_flags,
             // Identity commands (hardware fingerprinting)
             get_hardware_info,
             get_device_fingerprint,
@@ -2601,6 +2637,7 @@ pub fn run() {
             duplicate_tab,
             close_tabs_to_right,
             close_unpinned_tabs,
+            close_all_tabs,
             // Bookmark commands
             add_bookmark,
             delete_bookmark,

@@ -161,9 +161,10 @@ export function MediaControls() {
   const toggleMute = () => sendCommand('toggleMute');
   const setVolume = (vol: number) => sendCommand('setVolume', { volume: vol });
   const seek = (positionMs: number) => sendCommand('seek', { positionMs: Math.floor(positionMs) });
-  const toggleShuffle = () => sendCommand('toggleShuffle');
   const toggleRepeat = () => sendCommand('toggleRepeat');
   const togglePlaylist = () => sendCommand('togglePlaylist');
+  const previousVideo = () => sendCommand('previousVideo');
+  const nextVideo = () => sendCommand('nextVideo');
 
   const handleProgressClick = (e: React.MouseEvent<HTMLDivElement>) => {
     if (!progressRef.current || state.duration <= 0) return;
@@ -336,29 +337,31 @@ export function MediaControls() {
 
           {/* Control Buttons */}
           <div className="flex items-center justify-between gap-2">
-            {/* Left: Shuffle & Skip Back */}
+            {/* Left: Previous video & Seek back (-10s) */}
             <div className="flex items-center">
               <button
-                onClick={toggleShuffle}
-                className={`p-1.5 rounded transition-colors ${state.isShuffled ? 'text-purple-500' : 'text-gray-500 hover:text-white'}`}
-                title="Shuffle"
+                onClick={previousVideo}
+                className="p-1.5 text-gray-400 hover:text-white transition-colors"
+                title="Previous video"
               >
-                <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M16 3h5v5M4 20L21 3M21 16v5h-5M15 15l6 6M4 4l5 5" />
+                {/* track-skip: bar + triangle */}
+                <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
+                  <path d="M6 6h2v12H6zm3.5 6l8.5 6V6z" />
                 </svg>
               </button>
               <button
                 onClick={skipBack}
                 className="p-1.5 text-gray-400 hover:text-white transition-colors"
-                title="Previous / -10s"
+                title="Back 10s"
               >
-                <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
-                  <path d="M6 6h2v12H6zm3.5 6l8.5 6V6z" />
+                {/* seek: double chevron */}
+                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 19l-7-7 7-7M18 19l-7-7 7-7" />
                 </svg>
               </button>
             </div>
 
-            {/* Center: Stop, Play/Pause, Next */}
+            {/* Center: Stop, Play/Pause, Seek forward (+10s), Next video */}
             <div className="flex items-center gap-1">
               <button
                 onClick={stop}
@@ -387,8 +390,19 @@ export function MediaControls() {
               <button
                 onClick={skipForward}
                 className="p-1.5 text-gray-400 hover:text-white transition-colors"
-                title="Next / +10s (Enter)"
+                title="Forward 10s"
               >
+                {/* seek: double chevron */}
+                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 5l7 7-7 7M6 5l7 7-7 7" />
+                </svg>
+              </button>
+              <button
+                onClick={nextVideo}
+                className="p-1.5 text-gray-400 hover:text-white transition-colors"
+                title="Next video"
+              >
+                {/* track-skip: triangle + bar */}
                 <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
                   <path d="M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z" />
                 </svg>

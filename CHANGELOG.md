@@ -5,6 +5,37 @@ All notable changes to Earth Reclaim are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.7] - 2026-06-28
+
+### Fixed
+- **Videos now auto-advance through the queue.** When a clip finished, the pane
+  used to freeze on the last frame instead of playing the next item. GStreamer's
+  `playbin` stays in the *Playing* state at end-of-stream with the position parked
+  at the duration, so the old "position is 0 and paused" end-check never fired. The
+  player now detects end-of-stream via the GStreamer EOS bus message (exposed on
+  the player status) with a position-frozen-at-end fallback, and advances the pane.
+- **Shuffle and Repeat now actually work for video playback.** Queue advancement
+  could stall after one or two clips — and the Next button would stop responding —
+  because the next-item picker required a clip that was both unplayed *and* not
+  already on another pane, a set that empties quickly when the queue is near the
+  pane count, and the repeat-all reset read a stale played-set. Selection was
+  rewritten to read live state and never stall: it prefers an unplayed, off-screen
+  clip, advances anyway when the queue is smaller than the pane count, and loops
+  the whole queue under Repeat-all. Repeat-one replays the current clip on auto-end
+  but still advances on a manual Next.
+- **Floating media controls now load in packaged builds** (and the stuck "The URL
+  can't be shown" window is gone). The raw WebKitGTK controls webview couldn't load
+  the embedded frontend in a packaged build; a small localhost asset server now
+  serves the controls page so the X11 controls window loads in both dev and
+  packaged builds.
+
+### Changed
+- **Floating controls: replaced the Shuffle button with Previous-/Next-video
+  buttons.** Shuffle and Repeat are now single toggles in the media toolbar (they
+  drive both photos and videos); the in-window seek buttons (±10s) use chevron
+  icons to distinguish them from the new track-skip buttons, which respect the
+  active Shuffle/Repeat cycle.
+
 ## [1.0.6] - 2026-06-28
 
 ### Fixed

@@ -651,7 +651,8 @@ const mockCommands: Record<string, (args?: any) => any> = {
     return null;
   },
   close_tabs_to_right: () => undefined,
-  close_unpinned_tabs: () => undefined,
+  close_unpinned_tabs: () => { mockTabs = mockTabs.filter(t => t.is_pinned); return undefined; },
+  close_all_tabs: () => { mockTabs = []; return undefined; },
 
   // Bookmark commands
   add_bookmark: (args: any) => {

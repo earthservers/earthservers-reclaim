@@ -152,6 +152,9 @@ pub struct PlayerStatus {
     /// (proves hardware vs software — e.g. "nvh264dec" vs "avdec_h264"). None until
     /// a video has loaded.
     pub active_decoder: Option<String>,
+    /// True once playback has reached end-of-stream. The frontend edge-detects this
+    /// (false -> true) to advance the queue, since playbin reports Playing at EOS.
+    pub eos: bool,
 }
 
 /// Hardware-accelerated media player using GStreamer playbin directly
@@ -172,6 +175,12 @@ pub struct MediaPlayer {
     muted: Arc<Mutex<bool>>,
     volume: Arc<Mutex<f64>>,
     last_error: Arc<Mutex<Option<String>>>,
+    /// Set true when the pipeline posts an EOS message (playback reached the end).
+    /// playbin stays in the Playing state at EOS with position frozen at the
+    /// duration, so neither state nor position can detect end-of-stream — the bus
+    /// EOS message is the only reliable signal. The frontend polls this via
+    /// PlayerStatus to drive queue auto-advance. Reset to false on load/play/seek.
+    eos: Arc<Mutex<bool>>,
 }
 
 impl MediaPlayer {
@@ -337,10 +346,13 @@ impl MediaPlayer {
         }
 
         // Set up bus handler for messages
+        let eos = Arc::new(Mutex::new(false));
+
         let bus = pipeline.bus().expect("Pipeline should have a bus");
         let error_clone = last_error.clone();
         let window_handle_for_bus = window_handle.clone();
         let video_sink_for_bus = stored_sink.clone();
+        let eos_for_bus = eos.clone();
 
         // Use sync handler to catch prepare-window-handle immediately
         bus.set_sync_handler(move |_bus, msg| {
@@ -397,6 +409,15 @@ impl MediaPlayer {
                         warn.debug()
                     );
                 }
+                MessageView::Eos(_) => {
+                    // End of stream — playback reached the end. playbin stays in the
+                    // Playing state here, so this flag is the only reliable end signal
+                    // the frontend can poll to auto-advance the queue.
+                    log::info!("Received EOS — playback reached end of stream");
+                    if let Ok(mut e) = eos_for_bus.lock() {
+                        *e = true;
+                    }
+                }
                 _ => {}
             }
 
@@ -412,6 +433,7 @@ impl MediaPlayer {
             muted,
             volume,
             last_error,
+            eos,
         })
     }
 
@@ -497,6 +519,11 @@ impl MediaPlayer {
             *err = None;
         }
 
+        // New media — clear the end-of-stream flag from the previous clip.
+        if let Ok(mut e) = self.eos.lock() {
+            *e = false;
+        }
+
         // Update info
         if let Ok(mut info) = self.info.lock() {
             *info = MediaInfo {
@@ -517,6 +544,12 @@ impl MediaPlayer {
     /// Start playback
     pub fn play(&self) -> Result<(), MediaError> {
         log::info!("Starting playback...");
+
+        // Resuming/restarting clears any stale end-of-stream flag (e.g. repeat-one
+        // replays the same clip after EOS).
+        if let Ok(mut e) = self.eos.lock() {
+            *e = false;
+        }
 
         self.pipeline.set_state(gst::State::Playing)
             .map_err(|e| MediaError::PlaybackError(format!("Failed to play: {:?}", e)))?;
@@ -554,6 +587,11 @@ impl MediaPlayer {
         }
 
         log::info!("Seeking to {}ms", position_ms);
+
+        // Seeking back into the clip clears the end-of-stream flag.
+        if let Ok(mut e) = self.eos.lock() {
+            *e = false;
+        }
 
         let position = gst::ClockTime::from_mseconds(position_ms as u64);
         self.pipeline.seek_simple(
@@ -649,6 +687,7 @@ impl MediaPlayer {
             info: self.get_info(),
             hw_decode_available: nvdec_available(),
             active_decoder: self.get_active_decoder(),
+            eos: self.eos.lock().map(|e| *e).unwrap_or(false),
         }
     }
 

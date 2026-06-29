@@ -615,7 +615,7 @@ export function TabBar({ profileId, onTabChange, refreshTrigger }: TabBarProps) 
               top: draggingTab.startY - 18,
             }}
           >
-            <div className="flex items-center gap-2 min-w-[120px] max-w-[200px] h-9 px-3 bg-[var(--navbar-color)] border border-[var(--primary-color)] rounded shadow-lg opacity-90">
+            <div className="flex items-center gap-2 min-w-[120px] max-w-[288px] h-9 px-3 bg-[var(--navbar-color)] border border-[var(--primary-color)] rounded shadow-lg opacity-90">
               {tab.favicon ? (
                 <img src={tab.favicon} className="w-4 h-4 flex-shrink-0" alt="" />
               ) : (
@@ -666,7 +666,7 @@ export function TabBar({ profileId, onTabChange, refreshTrigger }: TabBarProps) 
             )}
             <NativeClickableDiv
               className={`
-                flex items-center gap-2 min-w-[120px] max-w-[200px] h-full px-3 cursor-pointer
+                flex items-center gap-2 min-w-[120px] max-w-[288px] h-full px-3 cursor-pointer
                 border-r border-gray-700/30 transition-all group relative
                 ${tab.is_active
                   ? 'bg-[var(--primary-color)]/20 border-b-2 border-b-[var(--primary-color)]'
@@ -728,11 +728,14 @@ export function TabBar({ profileId, onTabChange, refreshTrigger }: TabBarProps) 
       {/* Context menu */}
       {contextMenu && (
         <div
-          className="fixed z-50 bg-[var(--card-bg-color)] border border-gray-700 rounded-lg shadow-xl py-1 min-w-[160px]"
-          style={{ top: contextMenu.y, left: contextMenu.x }}
+          className="fixed z-50 bg-gray-900 border border-gray-700 rounded-lg shadow-2xl py-0.5 min-w-[150px]"
+          // Anchor to the RIGHT of the cursor, vertically CENTERED on it
+          // (translateY(-50%)), so the compact menu stays in the chrome rather than
+          // dropping into the page area where the native webview would cover it.
+          style={{ top: contextMenu.y, left: contextMenu.x, transform: 'translateY(-50%)' }}
         >
           <NativeButton
-            className="w-full px-4 py-2 text-left text-sm hover:bg-gray-700/50 transition-colors cursor-pointer"
+            className="w-full px-3 py-1.5 text-left text-xs hover:bg-gray-700/50 transition-colors cursor-pointer"
             onClick={() => {
               togglePin(contextMenu.tabId);
               setContextMenu(null);
@@ -743,7 +746,7 @@ export function TabBar({ profileId, onTabChange, refreshTrigger }: TabBarProps) 
             </span>
           </NativeButton>
           <NativeButton
-            className="w-full px-4 py-2 text-left text-sm hover:bg-gray-700/50 transition-colors cursor-pointer"
+            className="w-full px-3 py-1.5 text-left text-xs hover:bg-gray-700/50 transition-colors cursor-pointer"
             onClick={() => {
               duplicateTab(contextMenu.tabId);
               setContextMenu(null);
@@ -751,9 +754,9 @@ export function TabBar({ profileId, onTabChange, refreshTrigger }: TabBarProps) 
           >
             <span className="pointer-events-none">Duplicate Tab</span>
           </NativeButton>
-          <div className="border-t border-gray-700 my-1" />
+          <div className="border-t border-gray-700 my-0.5" />
           <NativeButton
-            className="w-full px-4 py-2 text-left text-sm hover:bg-gray-700/50 transition-colors cursor-pointer"
+            className="w-full px-3 py-1.5 text-left text-xs hover:bg-gray-700/50 transition-colors cursor-pointer"
             onClick={() => {
               closeTab(contextMenu.tabId);
               setContextMenu(null);
@@ -762,7 +765,7 @@ export function TabBar({ profileId, onTabChange, refreshTrigger }: TabBarProps) 
             <span className="pointer-events-none">Close Tab</span>
           </NativeButton>
           <NativeButton
-            className="w-full px-4 py-2 text-left text-sm hover:bg-gray-700/50 transition-colors cursor-pointer"
+            className="w-full px-3 py-1.5 text-left text-xs hover:bg-gray-700/50 transition-colors cursor-pointer"
             onClick={() => {
               closeTabsToRight(contextMenu.tabId);
               setContextMenu(null);

@@ -348,6 +348,37 @@ function App() {
     }
   };
 
+  // Close every open page/tab and return to the search home.
+  const handleCloseAllPages = async () => {
+    try {
+      await invoke('close_all_tabs', { profileId: activeProfile?.id ?? 1 });
+    } catch (err) {
+      console.error('Failed to close all pages:', err);
+    }
+    setActiveTab(null);
+    setActiveService('search');
+    setTabRefreshTrigger(prev => prev + 1);
+  };
+
+  // Close all UNPINNED pages, keeping pinned ones. If the active page was closed,
+  // fall back to a remaining pinned tab (or the search home if none remain).
+  const handleCloseUnpinnedPages = async () => {
+    const pid = activeProfile?.id ?? 1;
+    try {
+      await invoke('close_unpinned_tabs', { profileId: pid });
+    } catch (err) {
+      console.error('Failed to close unpinned pages:', err);
+    }
+    try {
+      const tabs = await invoke<Tab[]>('get_all_tabs', { profileId: pid });
+      if (!tabs.some(t => t.id === activeTab?.id)) {
+        setActiveTab(tabs[0] ?? null);
+        if (tabs.length === 0) setActiveService('search');
+      }
+    } catch { /* ignore */ }
+    setTabRefreshTrigger(prev => prev + 1);
+  };
+
   // Track chrome height for webview positioning
   const [chromeHeight, setChromeHeight] = useState(0);
   // Render engine that drew each tab, reported by WebView after `navigate`
@@ -455,6 +486,16 @@ function App() {
       (url.startsWith('http://') || url.startsWith('https://'));
     invoke(isBrowsing ? 'browser_surface_show' : 'browser_surface_hide').catch(() => {});
   }, [activeService, activeTab?.url, activeTab?.id, mediaFullscreen, engineByTab]);
+
+  // Leaving the Media service: stop all media players and HIDE the floating
+  // controls, so nothing keeps playing in the background and the controls don't
+  // linger over other pages. (Hide, not destroy — destroying the X11 window can
+  // crash with an X11 RenderBadPicture error if a surface is mid-teardown.)
+  useEffect(() => {
+    if (!isTauri() || activeService === 'media') return;
+    invoke('player_stop_all').catch(() => {});
+    invoke('hide_x11_webview_controls').catch(() => {});
+  }, [activeService]);
 
   // Loading spinner: driven by REAL WebKit load events emitted from the page
   // surface (`browser-load-changed`: started → finished/failed). Covers reloads,
@@ -1002,6 +1043,36 @@ function App() {
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 15l7-7 7 7" />
                     </svg>
                   </button>
+
+                  {/* Close pages (all / unpinned) — search tab only */}
+                  {activeService === 'search' && (
+                  <div
+                    className={`flex items-center gap-1 transition-all duration-300 ${navbarCollapsed ? 'opacity-0 w-0 overflow-hidden pointer-events-none' : 'opacity-100'}`}
+                    style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
+                  >
+                    <button
+                      onClick={handleCloseUnpinnedPages}
+                      title="Close unpinned pages (keep pinned)"
+                      className="p-1.5 rounded-lg text-white/60 hover:bg-white/10 hover:text-white transition-all cursor-pointer"
+                    >
+                      <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        {/* pin + small x */}
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 4h6l-1 6 3 2v2H7v-2l3-2-1-6z" />
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 14v6" />
+                      </svg>
+                    </button>
+                    <button
+                      onClick={handleCloseAllPages}
+                      title="Close all pages"
+                      className="p-1.5 rounded-lg text-white/60 hover:bg-white/10 hover:text-white transition-all cursor-pointer"
+                    >
+                      <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 17H7a2 2 0 01-2-2V7a2 2 0 012-2h8a2 2 0 012 2v2M11 21h6a2 2 0 002-2v-6a2 2 0 00-2-2h-6a2 2 0 00-2 2v6a2 2 0 002 2z" />
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 15l4 4m0-4l-4 4" />
+                      </svg>
+                    </button>
+                  </div>
+                  )}
 
                   {/* Privacy protections — search tab only */}
                   {activeService === 'search' && (

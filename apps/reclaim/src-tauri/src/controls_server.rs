@@ -71,6 +71,9 @@ pub enum ControlCommand {
     ToggleShuffle { #[serde(rename = "playerId")] player_id: Option<String> },
     ToggleRepeat { #[serde(rename = "playerId")] player_id: Option<String> },
     TogglePlaylist,
+    // Skip to the previous / next item in the queue (whole video, not seek).
+    PreviousVideo,
+    NextVideo,
 }
 
 /// Callback type for handling commands
@@ -242,6 +245,27 @@ lazy_static::lazy_static! {
     /// focused pane. Defaults to the first pane.
     static ref ACTIVE_PLAYER_ID: std::sync::RwLock<String> =
         std::sync::RwLock::new("pane-0".to_string());
+    /// Frontend-owned playback flags (shuffle + repeat mode) mirrored here so the
+    /// status-broadcast loop can report them to the floating controls. The frontend
+    /// is the source of truth and pushes updates via `set_playback_flags`.
+    static ref PLAYBACK_FLAGS: std::sync::RwLock<(bool, String)> =
+        std::sync::RwLock::new((false, "none".to_string()));
+}
+
+/// Update the shuffle + repeat flags the controls display (called from the frontend
+/// whenever its playback state changes).
+pub fn set_playback_flags(is_shuffled: bool, repeat_mode: String) {
+    if let Ok(mut g) = PLAYBACK_FLAGS.write() {
+        *g = (is_shuffled, repeat_mode);
+    }
+}
+
+/// Current (is_shuffled, repeat_mode) for the controls broadcast.
+pub fn get_playback_flags() -> (bool, String) {
+    PLAYBACK_FLAGS
+        .read()
+        .map(|g| g.clone())
+        .unwrap_or_else(|_| (false, "none".to_string()))
 }
 
 /// Set the player the floating controls drive (called from the frontend when the

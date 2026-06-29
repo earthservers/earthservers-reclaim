@@ -424,6 +424,13 @@ impl TabManager {
         Ok(())
     }
 
+    /// Close ALL tabs for a profile (including pinned) — "close all pages".
+    pub fn close_all_tabs(&self, profile_id: i64) -> Result<()> {
+        let conn = Connection::open(&self.db_path)?;
+        conn.execute("DELETE FROM tabs WHERE profile_id = ?1", params![profile_id])?;
+        Ok(())
+    }
+
     /// Close tabs to the right of a given tab
     pub fn close_tabs_to_right(&self, tab_id: i64) -> Result<()> {
         let conn = Connection::open(&self.db_path)?;

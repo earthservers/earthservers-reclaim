@@ -237,7 +237,10 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
   const [slideshow, setSlideshow] = useState<SlideshowSettings>(() => mediaStateCache.slideshow ?? {
     enabled: false,
     interval: 5,
-    mode: 'shuffle',
+    // Rotation STYLE only ('consecutive' all panes together | 'staggered' one at a
+    // time). Randomization is the separate Shuffle toggle (playbackState.isShuffled),
+    // which applies to photos AND videos. (Legacy 'shuffle' is treated as consecutive.)
+    mode: 'consecutive',
   });
   // Current ordering of image ids + cursor, driving rotation. A ref so ticks
   // don't churn React state / re-create the interval.
@@ -282,6 +285,16 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
   useEffect(() => { mediaStateCache.queue = queue; }, [queue]);
   useEffect(() => { mediaStateCache.slideshow = slideshow; }, [slideshow]);
 
+  // Mirror shuffle + repeat state to the backend so the floating media controls
+  // reflect (and stay in sync with) it via the status broadcast.
+  useEffect(() => {
+    if (!isTauri()) return;
+    invoke('set_media_playback_flags', {
+      isShuffled: playbackState.isShuffled,
+      repeatMode: playbackState.repeatMode,
+    }).catch(() => {});
+  }, [playbackState.isShuffled, playbackState.repeatMode]);
+
   // When the layout changes (queue panel opens/closes, fullscreen toggles), the
   // video panes resize. Nudge a window 'resize' after the DOM settles so every
   // GStreamerVideoPlayer re-syncs its native surface bounds to the new pane size
@@ -310,10 +323,16 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
         const showOne = async (i: number) => {
           if (!mounted || i >= 4) return;
           const playerId = `pane-${i}`;
+          // Only re-show a surface if THIS pane currently holds video/audio.
+          // Otherwise a stale surface from a previous session (left hidden, not
+          // destroyed) would re-map as a black box over an empty pane when you
+          // return to the Media tab.
+          const m = mediaItems[i];
+          const hasMedia = !!m && (m.type === 'video' || m.type === 'audio');
           try {
             // Use Promise.race with a timeout to prevent blocking
             await Promise.race([
-              invoke('show_video_surface', { playerId }),
+              invoke(hasMedia ? 'show_video_surface' : 'hide_video_surface', { playerId }),
               new Promise((_, reject) => setTimeout(() => reject('timeout'), 100))
             ]);
           } catch {
@@ -358,6 +377,15 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
   // Mirror of mediaItems so the slideshow tick can read current pane contents
   // (for staggered dupe-avoidance) without re-creating the interval each change.
   const mediaItemsRef = useRef(mediaItems);
+  // Mirrors so the mount-only control-action handler (next/prev video) reads the
+  // CURRENT queue + shuffle/repeat state.
+  const queueRef = useRef(queue);
+  const playbackStateRef = useRef(playbackState);
+  // Mirrors so the queue-advance logic (auto EOS + next/prev buttons) always reads
+  // the CURRENT played-set and pane contents — avoids stale closures that left a
+  // pane stuck after a couple of advances.
+  const playedItemsRef = useRef(playedItems);
+  const paneStatesRef = useRef(paneStates);
 
   // Keep refs in sync with state
   useEffect(() => {
@@ -366,6 +394,10 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
   useEffect(() => {
     mediaItemsRef.current = mediaItems;
   }, [mediaItems]);
+  useEffect(() => { queueRef.current = queue; }, [queue]);
+  useEffect(() => { playbackStateRef.current = playbackState; }, [playbackState]);
+  useEffect(() => { playedItemsRef.current = playedItems; }, [playedItems]);
+  useEffect(() => { paneStatesRef.current = paneStates; }, [paneStates]);
 
   // The floating controls follow the focused pane. Clicking any pane updates
   // activePane (DOM click handler / native video-surface-clicked / tab restore);
@@ -443,6 +475,44 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
                 await invoke('player_seek', { playerId: targetPlayerId, positionMs: Math.floor(time) });
               }
               break;
+            case 'toggle-shuffle':
+              setPlaybackState(prev => ({ ...prev, isShuffled: !prev.isShuffled }));
+              break;
+            case 'cycle-repeat': {
+              const order = ['none', 'all', 'one'] as const;
+              setPlaybackState(prev => ({
+                ...prev,
+                repeatMode: order[(order.indexOf(prev.repeatMode) + 1) % order.length],
+              }));
+              break;
+            }
+            case 'toggle-playlist':
+              setShowPlaylistPanel(p => !p);
+              break;
+            case 'next-video': {
+              // Reuse the auto-advance path so it respects shuffle (random next when
+              // on) and repeat (repeat-all loops the queue). manual:true so it still
+              // ADVANCES under repeat-one instead of replaying the same clip.
+              const idx = parseInt((activePlayerIdRef.current || 'pane-0').replace('pane-', ''), 10) || 0;
+              window.dispatchEvent(new CustomEvent(`media-ended-pane-${idx}`, { detail: { manual: true } }));
+              break;
+            }
+            case 'prev-video': {
+              // Positional previous in queue order; wraps to the end under repeat-all.
+              const idx = parseInt((activePlayerIdRef.current || 'pane-0').replace('pane-', ''), 10) || 0;
+              const q = queueRef.current;
+              if (q.length === 0) break;
+              const curSrc = mediaItemsRef.current[idx]?.source;
+              let pos = q.findIndex(it => it.source === curSrc);
+              if (pos < 0) pos = 0;
+              let prevPos = pos - 1;
+              if (prevPos < 0) prevPos = playbackStateRef.current.repeatMode !== 'none' ? q.length - 1 : 0;
+              const item = q[prevPos];
+              if (!item) break;
+              setMediaItems(prev => { const u = [...prev]; u[idx] = { source: item.source, type: item.type, title: item.title }; return u; });
+              setPaneStates(prev => { const u = [...prev]; u[idx] = { ...u[idx], currentItem: item, isPlaying: true }; return u; });
+              break;
+            }
           }
         } catch (err) {
           console.error('[EarthMultiMedia] Control action failed:', err);
@@ -497,9 +567,13 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
     const status = playerStatuses[activePlayerId];
     if (!status) return;
 
-    // If a video is playing and controls haven't been created yet, create them now
+    // If a video is playing and controls haven't been created yet, create them now.
+    // Gate on the CURRENT tab actually having media — otherwise a stale "isPlaying"
+    // status (e.g. just after switching to a new/empty tab) would re-show controls
+    // that the no-media effect just hid.
     const createControlsIfNeeded = async () => {
-      if (status.isPlaying && !floatingControlsCreatedRef.current) {
+      const hasMedia = mediaItems.some(Boolean) || queue.length > 0;
+      if (status.isPlaying && hasMedia && !floatingControlsCreatedRef.current) {
         console.log('[EarthMultiMedia] Video is playing, creating controls on-demand');
         try {
           // Get window dimensions and position for positioning controls
@@ -533,14 +607,20 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
           console.log('[EarthMultiMedia] Title bar height:', titleBarHeight);
           console.log('[EarthMultiMedia] Controls absolute bounds:', bounds);
 
-          const isDev = import.meta.env.DEV;
-          const controlsUrl = isDev
-            ? `http://localhost:1420/media-controls`
-            : `tauri://localhost/media-controls`;
-
-          console.log('[EarthMultiMedia] Creating controls on-demand at:', controlsUrl);
+          // Separate X11 webview overlay for the controls. In dev it loads from the
+          // Vite dev server; in packaged builds it loads from the embedded-asset
+          // server (assets_server.rs on :9877) since a raw WebKitGTK webview can't
+          // use tauri:// and the assets aren't on disk.
+          const controlsUrl = import.meta.env.DEV
+            ? 'http://localhost:1420/media-controls'
+            : 'http://127.0.0.1:9877/media-controls';
+          console.log('[EarthMultiMedia] Creating X11 controls at:', controlsUrl);
+          // create_x11_webview_controls is idempotent (no-ops if the window already
+          // exists), so this also covers re-entering the media tab. Always show
+          // afterwards so a previously HIDDEN controls window becomes visible again.
           await invoke('create_x11_webview_controls', { bounds, url: controlsUrl });
           floatingControlsCreatedRef.current = true;
+          invoke('show_x11_webview_controls').catch(() => {});
           console.log('[EarthMultiMedia] ✓ Controls created on-demand');
         } catch (err) {
           console.warn('[EarthMultiMedia] Failed to create controls on-demand:', err);
@@ -567,7 +647,23 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
 
     // Send immediately
     sendUpdate();
-  }, [playerStatuses, activePlayerId]);
+  }, [playerStatuses, activePlayerId, mediaItems, queue]);
+
+  // Tear down the floating controls when the active media session has nothing to
+  // control — no media loaded in any pane and an empty queue (e.g. a freshly
+  // opened media tab, or after closing the tab that had the videos). Without this
+  // the controls linger and can keep driving a now-hidden player.
+  useEffect(() => {
+    if (!isTauri()) return;
+    const hasMedia = mediaItems.some(Boolean) || queue.length > 0;
+    if (!hasMedia && floatingControlsCreatedRef.current) {
+      // HIDE, don't destroy — destroying the X11 window mid-render (e.g. while a
+      // video surface is tearing down on tab switch) crashes the app with an X11
+      // RenderBadPicture error. Reset the flag so the next playback re-shows it.
+      invoke('hide_x11_webview_controls').catch(() => {});
+      floatingControlsCreatedRef.current = false;
+    }
+  }, [mediaItems, queue]);
 
   // Generate unique tab ID
   const generateTabId = useCallback(() => {
@@ -787,18 +883,6 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
     });
   }, []);
 
-  // Get next unplayed item from queue
-  const getNextUnplayedItem = useCallback((shuffle: boolean, excludeIds: Set<string> = new Set()): QueueItem | null => {
-    const unplayed = queue.filter(item => !playedItems.has(item.id) && !excludeIds.has(item.id));
-    if (unplayed.length === 0) return null;
-
-    if (shuffle) {
-      const randomIndex = Math.floor(Math.random() * unplayed.length);
-      return unplayed[randomIndex];
-    }
-    return unplayed[0];
-  }, [queue, playedItems]);
-
   // Get max panes for current layout
   const getMaxPanesForLayout = useCallback((l: ViewLayout): number => {
     switch (l) {
@@ -840,74 +924,94 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
     }
   }, [getMaxPanesForLayout, queue, playedItems]);
 
-  // Assign next item to a specific pane
-  const assignNextToPaneIndex = useCallback((paneIndex: number) => {
-    // Get IDs currently being shown in other panes
-    const currentlyShowingIds = new Set(
-      paneStates
-        .filter((_, i) => i !== paneIndex)
-        .map(p => p.currentItem?.id)
-        .filter(Boolean) as string[]
-    );
 
-    const nextItem = getNextUnplayedItem(playbackState.isShuffled, currentlyShowingIds);
-    if (nextItem) {
-      setPaneStates(prev => {
-        const updated = [...prev];
-        updated[paneIndex] = { ...updated[paneIndex], currentItem: nextItem, isPlaying: true };
-        return updated;
-      });
+  // Advance a single pane to the next video when its clip ends (auto, via EOS) or
+  // when the user hits Next (manual). Reads everything from refs so it always sees
+  // the CURRENT queue / played-set / pane contents — earlier versions closed over
+  // stale state and a hard "not playing elsewhere" filter, which left panes (and the
+  // Next button) stuck after a couple of advances. Selection rules, in priority order:
+  //   1. an unplayed clip not already showing in another pane (ideal — no dupes)
+  //   2. if unplayed clips remain but are all on screen, advance to one anyway so the
+  //      pane never freezes (queue smaller than pane count)
+  //   3. if everything has played: repeat-all restarts the cycle; repeat-none stops
+  // Shuffle picks randomly from the chosen pool; otherwise it walks queue order.
+  const handlePaneVideoEnded = useCallback((paneIndex: number, opts?: { manual?: boolean }) => {
+    const q = queueRef.current;
+    if (q.length === 0) return;
 
-      // Also update mediaItems for rendering
-      setMediaItems(prev => {
-        const updated = [...prev];
-        updated[paneIndex] = { source: nextItem.source, type: nextItem.type, title: nextItem.title };
-        return updated;
-      });
-    }
-  }, [paneStates, playbackState.isShuffled, getNextUnplayedItem]);
+    const { isShuffled, repeatMode } = playbackStateRef.current;
+    const current = paneStatesRef.current[paneIndex]?.currentItem
+      ?? (mediaItemsRef.current[paneIndex]
+        ? (q.find(it => it.source === mediaItemsRef.current[paneIndex]?.source) ?? null)
+        : null);
+    const curSrc = current?.source;
 
-  // Mark an item as played (so it won't be selected again until reset)
-  const markAsPlayed = useCallback((itemId: string) => {
-    setPlayedItems(prev => new Set(prev).add(itemId));
-  }, []);
-
-  // Reset played items (used when repeat-all is enabled and queue is exhausted)
-  const resetPlayedItems = useCallback(() => {
-    setPlayedItems(new Set());
-  }, []);
-
-  // Handle video ended event for a specific pane - plays next unplayed video from queue
-  const handlePaneVideoEnded = useCallback((paneIndex: number) => {
-    const paneState = paneStates[paneIndex];
-
-    // Mark current item as played
-    if (paneState.currentItem) {
-      markAsPlayed(paneState.currentItem.id);
-    }
-
-    // Check repeat mode
-    if (playbackState.repeatMode === 'one') {
-      // Repeat-one: replay the same item - seek to beginning and play
+    // Repeat-one: auto-EOS replays the same clip; a manual Next still advances.
+    if (repeatMode === 'one' && !opts?.manual) {
       window.dispatchEvent(new CustomEvent(`media-seek-pane-${paneIndex}`, { detail: { time: 0 } }));
       window.dispatchEvent(new CustomEvent(`media-play-pane-${paneIndex}`));
       return;
     }
 
-    // Try to get next unplayed item
-    const nextItem = getNextUnplayedItem(playbackState.isShuffled);
+    // Mark the finished clip as played for this cycle.
+    const played = new Set(playedItemsRef.current);
+    if (current) played.add(current.id);
 
-    if (nextItem) {
-      // Assign next item to this pane
-      assignNextToPaneIndex(paneIndex);
-    } else if (playbackState.repeatMode === 'all') {
-      // No more unplayed items but repeat-all is enabled - reset and start over
-      resetPlayedItems();
-      // After reset, assign next item
-      setTimeout(() => assignNextToPaneIndex(paneIndex), 0);
+    // Sources currently on the OTHER panes (avoid showing the same clip twice).
+    const showingElsewhere = new Set(
+      paneStatesRef.current
+        .map((p, i) => (i !== paneIndex ? p?.currentItem?.source : null))
+        .filter(Boolean) as string[]
+    );
+
+    const pick = (pool: QueueItem[]) =>
+      isShuffled ? pool[Math.floor(Math.random() * pool.length)] : pool[0];
+
+    const unplayed = q.filter(it => !played.has(it.id));
+    let chosen: QueueItem | undefined;
+    let cycleReset = false;
+
+    const offScreenUnplayed = unplayed.filter(it => !showingElsewhere.has(it.source));
+    if (offScreenUnplayed.length > 0) {
+      // 1. ideal pick
+      chosen = pick(offScreenUnplayed);
+    } else if (unplayed.length > 0) {
+      // 2. unplayed remain but all on screen — advance anyway (prefer not self)
+      const notSelf = unplayed.filter(it => it.source !== curSrc);
+      chosen = pick(notSelf.length > 0 ? notSelf : unplayed);
+    } else if (repeatMode === 'all') {
+      // 3. exhausted + repeat-all → restart the cycle
+      cycleReset = true;
+      let pool = q.filter(it => !showingElsewhere.has(it.source) && it.source !== curSrc);
+      if (pool.length === 0) pool = q.filter(it => it.source !== curSrc);
+      if (pool.length === 0) pool = q; // single-item queue: replay it
+      chosen = pick(pool);
     }
-    // If repeatMode is 'none' and no more items, the pane just stays on the last frame
-  }, [paneStates, playbackState.repeatMode, playbackState.isShuffled, markAsPlayed, getNextUnplayedItem, assignNextToPaneIndex, resetPlayedItems]);
+    // else: repeat-none and nothing left — leave the pane on its last frame.
+
+    if (!chosen) {
+      // Still record the finished clip so the played count stays accurate.
+      if (current) setPlayedItems(played);
+      return;
+    }
+
+    // Commit: mark the chosen clip played for this cycle and move it into the pane.
+    const nextPlayed = cycleReset ? new Set<string>([chosen.id]) : (played.add(chosen.id), played);
+    setPlayedItems(nextPlayed);
+    playedItemsRef.current = nextPlayed;
+
+    const picked = chosen;
+    setMediaItems(prev => {
+      const u = [...prev];
+      u[paneIndex] = { source: picked.source, type: picked.type, title: picked.title };
+      return u;
+    });
+    setPaneStates(prev => {
+      const u = [...prev];
+      u[paneIndex] = { ...u[paneIndex], currentItem: picked, isPlaying: true };
+      return u;
+    });
+  }, []);
 
   // Listen for video ended events from each pane
   useEffect(() => {
@@ -915,7 +1019,8 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
 
     // Create handlers for each pane (0-3 for quad layout support)
     for (let i = 0; i < 4; i++) {
-      const handler = () => handlePaneVideoEnded(i);
+      const handler = (e: Event) =>
+        handlePaneVideoEnded(i, { manual: !!(e as CustomEvent).detail?.manual });
       handlers.push(handler);
       window.addEventListener(`media-ended-pane-${i}`, handler);
     }
@@ -927,22 +1032,29 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
     };
   }, [handlePaneVideoEnded]);
 
-  // Place a set of image items into the first N panes (one per pane). Panes with
-  // no corresponding image are cleared. Drives both rendering and pane state.
+  // Flow image items into the photo/empty panes, one per pane. Panes currently
+  // playing VIDEO/AUDIO are left untouched (they advance on their own via
+  // handlePaneVideoEnded), so photos and videos can auto-play side by side.
   const applyImagesToPanes = useCallback((items: (QueueItem | undefined)[]) => {
     const maxPanes = getMaxPanesForLayout(layout);
     setMediaItems(prev => {
       const updated = [...prev];
+      let ii = 0;
       for (let p = 0; p < maxPanes; p++) {
-        const it = items[p];
+        const cur = prev[p];
+        if (cur && (cur.type === 'video' || cur.type === 'audio')) continue;
+        const it = items[ii++];
         updated[p] = it ? { source: it.source, type: it.type, title: it.title } : null;
       }
       return updated;
     });
     setPaneStates(prev => {
       const updated = [...prev];
+      let ii = 0;
       for (let p = 0; p < maxPanes; p++) {
-        const it = items[p];
+        const cur = prev[p]?.currentItem;
+        if (cur && (cur.type === 'video' || cur.type === 'audio')) continue;
+        const it = items[ii++];
         updated[p] = { ...updated[p], currentItem: it ?? null, isPlaying: false };
       }
       return updated;
@@ -969,7 +1081,8 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
       let pool = imageItems.filter(it => !shownElsewhere.has(it.source) && it.source !== current[pane]?.source);
       if (pool.length === 0) pool = imageItems.filter(it => !shownElsewhere.has(it.source));
       if (pool.length === 0) pool = imageItems;
-      const pick = pool[Math.floor(Math.random() * pool.length)];
+      // Shuffle toggle decides random vs. next-in-queue-order.
+      const pick = playbackState.isShuffled ? pool[Math.floor(Math.random() * pool.length)] : pool[0];
       setMediaItems(prev => {
         const u = [...prev];
         u[pane] = { source: pick.source, type: pick.type, title: pick.title };
@@ -992,7 +1105,7 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
     // (Re)build the ordering if the image set changed or it's uninitialised.
     const sameSet = order.length === len && order.every(id => byId.has(id));
     if (!sameSet) {
-      order = slideshow.mode === 'shuffle' ? shuffleArray(imageIds) : [...imageIds];
+      order = playbackState.isShuffled ? shuffleArray(imageIds) : [...imageIds];
       cursor = 0;
     }
 
@@ -1004,18 +1117,18 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
       selected.push(byId.get(order[(cursor + i) % len]));
     }
 
-    // Advance; on completing a full pass, reshuffle (shuffle mode) for the next pass.
+    // Advance; on completing a full pass, reshuffle (when shuffle is on) for the next pass.
     let nextCursor = cursor + count;
     if (nextCursor >= len) {
       nextCursor = nextCursor % len;
-      if (slideshow.mode === 'shuffle') {
+      if (playbackState.isShuffled) {
         order = shuffleArray(imageIds);
       }
     }
     slideshowOrderRef.current = { order, cursor: nextCursor };
 
     applyImagesToPanes(selected);
-  }, [layout, queue, slideshow.mode, getMaxPanesForLayout, applyImagesToPanes]);
+  }, [layout, queue, slideshow.mode, playbackState.isShuffled, getMaxPanesForLayout, applyImagesToPanes]);
 
   // Auto-load the first N photos into the panes when switching to a multi-pane
   // layout (photos only). Fills empty panes so a video the user placed isn't
@@ -1071,10 +1184,10 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
     setSlideshow(prev => ({ ...prev, mode }));
   }, []);
 
-  // Staggered only makes sense with multiple panes; fall back to shuffle in single.
+  // Staggered only makes sense with multiple panes; fall back to consecutive in single.
   useEffect(() => {
     if (layout === 'single' && slideshow.mode === 'staggered') {
-      setSlideshowMode('shuffle');
+      setSlideshowMode('consecutive');
     }
   }, [layout, slideshow.mode, setSlideshowMode]);
 
@@ -1316,6 +1429,15 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
       }
     }).then(u => { if (cancelled) u(); else unlisten = u; });
     return () => { cancelled = true; unlisten?.(); };
+  }, []);
+
+  // Hide the browser (web page) native surface while the Media tab is mounted, so
+  // the page you were on doesn't bleed through behind the media UI. The native
+  // WebKit surface renders above the DOM, so it must be explicitly unmapped here
+  // (belt-and-suspenders alongside App's own show/hide on service change).
+  useEffect(() => {
+    if (!isTauri()) return;
+    invoke('browser_surface_hide').catch(() => {});
   }, []);
 
   // Load initial data
@@ -1884,35 +2006,60 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
                   value={slideshow.interval}
                   onChange={(e) => setSlideshowInterval(parseInt(e.target.value) || 5)}
                   className="w-10 bg-black/30 border border-gray-700/50 rounded px-1 py-0.5 text-xs text-white text-center"
-                  title="Slideshow interval (seconds)"
+                  title="Slideshow photo interval (seconds)"
                 />
                 <span className="text-xs text-gray-400">s</span>
 
-                {/* Slideshow mode toggle (staggered is multi-pane only) */}
-                {(
+                {/* Rotation style — Consecutive ↔ Staggered (multi-pane only;
+                    randomization is the separate Shuffle toggle, so "staggered +
+                    shuffle on" = one random pane at a time). */}
+                {layout !== 'single' && (
                   <button
-                    onClick={() => setSlideshowMode(layout === 'single' ? (slideshow.mode === 'consecutive' ? 'shuffle' : 'consecutive') : (slideshow.mode === 'shuffle' ? 'consecutive' : slideshow.mode === 'consecutive' ? 'staggered' : 'shuffle'))}
+                    onClick={() => setSlideshowMode(slideshow.mode === 'staggered' ? 'consecutive' : 'staggered')}
                     className="p-1.5 rounded transition-colors text-gray-400 hover:text-white"
-                    title={slideshow.mode === 'shuffle' ? 'Mode: Shuffle (all panes change, random)' : slideshow.mode === 'consecutive' ? 'Mode: Consecutive (all panes change, in order)' : 'Mode: Staggered (one pane at a time)'}
+                    title={slideshow.mode === 'staggered' ? 'Rotation: Staggered (one pane at a time)' : 'Rotation: Consecutive (all panes change together)'}
                   >
-                    {slideshow.mode === 'shuffle' ? (
-                      // Crossing arrows (shuffle)
-                      <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M16 3h5v5 M4 20L21 3 M21 16v5h-5 M15 15l6 6 M4 4l5 5" />
-                      </svg>
-                    ) : slideshow.mode === 'consecutive' ? (
-                      // Single straight right arrow (consecutive)
-                      <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 12h14m-6-6l6 6-6 6" />
-                      </svg>
-                    ) : (
+                    {slideshow.mode === 'staggered' ? (
                       // Staggered: one pane at a time (offset lines)
                       <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h14M4 12h9M4 18h16" />
                       </svg>
+                    ) : (
+                      // Consecutive: all panes change (right arrow)
+                      <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 12h14m-6-6l6 6-6 6" />
+                      </svg>
                     )}
                   </button>
                 )}
+              </div>
+
+              {/* Shuffle + Repeat (apply to the whole queue — videos & photos) */}
+              <div className="flex items-center gap-1 bg-black/30 rounded p-1">
+                <button
+                  onClick={() => setPlaybackState(prev => ({ ...prev, isShuffled: !prev.isShuffled }))}
+                  className={`p-1.5 rounded transition-colors ${playbackState.isShuffled ? 'bg-[var(--primary-color)]/20 text-[var(--primary-color)]' : 'text-gray-400 hover:text-white'}`}
+                  title={playbackState.isShuffled ? 'Shuffle: on (re-shuffles each repeat pass)' : 'Shuffle: off'}
+                >
+                  <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M16 3h5v5 M4 20L21 3 M21 16v5h-5 M15 15l6 6 M4 4l5 5" />
+                  </svg>
+                </button>
+                <button
+                  onClick={() => setPlaybackState(prev => {
+                    const order = ['none', 'all', 'one'] as const;
+                    return { ...prev, repeatMode: order[(order.indexOf(prev.repeatMode) + 1) % order.length] };
+                  })}
+                  className={`relative p-1.5 rounded transition-colors ${playbackState.repeatMode !== 'none' ? 'bg-[var(--primary-color)]/20 text-[var(--primary-color)]' : 'text-gray-400 hover:text-white'}`}
+                  title={playbackState.repeatMode === 'none' ? 'Repeat: off' : playbackState.repeatMode === 'all' ? 'Repeat: all (loop the queue)' : 'Repeat: one'}
+                >
+                  <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 1l4 4-4 4 M3 11V9a4 4 0 014-4h14 M7 23l-4-4 4-4 M21 13v2a4 4 0 01-4 4H3" />
+                  </svg>
+                  {playbackState.repeatMode === 'one' && (
+                    <span className="absolute -top-1 -right-1 text-[9px] font-bold leading-none">1</span>
+                  )}
+                </button>
               </div>
 
               {/* Queue info */}
@@ -2155,6 +2302,34 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
           ))}
         </div>
 
+        {/* Shuffle + Repeat (whole queue — videos & photos). Left of Slideshow. */}
+        <div className="flex items-center gap-1 bg-black/30 rounded p-1">
+          <button
+            onClick={() => setPlaybackState(prev => ({ ...prev, isShuffled: !prev.isShuffled }))}
+            className={`p-1.5 rounded transition-colors ${playbackState.isShuffled ? 'bg-[var(--primary-color)]/20 text-[var(--primary-color)]' : 'text-gray-400 hover:text-white'}`}
+            title={playbackState.isShuffled ? 'Shuffle: on (re-shuffles each repeat pass)' : 'Shuffle: off'}
+          >
+            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M16 3h5v5 M4 20L21 3 M21 16v5h-5 M15 15l6 6 M4 4l5 5" />
+            </svg>
+          </button>
+          <button
+            onClick={() => setPlaybackState(prev => {
+              const order = ['none', 'all', 'one'] as const;
+              return { ...prev, repeatMode: order[(order.indexOf(prev.repeatMode) + 1) % order.length] };
+            })}
+            className={`relative p-1.5 rounded transition-colors ${playbackState.repeatMode !== 'none' ? 'bg-[var(--primary-color)]/20 text-[var(--primary-color)]' : 'text-gray-400 hover:text-white'}`}
+            title={playbackState.repeatMode === 'none' ? 'Repeat: off' : playbackState.repeatMode === 'all' ? 'Repeat: all (loop the queue)' : 'Repeat: one'}
+          >
+            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 1l4 4-4 4 M3 11V9a4 4 0 014-4h14 M7 23l-4-4 4-4 M21 13v2a4 4 0 01-4 4H3" />
+            </svg>
+            {playbackState.repeatMode === 'one' && (
+              <span className="absolute -top-1 -right-1 text-[9px] font-bold leading-none">1</span>
+            )}
+          </button>
+        </div>
+
         {/* Slideshow Controls */}
         <div className="flex items-center gap-1 bg-black/30 rounded p-1">
           {/* Slideshow toggle */}
@@ -2184,31 +2359,27 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
             value={slideshow.interval}
             onChange={(e) => setSlideshowInterval(parseInt(e.target.value) || 5)}
             className="w-12 bg-black/30 border border-gray-700/50 rounded px-1 py-0.5 text-xs text-white text-center"
-            title="Slideshow interval (seconds)"
+            title="Slideshow photo interval (seconds)"
           />
           <span className="text-xs text-gray-400">s</span>
 
-          {/* Slideshow mode toggle (staggered is multi-pane only) */}
-          {(
+          {/* Rotation style — Consecutive ↔ Staggered (multi-pane only;
+              randomization is the separate Shuffle toggle). */}
+          {layout !== 'single' && (
             <button
-              onClick={() => setSlideshowMode(layout === 'single' ? (slideshow.mode === 'consecutive' ? 'shuffle' : 'consecutive') : (slideshow.mode === 'shuffle' ? 'consecutive' : slideshow.mode === 'consecutive' ? 'staggered' : 'shuffle'))}
+              onClick={() => setSlideshowMode(slideshow.mode === 'staggered' ? 'consecutive' : 'staggered')}
               className={`p-1.5 rounded transition-colors text-gray-400 hover:text-white`}
-              title={slideshow.mode === 'shuffle' ? 'Mode: Shuffle (all panes change, random)' : slideshow.mode === 'consecutive' ? 'Mode: Consecutive (all panes change, in order)' : 'Mode: Staggered (one pane at a time)'}
+              title={slideshow.mode === 'staggered' ? 'Rotation: Staggered (one pane at a time)' : 'Rotation: Consecutive (all panes change together)'}
             >
-              {slideshow.mode === 'shuffle' ? (
-                // Crossing arrows (shuffle)
-                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M16 3h5v5 M4 20L21 3 M21 16v5h-5 M15 15l6 6 M4 4l5 5" />
-                </svg>
-              ) : slideshow.mode === 'consecutive' ? (
-                // Single straight right arrow (consecutive)
-                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 12h14m-6-6l6 6-6 6" />
-                </svg>
-              ) : (
+              {slideshow.mode === 'staggered' ? (
                 // Staggered: one pane at a time (offset lines)
                 <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h14M4 12h9M4 18h16" />
+                </svg>
+              ) : (
+                // Consecutive: all panes change (right arrow)
+                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 12h14m-6-6l6 6-6 6" />
                 </svg>
               )}
             </button>

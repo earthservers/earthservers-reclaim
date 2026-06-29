@@ -54,6 +54,9 @@ interface PlayerStatus {
     is_video: boolean;
     is_live: boolean;
   };
+  /// True once playback reached end-of-stream (playbin stays "Playing" at EOS,
+  /// so this flag — not state/position — is the reliable end signal).
+  eos?: boolean;
 }
 
 // Helper to check playback state
@@ -128,6 +131,9 @@ export function GStreamerVideoPlayer({
   const controlsTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const clickTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastPositionRef = useRef<number>(0);
+  // Tracks the previous poll's EOS flag so onEnded fires exactly once on the
+  // false -> true edge (the flag stays true until the next clip loads).
+  const eosFiredRef = useRef<boolean>(false);
 
   // Check GStreamer availability on mount
   useEffect(() => {
@@ -557,10 +563,25 @@ export function GStreamerVideoPlayer({
           }
         }));
 
-        // Check if playback ended
-        if (lastPositionRef.current > 0 && currentTime === 0 && !isPlaying && duration > 0) {
+        // Check if playback ended. playbin STAYS in the Playing state at the end
+        // with the position frozen at the duration (it does NOT reset to 0 or pause),
+        // so we detect end-of-stream two ways and fire onEnded once, on the rising edge:
+        //   1. Primary: the backend's eos flag (GStreamer EOS bus message).
+        //   2. Fallback: the position is parked at (or just shy of) the duration and
+        //      has stopped advancing while still "playing" — covers cases where the
+        //      EOS bus message never surfaces to our handler.
+        const frozenAtEnd =
+          isPlaying &&
+          duration > 0 &&
+          currentTime > 0 &&
+          currentTime >= duration - 400 &&
+          Math.abs(currentTime - lastPositionRef.current) < 50;
+        const ended = status.eos === true || frozenAtEnd;
+        if (ended && !eosFiredRef.current) {
+          console.log('[GStreamer] End of stream detected', { playerId, eos: status.eos, frozenAtEnd, currentTime, duration });
           onEnded?.();
         }
+        eosFiredRef.current = ended;
         lastPositionRef.current = currentTime;
 
       } catch (err) {
