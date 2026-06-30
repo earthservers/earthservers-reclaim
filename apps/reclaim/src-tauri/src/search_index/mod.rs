@@ -248,6 +248,36 @@ mod integration {
     }
 
     #[test]
+    fn segment_reindex_dedups_by_url() {
+        use adapters::Segment;
+        use kinds::ContentKind;
+        let conn = db();
+        let qid = store::insert_query(&conn, "q", "cache", 100, 1).unwrap();
+        let mk = |text: &str, score: i64| Segment {
+            kind: ContentKind::Comment,
+            url: "https://www.reddit.com/r/x/comments/p/_/c1".into(),
+            parent_url: Some("https://www.reddit.com/r/x/comments/p".into()),
+            title: None,
+            text: text.into(),
+            author: Some("bob".into()),
+            engagement: Some(score),
+        };
+        let id1 = store::upsert_segment(&conn, 1, &mk("widget first", 5), Some(qid), "reddit", "h1", "cache", 100, Some(700)).unwrap();
+        // Re-run the same search later: same comment URL → same row, not a duplicate.
+        let id2 = store::upsert_segment(&conn, 1, &mk("widget updated", 9), Some(qid), "reddit", "h2", "cache", 200, Some(900)).unwrap();
+        assert_eq!(id1, id2, "same comment URL dedups to one row across re-runs");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM search_pages WHERE content_kind='comment'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+        // engagement updated on re-index
+        let eng: i64 = conn
+            .query_row("SELECT engagement FROM search_pages WHERE id=?1", rusqlite::params![id1], |r| r.get(0))
+            .unwrap();
+        assert_eq!(eng, 9);
+    }
+
+    #[test]
     fn content_kind_filter_scopes_candidates() {
         use adapters::Segment;
         use kinds::ContentKind;

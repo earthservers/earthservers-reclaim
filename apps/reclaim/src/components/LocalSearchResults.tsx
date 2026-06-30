@@ -9,8 +9,20 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { invoke, listen, isTauri } from '../lib/tauri';
 import { FavoriteStar } from './FavoriteStar';
+import { SearchSourcesPanel } from './SearchSourcesPanel';
 
 type Retention = 'ephemeral' | 'cache' | 'pinned';
+type KindsMode = 'all' | 'discussions' | 'comments';
+
+const KIND_PARAM: Record<KindsMode, string[] | null> = {
+  all: null,
+  discussions: ['comment', 'forum_comment', 'post', 'forum_post'],
+  comments: ['comment', 'forum_comment'],
+};
+const SOURCE_LABEL: Record<string, string> = {
+  web: 'Web', reddit: 'Reddit', forums: 'Forums', youtube: 'YouTube',
+  tiktok: 'TikTok', instagram: 'Instagram', facebook: 'Facebook', crawl: 'Crawl',
+};
 
 interface Signals {
   ftsRank: number | null;
@@ -31,6 +43,8 @@ interface ResultRow {
   curated?: boolean;
   sourceTable?: string;   // 'search_pages' | 'scraped_pages' (crawler)
   provenance?: string | null; // crawl job name for crawler rows
+  contentKind?: string;   // 'article' | 'post' | 'comment' | 'forum_post' | 'forum_comment'
+  parentUrl?: string | null;
   // local lifecycle state for optimistic UI
   pinned?: boolean;
   archived?: boolean;
@@ -38,8 +52,8 @@ interface ResultRow {
 }
 
 interface ShallowEvt { queryId: number; candidate: { url: string; title: string; snippet: string; sourceEngine: string } }
-interface DeepEvt { queryId: number; page: { pageId: number; url: string; title: string; snippet: string; sourceEngine: string; cacheHit: boolean } }
-interface RankedEvt { queryId: number; ranked: Array<{ pageId: number; url: string; title: string; snippet: string; sourceEngine: string; fusedScore: number; signals: Signals; sourceTable: string; provenance: string | null }> }
+interface DeepEvt { queryId: number; page: { pageId: number; url: string; title: string; snippet: string; sourceEngine: string; cacheHit: boolean; contentKind: string; parentUrl: string | null } }
+interface RankedEvt { queryId: number; ranked: Array<{ pageId: number; url: string; title: string; snippet: string; sourceEngine: string; contentKind: string; parentUrl: string | null; fusedScore: number; signals: Signals; sourceTable: string; provenance: string | null }> }
 
 export function LocalSearchResults({
   profileId,
@@ -63,6 +77,19 @@ export function LocalSearchResults({
   const [order, setOrder] = useState<string[]>([]);        // arrival order (pre-ranking)
   const [rankedOrder, setRankedOrder] = useState<string[] | null>(null);
   const [showDebug, setShowDebug] = useState(false);
+  const [kindsMode, setKindsMode] = useState<KindsMode>('all');
+  const [sources, setSources] = useState<string[]>([]);
+  const [sourcesReady, setSourcesReady] = useState(false);
+  const [showSources, setShowSources] = useState(false);
+
+  // Initialize the selected sources from the backend's default-enabled adapters.
+  useEffect(() => {
+    if (!isTauri()) { setSourcesReady(true); return; }
+    invoke<Array<{ id: string; defaultEnabled: boolean }>>('list_search_sources')
+      .then(list => setSources(list.filter(s => s.defaultEnabled).map(s => s.id)))
+      .catch(() => setSources(['web']))
+      .finally(() => setSourcesReady(true));
+  }, []);
 
   const activeQueryId = useRef<number | null>(null);
   const queryIdForClicks = useRef<number | null>(null);
@@ -78,9 +105,9 @@ export function LocalSearchResults({
     });
   }, []);
 
-  // Run the search whenever the query (or nonce, or retention) changes.
+  // Run the search whenever the query (or nonce, retention, kinds, sources) changes.
   useEffect(() => {
-    if (!query.trim() || !isTauri()) return;
+    if (!query.trim() || !isTauri() || !sourcesReady) return;
     let cancelled = false;
     const unlisteners: Array<() => void> = [];
 
@@ -108,14 +135,14 @@ export function LocalSearchResults({
       track(await listen<DeepEvt>('local-search-deep', ({ payload }) => {
         if (!isActive(payload.queryId)) return;
         const p = payload.page;
-        upsertRow(p.url, { pageId: p.pageId, cacheHit: p.cacheHit, title: p.title || undefined, sourceEngine: p.sourceEngine },
+        upsertRow(p.url, { pageId: p.pageId, cacheHit: p.cacheHit, title: p.title || undefined, sourceEngine: p.sourceEngine, contentKind: p.contentKind, parentUrl: p.parentUrl },
           { url: p.url, title: p.title, snippet: p.snippet, sourceEngine: p.sourceEngine });
       }));
       track(await listen<RankedEvt>('local-search-ranked', ({ payload }) => {
         if (!isActive(payload.queryId)) return;
         setPhase('ranking');
         for (const r of payload.ranked) {
-          upsertRow(r.url, { pageId: r.pageId, fusedScore: r.fusedScore, signals: r.signals, sourceEngine: r.sourceEngine, sourceTable: r.sourceTable, provenance: r.provenance },
+          upsertRow(r.url, { pageId: r.pageId, fusedScore: r.fusedScore, signals: r.signals, sourceEngine: r.sourceEngine, sourceTable: r.sourceTable, provenance: r.provenance, contentKind: r.contentKind, parentUrl: r.parentUrl },
             { url: r.url, title: r.title, snippet: r.snippet, sourceEngine: r.sourceEngine });
         }
         setRankedOrder(payload.ranked.map(r => r.url));
@@ -137,9 +164,10 @@ export function LocalSearchResults({
           query,
           retention,
           profileId: profileId ?? 1,
-          sources: null,
+          sources: sources.length ? sources : null,
           limit: 20,
           searxngUrl: null,
+          kinds: KIND_PARAM[kindsMode],
         });
       } catch {
         if (!cancelled) setPhase('done');
@@ -149,7 +177,7 @@ export function LocalSearchResults({
 
     return () => { cancelled = true; unlisteners.forEach(u => u()); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [query, searchNonce, retention, profileId]);
+  }, [query, searchNonce, retention, profileId, kindsMode, sources.join(','), sourcesReady]);
 
   const openResult = (row: ResultRow) => {
     if (queryIdForClicks.current != null) {
@@ -216,6 +244,39 @@ export function LocalSearchResults({
         </div>
       </div>
 
+      {/* Kinds filter + source picker */}
+      <div className="flex items-center gap-3 mb-2 flex-wrap">
+        <div className="flex items-center gap-1 bg-white/5 rounded-lg p-0.5">
+          {([['all', 'All'], ['discussions', 'Comments & discussions'], ['comments', 'Comments only']] as [KindsMode, string][]).map(([m, label]) => (
+            <button
+              key={m}
+              onClick={() => setKindsMode(m)}
+              className={`px-2.5 py-1 rounded-md text-xs transition-colors ${kindsMode === m ? 'bg-[var(--primary-color)] text-white' : 'text-gray-400 hover:text-white'}`}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+        <button onClick={() => setShowSources(s => !s)} className="text-xs px-2.5 py-1 rounded-md border border-white/10 text-gray-400 hover:text-white">
+          Sources ({sources.length})
+        </button>
+      </div>
+
+      {/* Honest note about the two-stage nature of comment search */}
+      {kindsMode !== 'all' && (
+        <p className="text-[11px] text-[var(--text-muted-color)] mb-2 leading-snug">
+          Note: platforms don't allow searching all comments globally. This finds comments &amp;
+          discussions <em>within</em> the threads/videos/posts your query surfaces — not the entire
+          comment corpus.
+        </p>
+      )}
+
+      {showSources && (
+        <div className="mb-3">
+          <SearchSourcesPanel profileId={profileId} selected={sources} onChange={setSources} onClose={() => setShowSources(false)} />
+        </div>
+      )}
+
       {/* Status line */}
       <div className="text-xs text-[var(--text-muted-color)] mb-3 flex items-center gap-2">
         {phase === 'searching' && <><Spinner /> searching &amp; indexing locally…</>}
@@ -243,7 +304,11 @@ export function LocalSearchResults({
             <div className="flex-1 min-w-0 cursor-pointer" onClick={() => openResult(row)}>
               <div className="flex items-center gap-2">
                 <span className="text-[var(--primary-color)] text-sm font-medium truncate">{row.title || row.url}</span>
-                <Badge label={row.sourceEngine} />
+                {/* Provenance: source + kind, e.g. "Reddit · comment" */}
+                <Badge
+                  label={`${SOURCE_LABEL[row.sourceEngine] ?? row.sourceEngine}${row.contentKind && row.contentKind !== 'article' ? ` · ${row.contentKind.replace('forum_', '')}` : ''}`}
+                  tone={row.contentKind === 'comment' || row.contentKind === 'forum_comment' ? 'blue' : 'slate'}
+                />
                 {row.sourceTable === 'scraped_pages'
                   ? <Badge label={row.provenance ? `from crawl: ${row.provenance}` : 'from crawl'} tone="violet" />
                   : row.cacheHit ? <Badge label="from local index" tone="green" />
