@@ -52,6 +52,15 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y $APT_DEPS
+      - name: Stub web assets
+        # This job verifies the Rust backend (tests) — not the web bundle. tauri_build
+        # only checks that the bundled NoScript .so and the frontendDist exist, so we
+        # stub them instead of running the full pnpm/vite/noscript build.
+        run: |
+          mkdir -p apps/reclaim/src-tauri/resources/noscript
+          touch apps/reclaim/src-tauri/resources/noscript/libearth_noscript_ext.so
+          mkdir -p apps/reclaim/dist
+          printf '<!doctype html><meta charset="utf-8"><title>ci</title><div id="root"></div>' > apps/reclaim/dist/index.html
       - name: Unit tests (vault isolation, totp, hygiene)
         run: cargo test --lib
       - name: Clippy (our crates)
@@ -69,6 +78,14 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y $APT_DEPS
+      - name: Stub web assets
+        # We only readelf the binary's hardening flags here, not run the app, so the
+        # NoScript .so + frontendDist just need to exist for tauri_build.
+        run: |
+          mkdir -p apps/reclaim/src-tauri/resources/noscript
+          touch apps/reclaim/src-tauri/resources/noscript/libearth_noscript_ext.so
+          mkdir -p apps/reclaim/dist
+          printf '<!doctype html><meta charset="utf-8"><title>ci</title><div id="root"></div>' > apps/reclaim/dist/index.html
       - name: Build release binary
         run: cargo build --release --bin reclaim
       - name: Verify hardening (RELRO now + NX + PIE)
