@@ -375,12 +375,23 @@ pub fn score_pins(
 }
 
 /// Light URL heuristic backstop for login pages (the authoritative signal is the
-/// frontend's reclaimVault login detection, passed as `is_login`).
+/// frontend's reclaimVault login detection, passed as `is_login`). Segment-aware
+/// so a real article at `/login-tips` is NOT misread as a login page — only a path
+/// segment that IS one of these words counts.
 fn looks_like_login(url: &str) -> bool {
-    let u = url.to_ascii_lowercase();
-    ["/login", "/signin", "/sign-in", "/log-in", "/auth", "/sso", "/account/login"]
-        .iter()
-        .any(|p| u.contains(p))
+    const LOGIN_SEGMENTS: &[&str] =
+        &["login", "signin", "sign-in", "log-in", "logon", "auth", "sso"];
+    let lower = url.to_ascii_lowercase();
+    // Isolate the path: drop scheme+host, then the query/fragment.
+    let after_scheme = lower.split("://").nth(1).unwrap_or(&lower);
+    let path = after_scheme
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("")
+        .split_once('/')
+        .map(|(_, p)| p)
+        .unwrap_or("");
+    path.split('/').any(|seg| LOGIN_SEGMENTS.contains(&seg))
 }
 
 /// Warm the persistent WebKit render cache so the live page paints fast next visit.
@@ -456,7 +467,12 @@ mod tests {
     fn login_url_heuristic() {
         assert!(looks_like_login("https://site.com/login"));
         assert!(looks_like_login("https://site.com/account/login?next=/"));
+        assert!(looks_like_login("https://site.com/auth"));
+        // segment-aware: an article whose slug merely starts with "login" is NOT a login page
+        assert!(!looks_like_login("https://site.com/articles/login-tips"));
         assert!(!looks_like_login("https://site.com/blog/rust-tips"));
         assert!(!looks_like_login("https://reddit.com/r/rust"));
+        // host containing "auth" must not trip it (only path segments count)
+        assert!(!looks_like_login("https://auth0.com/pricing"));
     }
 }
