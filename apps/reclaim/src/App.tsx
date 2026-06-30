@@ -128,7 +128,10 @@ const mainServiceItems = [
   { id: 'ai' as const, label: 'Local AI / History', icon: 'M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z' },
 ];
 
-// Local-AI on/off settings, persisted in localStorage.
+// Local-AI on/off settings. Persisted PER PROFILE in the backend (earthservers.db)
+// — NOT localStorage: the browser window is incognito, so localStorage is wiped on
+// restart, which made the curator silently switch itself back on every launch.
+// localStorage is kept only as a fallback for non-Tauri (mock/browser) mode.
 export interface AiSettings {
   curator: boolean;   // transparently summarize visited pages into the knowledge graph
   assistant: boolean; // local chat assistant (model picked by hardware tier)
@@ -213,10 +216,30 @@ function App() {
   const updateAiSettings = useCallback((next: Partial<AiSettings>) => {
     setAiSettings(prev => {
       const merged = { ...prev, ...next };
-      try { localStorage.setItem(AI_SETTINGS_KEY, JSON.stringify(merged)); } catch { /* ignore */ }
+      // Persist per-profile in the backend (survives restart under incognito).
+      if (isTauri()) {
+        invoke('set_ai_settings', {
+          profileId: activeProfile?.id ?? 1,
+          curator: merged.curator,
+          assistant: merged.assistant,
+        }).catch(() => { /* best-effort */ });
+      } else {
+        try { localStorage.setItem(AI_SETTINGS_KEY, JSON.stringify(merged)); } catch { /* ignore */ }
+      }
       return merged;
     });
-  }, []);
+  }, [activeProfile?.id]);
+
+  // Load the active profile's persisted Local-AI settings from the backend, and
+  // reload whenever the profile changes (each profile keeps its own choice).
+  useEffect(() => {
+    if (!isTauri() || !activeProfile?.id) return;
+    let cancelled = false;
+    invoke<AiSettings>('get_ai_settings', { profileId: activeProfile.id })
+      .then(s => { if (!cancelled && s) setAiSettings(s); })
+      .catch(() => { /* keep current defaults */ });
+    return () => { cancelled = true; };
+  }, [activeProfile?.id]);
 
   // Autosave "Save password?" prompt, raised when the page captures a login submit.
   const [savePrompt, setSavePrompt] = useState<{ origin: string; username: string } | null>(null);

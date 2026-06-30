@@ -3,6 +3,7 @@
 
 mod search;
 mod search_index;
+mod ai_settings;
 mod memory;
 mod ratings;
 mod ai;
@@ -2486,6 +2487,12 @@ pub fn run() {
             // Auto-GC for the search index: sweep expired ephemeral/cache rows on
             // startup and hourly (never touches pinned/archived).
             search_index::gc::start(db_path_str.clone());
+            // Per-profile Local-AI settings (curator/assistant). Persisted here so
+            // the curator toggle survives restart (localStorage is wiped because the
+            // browser window is incognito).
+            if let Err(e) = ai_settings::init(&db_path_str) {
+                log::error!("Failed to initialize ai_settings table: {}", e);
+            }
             // Security subsystem: append-only vault audit log + live event sink for
             // the Security panel. Deterministic; no LLM involved.
             security::init(app.handle().clone(), &db_path_str);
@@ -2913,6 +2920,9 @@ pub fn run() {
             search_index::lifecycle::favorite_state,
             search_index::lifecycle::auto_cache_page,
             search_index::lifecycle::review_pinned,
+            // Per-profile Local-AI settings (curator/assistant on-off persistence)
+            ai_settings::get_ai_settings,
+            ai_settings::set_ai_settings,
             // Memory commands (EarthMemory)
             get_indexed_pages,
             index_page,
