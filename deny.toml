@@ -1,17 +1,28 @@
 # cargo-deny config (Phase 5, supply chain). Run: `cargo deny check`.
-# Kept minimal and version-robust: newer cargo-deny removed several [advisories]
-# keys (vulnerabilities are always denied; unmaintained/unsound are handled
-# internally), so we only set the few keys that are stable across versions and
-# rely on sane defaults otherwise.
+#
+# Policy: hard-fail on KNOWN VULNERABILITIES and disallowed licenses; do NOT gate
+# on "unmaintained" crates, because the app's WebKitGTK/GTK3 stack (gtk-rs 0.18,
+# unic, paste, proc-macro-error) is unmaintained by nature and can't be dropped
+# without a full UI-stack migration. Everything fixable by a semver-compatible
+# bump has already been updated in Cargo.lock (`cargo update`).
 
 [advisories]
-# Treat installing a yanked crate as a warning (not all yanks are security).
 yanked = "warn"
-# Advisory IDs to silence go here once triaged (e.g. an unfixable transitive one).
-ignore = []
+# Don't fail the build on unmaintained-crate advisories (the old gtk-rs stack).
+unmaintained = "none"
+# Triaged, accepted VULNERABILITIES (review periodically):
+ignore = [
+    # ring <0.17: AES funcs may panic only when overflow-checks are on (debug).
+    # Pulled transitively via jsonwebtoken 8.x -> meilisearch-sdk; needs a
+    # jsonwebtoken upgrade to remove. Not reachable in release builds.
+    "RUSTSEC-2025-0009",
+    # glib VariantStrIter unsoundness — inherent to the unmaintained gtk-rs 0.18
+    # GTK3 stack; removable only by migrating the whole UI to gtk4-rs.
+    "RUSTSEC-2024-0429",
+]
 
 [licenses]
-# Permissive licenses we accept for a MIT-licensed app.
+# Permissive licenses accepted for a MIT-licensed app.
 allow = [
     "MIT",
     "Apache-2.0",
@@ -28,11 +39,20 @@ allow = [
     "0BSD",
     "Unlicense",
     "OpenSSL",
+    # Permissive data license used by the bundled webpki root-certificate sets.
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.9
 
+# `ring` ships no SPDX license field; clarify it to its actual licenses so it
+# isn't flagged "unlicensed". Hash is of ring 0.16.20's LICENSE file.
+[[licenses.clarify]]
+name = "ring"
+expression = "MIT AND ISC AND OpenSSL"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
 [bans]
-# Warn (don't hard-fail) on duplicate versions / wildcard deps — informational.
+# Informational only (don't hard-fail): duplicate versions / wildcard deps.
 multiple-versions = "warn"
 wildcards = "warn"
 
