@@ -16,9 +16,19 @@ const TIKTOK_MAX_UNITS: usize = 20;
 
 /// Run yt-dlp and parse one JSON object from stdout. `kill_on_drop` + timeout means
 /// a hung child is reaped, not leaked into a stall.
-async fn run_ytdlp_json(target: &str, args: &[&str]) -> Result<serde_json::Value, String> {
+async fn run_ytdlp_json(
+    target: &str,
+    args: &[&str],
+    cookie: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    let mut all: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    // Opt-in user session (default off): pass as a request header to yt-dlp.
+    if let Some(c) = cookie {
+        all.push("--add-header".to_string());
+        all.push(format!("Cookie:{}", c));
+    }
     let mut child = tokio::process::Command::new("yt-dlp")
-        .args(args)
+        .args(&all)
         .arg(target)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -70,7 +80,7 @@ impl SourceAdapter for YoutubeAdapter {
     async fn discover(&self, query: &str, limit: usize) -> Result<Vec<Candidate>, String> {
         // `ytsearchN:` discovery via yt-dlp — no API key needed.
         let target = format!("ytsearch{}:{}", limit.clamp(1, 25), query);
-        let v = run_ytdlp_json(&target, &["-J", "--flat-playlist", "--no-warnings"]).await?;
+        let v = run_ytdlp_json(&target, &["-J", "--flat-playlist", "--no-warnings"], None).await?;
         let entries = v["entries"].as_array().cloned().unwrap_or_default();
         Ok(entries
             .iter()
@@ -90,7 +100,7 @@ impl SourceAdapter for YoutubeAdapter {
     }
 
     async fn fetch(&self, url: &str) -> Result<FetchedDoc, String> {
-        let v = run_ytdlp_json(url, &["-J", "--no-warnings"]).await?;
+        let v = run_ytdlp_json(url, &["-J", "--no-warnings"], None).await?;
         Ok(FetchedDoc {
             url: url.to_string(),
             title: v["title"].as_str().unwrap_or("").to_string(),
@@ -116,6 +126,7 @@ impl SourceAdapter for YoutubeAdapter {
         let v = run_ytdlp_json(
             url,
             &["-J", "--write-comments", "--no-warnings", "--extractor-args", &extractor],
+            None,
         )
         .await?;
         let title = v["title"].as_str().unwrap_or("").to_string();
@@ -163,10 +174,16 @@ impl SourceAdapter for YoutubeAdapter {
 
 // ---------------- TikTok ----------------
 
-pub struct TiktokAdapter;
+pub struct TiktokAdapter {
+    cookie: Option<String>,
+}
 impl TiktokAdapter {
     pub fn new() -> Self {
-        TiktokAdapter
+        TiktokAdapter { cookie: None }
+    }
+    /// Opt-in: a user-supplied session cookie passed to yt-dlp (default off).
+    pub fn with_session(cookie: Option<String>) -> Self {
+        TiktokAdapter { cookie }
     }
 }
 impl Default for TiktokAdapter {
@@ -199,7 +216,7 @@ impl SourceAdapter for TiktokAdapter {
     }
 
     async fn fetch(&self, url: &str) -> Result<FetchedDoc, String> {
-        let v = run_ytdlp_json(url, &["-J", "--no-warnings"]).await?;
+        let v = run_ytdlp_json(url, &["-J", "--no-warnings"], self.cookie.as_deref()).await?;
         Ok(FetchedDoc {
             url: url.to_string(),
             title: v["title"].as_str().or(v["description"].as_str()).unwrap_or("").to_string(),
@@ -226,7 +243,7 @@ impl SourceAdapter for TiktokAdapter {
     async fn fetch_segments(&self, url: &str, _max_units: usize) -> Result<Vec<Segment>, String> {
         // yt-dlp gives the caption reliably; comment support is fragile/absent, so
         // we surface the caption as a `post` and best-effort any comments present.
-        let v = run_ytdlp_json(url, &["-J", "--no-warnings"]).await?;
+        let v = run_ytdlp_json(url, &["-J", "--no-warnings"], self.cookie.as_deref()).await?;
         let caption = v["description"].as_str().or(v["title"].as_str()).unwrap_or("").to_string();
         let mut segs = Vec::new();
         if !caption.trim().is_empty() {

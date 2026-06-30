@@ -2487,6 +2487,10 @@ pub fn run() {
             // Auto-GC for the search index: sweep expired ephemeral/cache rows on
             // startup and hourly (never touches pinned/archived).
             search_index::gc::start(db_path_str.clone());
+            // Opt-in per-adapter logged-in sessions (default off).
+            if let Err(e) = search_index::sessions::init(&db_path_str) {
+                log::error!("Failed to initialize adapter_sessions table: {}", e);
+            }
             // Per-profile Local-AI settings (curator/assistant). Persisted here so
             // the curator toggle survives restart (localStorage is wiped because the
             // browser window is incognito).
@@ -2913,6 +2917,8 @@ pub fn run() {
             search_index::orchestrator::local_search,
             search_index::orchestrator::log_result_click,
             search_index::orchestrator::list_search_sources,
+            search_index::sessions::get_adapter_sessions,
+            search_index::sessions::set_adapter_session,
             search_index::lifecycle::pin_result,
             search_index::lifecycle::archive_result,
             search_index::lifecycle::forget_result,

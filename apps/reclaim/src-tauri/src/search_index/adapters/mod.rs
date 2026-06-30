@@ -140,15 +140,28 @@ pub struct AdapterRegistry {
 }
 
 impl AdapterRegistry {
-    /// The default set: generic web (backstop) + Reddit + Forums.
+    /// The default set with no logged-in sessions (public/logged-out only).
     pub fn default_set(searxng_url: Option<String>) -> Self {
+        Self::default_set_with(searxng_url, &std::collections::HashMap::new())
+    }
+
+    /// The default set, optionally wiring user-supplied (opt-in) sessions into the
+    /// social adapters by id. `sessions` maps adapter_id → cookie/token; absent =
+    /// public logged-out path.
+    pub fn default_set_with(
+        searxng_url: Option<String>,
+        sessions: &std::collections::HashMap<String, String>,
+    ) -> Self {
         let web: Arc<dyn SourceAdapter> = Arc::new(web::GenericWebAdapter::new(searxng_url));
         let reddit: Arc<dyn SourceAdapter> = Arc::new(reddit::RedditAdapter::new());
         let forums: Arc<dyn SourceAdapter> = Arc::new(forums::ForumAdapter::new());
         let youtube: Arc<dyn SourceAdapter> = Arc::new(ytdlp::YoutubeAdapter::new());
-        let tiktok: Arc<dyn SourceAdapter> = Arc::new(ytdlp::TiktokAdapter::new());
-        let instagram: Arc<dyn SourceAdapter> = Arc::new(social::InstagramAdapter::new());
-        let facebook: Arc<dyn SourceAdapter> = Arc::new(social::FacebookAdapter::new());
+        let tiktok: Arc<dyn SourceAdapter> =
+            Arc::new(ytdlp::TiktokAdapter::with_session(sessions.get("tiktok").cloned()));
+        let instagram: Arc<dyn SourceAdapter> =
+            Arc::new(social::InstagramAdapter::with_session(sessions.get("instagram").cloned()));
+        let facebook: Arc<dyn SourceAdapter> =
+            Arc::new(social::FacebookAdapter::with_session(sessions.get("facebook").cloned()));
         Self {
             adapters: vec![web.clone(), reddit, forums, youtube, tiktok, instagram, facebook],
             web,

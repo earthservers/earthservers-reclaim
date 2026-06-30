@@ -26,6 +26,7 @@ pub mod gc;
 pub mod curate;
 pub mod lifecycle;
 pub mod crawler;
+pub mod sessions;
 
 use rusqlite::Connection;
 

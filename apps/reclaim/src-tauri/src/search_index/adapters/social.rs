@@ -52,15 +52,18 @@ fn decode_entities(s: &str) -> String {
 }
 
 /// Shared best-effort caption fetch: returns a single `post` segment from the
-/// public page's Open Graph caption, or EMPTY on any block/failure (graceful).
-async fn caption_segment(url: &str) -> Vec<Segment> {
+/// public page's Open Graph caption, or EMPTY on any block/failure (graceful). An
+/// optional user-supplied session cookie (opt-in, default off) is sent if present.
+async fn caption_segment(url: &str, cookie: Option<&str>) -> Vec<Segment> {
     let client = browser_client();
-    let resp = match client
+    let mut req = client
         .get(url)
         .header("Accept-Language", "en-US,en;q=0.9")
-        .header("Accept", "text/html,application/xhtml+xml")
-        .send()
-        .await
+        .header("Accept", "text/html,application/xhtml+xml");
+    if let Some(c) = cookie {
+        req = req.header("Cookie", c);
+    }
+    let resp = match req.send().await
     {
         Ok(r) if r.status().is_success() => r,
         _ => return Vec::new(), // blocked/unavailable → graceful empty
@@ -90,10 +93,16 @@ async fn caption_segment(url: &str) -> Vec<Segment> {
 
 // ---------------- Instagram ----------------
 
-pub struct InstagramAdapter;
+pub struct InstagramAdapter {
+    cookie: Option<String>,
+}
 impl InstagramAdapter {
     pub fn new() -> Self {
-        InstagramAdapter
+        InstagramAdapter { cookie: None }
+    }
+    /// Opt-in: use a user-supplied session cookie (default off).
+    pub fn with_session(cookie: Option<String>) -> Self {
+        InstagramAdapter { cookie }
     }
 }
 impl Default for InstagramAdapter {
@@ -114,7 +123,7 @@ impl SourceAdapter for InstagramAdapter {
             .collect())
     }
     async fn fetch(&self, url: &str) -> Result<FetchedDoc, String> {
-        let segs = caption_segment(url).await;
+        let segs = caption_segment(url, self.cookie.as_deref()).await;
         match segs.into_iter().next() {
             Some(s) => Ok(FetchedDoc { url: url.to_string(), title: s.title.unwrap_or_default(), body: s.text }),
             None => Err("instagram: unavailable (public caption not reachable)".into()),
@@ -133,16 +142,22 @@ impl SourceAdapter for InstagramAdapter {
         false
     }
     async fn fetch_segments(&self, url: &str, _max_units: usize) -> Result<Vec<Segment>, String> {
-        Ok(caption_segment(url).await) // graceful-empty; comments need rotating GraphQL we don't touch
+        Ok(caption_segment(url, self.cookie.as_deref()).await) // graceful-empty; comments need rotating GraphQL we don't touch
     }
 }
 
 // ---------------- Facebook ----------------
 
-pub struct FacebookAdapter;
+pub struct FacebookAdapter {
+    cookie: Option<String>,
+}
 impl FacebookAdapter {
     pub fn new() -> Self {
-        FacebookAdapter
+        FacebookAdapter { cookie: None }
+    }
+    /// Opt-in: use a user-supplied session cookie (default off).
+    pub fn with_session(cookie: Option<String>) -> Self {
+        FacebookAdapter { cookie }
     }
 }
 impl Default for FacebookAdapter {
@@ -163,7 +178,7 @@ impl SourceAdapter for FacebookAdapter {
             .collect())
     }
     async fn fetch(&self, url: &str) -> Result<FetchedDoc, String> {
-        let segs = caption_segment(url).await;
+        let segs = caption_segment(url, self.cookie.as_deref()).await;
         match segs.into_iter().next() {
             Some(s) => Ok(FetchedDoc { url: url.to_string(), title: s.title.unwrap_or_default(), body: s.text }),
             None => Err("facebook: unavailable (login-walled or blocked)".into()),
@@ -182,7 +197,7 @@ impl SourceAdapter for FacebookAdapter {
         false
     }
     async fn fetch_segments(&self, url: &str, _max_units: usize) -> Result<Vec<Segment>, String> {
-        Ok(caption_segment(url).await) // graceful-empty; most content is login-walled
+        Ok(caption_segment(url, self.cookie.as_deref()).await) // graceful-empty; most content is login-walled
     }
 }
 

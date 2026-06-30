@@ -134,7 +134,9 @@ pub async fn local_search(
     };
     let _ = app.emit("local-search-started", StartedEvent { query_id });
 
-    let registry = Arc::new(AdapterRegistry::default_set(searxng_url));
+    // Opt-in user sessions for the social adapters (default off / empty).
+    let sessions = super::sessions::load_enabled(&db_path, profile_id);
+    let registry = Arc::new(AdapterRegistry::default_set_with(searxng_url, &sessions));
 
     // 2. Shallow: discover across the selected adapters concurrently, emitting each
     //    candidate as it arrives so the box is never empty. Dedup by URL.
