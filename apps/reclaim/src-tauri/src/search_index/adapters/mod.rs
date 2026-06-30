@@ -10,6 +10,8 @@
 pub mod web;
 pub mod reddit;
 pub mod forums;
+pub mod ytdlp;
+pub mod social;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -143,8 +145,12 @@ impl AdapterRegistry {
         let web: Arc<dyn SourceAdapter> = Arc::new(web::GenericWebAdapter::new(searxng_url));
         let reddit: Arc<dyn SourceAdapter> = Arc::new(reddit::RedditAdapter::new());
         let forums: Arc<dyn SourceAdapter> = Arc::new(forums::ForumAdapter::new());
+        let youtube: Arc<dyn SourceAdapter> = Arc::new(ytdlp::YoutubeAdapter::new());
+        let tiktok: Arc<dyn SourceAdapter> = Arc::new(ytdlp::TiktokAdapter::new());
+        let instagram: Arc<dyn SourceAdapter> = Arc::new(social::InstagramAdapter::new());
+        let facebook: Arc<dyn SourceAdapter> = Arc::new(social::FacebookAdapter::new());
         Self {
-            adapters: vec![web.clone(), reddit, forums],
+            adapters: vec![web.clone(), reddit, forums, youtube, tiktok, instagram, facebook],
             web,
         }
     }
