@@ -20,6 +20,9 @@ const W_POS: f32 = 0.5;
 const CLICK_BOOST: f32 = 0.15;
 /// How many crawler (scraped_pages) FTS hits to fan in per query.
 const CRAWLER_TOP_N: usize = 30;
+/// Max crawler hits from any single domain, so one heavily-crawled site can't
+/// flood the results (e.g. a site you crawled exhaustively matching every query).
+const CRAWLER_PER_DOMAIN: usize = 3;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -130,6 +133,7 @@ pub async fn rank(
             let ids = super::crawler::fts_rowids(&conn, e, CRAWLER_TOP_N).unwrap_or_default();
             let meta = super::crawler::load_candidates(&conn, &ids).unwrap_or_default();
             let mut rank = 0usize;
+            let mut per_domain: HashMap<String, usize> = HashMap::new();
             for id in ids {
                 if let Some(c) = meta.get(&id) {
                     // Dedup vs search_pages by normalized URL — prefer the (fresher,
@@ -137,6 +141,13 @@ pub async fn rank(
                     if sp_urls.contains(&norm_url(&c.url)) {
                         continue;
                     }
+                    // Cap per domain so one exhaustively-crawled site can't flood.
+                    let domain = super::adapters::host_of(&c.url).unwrap_or_default();
+                    let n = per_domain.entry(domain).or_insert(0);
+                    if *n >= CRAWLER_PER_DOMAIN {
+                        continue;
+                    }
+                    *n += 1;
                     crawler_fts_rank.insert(id, rank);
                     rank += 1;
                     crawler_cands.push(c.clone());

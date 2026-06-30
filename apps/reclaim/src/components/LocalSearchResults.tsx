@@ -197,7 +197,13 @@ export function LocalSearchResults({
     upsertRow(row.url, { forgotten: true });
   };
 
-  const displayOrder = rankedOrder ?? order;
+  // Show the fused ranking first, then KEEP any still-visible live (shallow/deep)
+  // results that weren't in the ranked set — the ranker only covers pages that got
+  // indexed (deep-scraped + cache + crawler), so without this the good live results
+  // would vanish when ranking completes.
+  const displayOrder = rankedOrder
+    ? [...rankedOrder, ...order.filter(u => !rankedOrder.includes(u))]
+    : order;
   const rows = displayOrder.map(u => rowsByUrl[u]).filter((r): r is ResultRow => !!r && !r.forgotten);
 
   return (

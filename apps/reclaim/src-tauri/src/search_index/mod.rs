@@ -277,6 +277,30 @@ mod integration {
         assert_eq!(eng, 9);
     }
 
+    #[tokio::test]
+    async fn crawler_results_are_capped_per_domain() {
+        let path = temp_db_path("perdomain");
+        let conn = setup_unified(&path);
+        let qid = store::insert_query(&conn, "gizmo", "cache", 100, 1).unwrap();
+        conn.execute("INSERT INTO scraping_jobs (id, name) VALUES (1,'site crawl')", []).unwrap();
+        // 6 crawler pages from ONE heavily-crawled domain, all matching the query.
+        for i in 0..6 {
+            conn.execute(
+                "INSERT INTO scraped_pages (id, job_id, url, title, content) VALUES (?1,1,?2,'P','gizmo gizmo gizmo')",
+                rusqlite::params![i + 1, format!("https://skrunkfugins.com/page{}", i)],
+            ).unwrap();
+        }
+        drop(conn);
+
+        let ranked = super::rank::rank(&path, qid, "gizmo", 1, 50, None).await;
+        let from_domain = ranked.iter()
+            .filter(|r| r.source_table == "scraped_pages" && r.url.contains("skrunkfugins.com"))
+            .count();
+        assert!(from_domain <= 3, "one crawled domain must be capped (got {})", from_domain);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn content_kind_filter_scopes_candidates() {
         use adapters::Segment;
