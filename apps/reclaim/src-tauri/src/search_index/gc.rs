@@ -16,7 +16,9 @@ pub fn start(db_path: String) {
         Ok(_) => {}
         Err(e) => log::warn!("[search_index] startup GC failed: {}", e),
     }
-    tokio::spawn(async move {
+    // Use Tauri's async runtime — `start` is called from the setup hook, which is
+    // NOT inside a Tokio reactor context, so a bare `tokio::spawn` panics.
+    tauri::async_runtime::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
         // The first tick fires immediately; skip it (we just swept above).
         tick.tick().await;
