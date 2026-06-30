@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod search;
+mod search_index;
 mod memory;
 mod ratings;
 mod ai;
@@ -69,6 +70,7 @@ pub struct AppState {
     pub multimedia_manager: MultimediaManager,
     pub scraper_manager: ScraperManager,
     pub vault_manager: vault::VaultManager,
+    pub search_index_manager: search_index::SearchIndexManager,
 }
 
 // ==================== Profile Commands ====================
@@ -2460,6 +2462,7 @@ pub fn run() {
             let multimedia_manager = MultimediaManager::new(db_path_str.clone());
             let scraper_manager = ScraperManager::new(db_path_str.clone());
             let vault_manager = vault::VaultManager::new(db_path_str.clone());
+            let search_index_manager = search_index::SearchIndexManager::new(db_path_str.clone());
 
             // Initialize database tables
             profile_manager.init().expect("Failed to initialize profile tables");
@@ -2475,6 +2478,10 @@ pub fn run() {
             }
             if let Err(e) = media_downloads::init(&db_path_str) {
                 log::error!("Failed to initialize media_downloads table: {}", e);
+            }
+            // Local search index: search_pages + FTS5 + embeddings + click-log.
+            if let Err(e) = search_index_manager.init() {
+                log::error!("Failed to initialize search index tables: {}", e);
             }
             // Security subsystem: append-only vault audit log + live event sink for
             // the Security panel. Deterministic; no LLM involved.
@@ -2535,6 +2542,7 @@ pub fn run() {
                 multimedia_manager,
                 scraper_manager,
                 vault_manager,
+                search_index_manager,
             };
 
             app.manage(Mutex::new(state));
