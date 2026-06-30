@@ -1,15 +1,17 @@
 # cargo-deny config (Phase 5, supply chain). Run: `cargo deny check`.
-# Fails CI on known-vulnerable dependencies and disallowed licenses.
+# Kept minimal and version-robust: newer cargo-deny removed several [advisories]
+# keys (vulnerabilities are always denied; unmaintained/unsound are handled
+# internally), so we only set the few keys that are stable across versions and
+# rely on sane defaults otherwise.
 
 [advisories]
-# Fail on any security advisory affecting a dependency (RUSTSEC).
-yanked = "deny"
-# Unmaintained/unsound advisories warn rather than hard-fail so a transitive,
-# unfixable advisory doesn't block all builds — review them in CI output.
-unmaintained = "workspace"
+# Treat installing a yanked crate as a warning (not all yanks are security).
+yanked = "warn"
+# Advisory IDs to silence go here once triaged (e.g. an unfixable transitive one).
+ignore = []
 
 [licenses]
-# Permissive licenses we accept for a MIT-licensed app. Add others deliberately.
+# Permissive licenses we accept for a MIT-licensed app.
 allow = [
     "MIT",
     "Apache-2.0",
@@ -23,12 +25,14 @@ allow = [
     "MPL-2.0",
     "CC0-1.0",
     "BSL-1.0",
+    "0BSD",
+    "Unlicense",
     "OpenSSL",
 ]
 confidence-threshold = 0.9
 
 [bans]
-# Warn on multiple versions of the same crate (bloat / drift), don't hard-fail.
+# Warn (don't hard-fail) on duplicate versions / wildcard deps — informational.
 multiple-versions = "warn"
 wildcards = "warn"
 
