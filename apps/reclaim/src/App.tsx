@@ -9,6 +9,7 @@ import { PrivacyButton } from './components/PrivacyButton';
 import { SecurityMonitor } from './components/SecurityMonitor';
 import { SecurityButton } from './components/SecurityButton';
 import { HistoryViewer } from './components/HistoryViewer';
+import { ReviewPinnedPanel } from './components/ReviewPinnedPanel';
 import { ThemeCustomizer } from './components/ThemeCustomizer';
 import { ThemeProvider, useTheme } from './contexts/ThemeContext';
 import { BrowserProvider } from './contexts/BrowserContext';
@@ -128,7 +129,10 @@ const mainServiceItems = [
   { id: 'ai' as const, label: 'Local AI / History', icon: 'M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z' },
 ];
 
-// Local-AI on/off settings, persisted in localStorage.
+// Local-AI on/off settings. Persisted PER PROFILE in the backend (earthservers.db)
+// — NOT localStorage: the browser window is incognito, so localStorage is wiped on
+// restart, which made the curator silently switch itself back on every launch.
+// localStorage is kept only as a fallback for non-Tauri (mock/browser) mode.
 export interface AiSettings {
   curator: boolean;   // transparently summarize visited pages into the knowledge graph
   assistant: boolean; // local chat assistant (model picked by hardware tier)
@@ -168,6 +172,7 @@ function App() {
   const [activeProfile, setActiveProfile] = useState<Profile | null>(null);
   const [isIncognito, setIsIncognito] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
+  const [showReviewPinned, setShowReviewPinned] = useState(false);
   const [showThemeCustomizer, setShowThemeCustomizer] = useState(false);
   const [showAbout, setShowAbout] = useState(false);
   const [navbarCollapsed, setNavbarCollapsed] = useState(false);
@@ -213,10 +218,30 @@ function App() {
   const updateAiSettings = useCallback((next: Partial<AiSettings>) => {
     setAiSettings(prev => {
       const merged = { ...prev, ...next };
-      try { localStorage.setItem(AI_SETTINGS_KEY, JSON.stringify(merged)); } catch { /* ignore */ }
+      // Persist per-profile in the backend (survives restart under incognito).
+      if (isTauri()) {
+        invoke('set_ai_settings', {
+          profileId: activeProfile?.id ?? 1,
+          curator: merged.curator,
+          assistant: merged.assistant,
+        }).catch(() => { /* best-effort */ });
+      } else {
+        try { localStorage.setItem(AI_SETTINGS_KEY, JSON.stringify(merged)); } catch { /* ignore */ }
+      }
       return merged;
     });
-  }, []);
+  }, [activeProfile?.id]);
+
+  // Load the active profile's persisted Local-AI settings from the backend, and
+  // reload whenever the profile changes (each profile keeps its own choice).
+  useEffect(() => {
+    if (!isTauri() || !activeProfile?.id) return;
+    let cancelled = false;
+    invoke<AiSettings>('get_ai_settings', { profileId: activeProfile.id })
+      .then(s => { if (!cancelled && s) setAiSettings(s); })
+      .catch(() => { /* keep current defaults */ });
+    return () => { cancelled = true; };
+  }, [activeProfile?.id]);
 
   // Autosave "Save password?" prompt, raised when the page captures a login submit.
   const [savePrompt, setSavePrompt] = useState<{ origin: string; username: string } | null>(null);
@@ -584,13 +609,31 @@ function App() {
   // won't re-curate, but reaching more (e.g. comments) refines it. Backend no-ops
   // if Ollama isn't running.
   const curatedKeysRef = useRef<Set<string>>(new Set());
+  const autoCachedRef = useRef<Set<string>>(new Set());
   useEffect(() => {
     if (!isTauri()) return;
     let unlisten: (() => void) | undefined;
     listen<{ url: string; title: string; text: string; isFinal: boolean }>('browser-viewed-content', ({ payload }) => {
       const { url, title, text } = payload;
-      if (!aiSettings.curator || !/^https?:\/\//.test(url || '') || isIncognito) return;
+      // Common gate: real web page, not incognito.
+      if (!/^https?:\/\//.test(url || '') || isIncognito) return;
       if (!text || text.length < 200) return;
+
+      // Auto-cache (the cheap bottom rung): put the browsed text into the grep-able
+      // index at the cache tier — TTL'd, auto-pruned, NO curation cost. Independent
+      // of the curator toggle. Backend skips login pages and dedups by URL.
+      if (!autoCachedRef.current.has(url)) {
+        autoCachedRef.current.add(url);
+        invoke('auto_cache_page', {
+          url,
+          title: title || url,
+          text,
+          profileId: activeProfile?.id ?? 1,
+        }).catch(() => {});
+      }
+
+      // Curation (the expensive rung): only when the curator is enabled.
+      if (!aiSettings.curator) return;
       const key = `${url}::${Math.floor(text.length / 2000)}`;
       if (curatedKeysRef.current.has(key)) return;
       curatedKeysRef.current.add(key);
@@ -1071,6 +1114,18 @@ function App() {
                     </svg>
                   </button>
 
+                  {/* Review pinned pages (curator suggestions; user disposes). */}
+                  <button
+                    onClick={() => setShowReviewPinned(true)}
+                    className={`hidden xs:block rounded-lg bg-white/10 border border-white/20 text-white/80 hover:bg-white/15 hover:text-white transition-all ${navbarCollapsed ? 'p-0.5 opacity-0 w-0 overflow-hidden' : 'p-1 sm:p-1.5 lg:p-2 opacity-100'}`}
+                    title="Review pinned pages"
+                    style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
+                  >
+                    <svg className="w-3.5 h-3.5 lg:w-4 lg:h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 3h6l-1 5 3 3v2h-4v6l-1 2-1-2v-6H7v-2l3-3-1-5z" />
+                    </svg>
+                  </button>
+
                   {/* Navbar Collapse Toggle - always visible */}
                   <button
                     onClick={() => setNavbarCollapsed(!navbarCollapsed)}
@@ -1367,6 +1422,13 @@ function App() {
             onClose={() => setShowHistory(false)}
           />
 
+          {/* Review Pinned Pages Modal (curator proposes; user disposes) */}
+          <ReviewPinnedPanel
+            profileId={activeProfile?.id ?? null}
+            isOpen={showReviewPinned}
+            onClose={() => setShowReviewPinned(false)}
+          />
+
           {/* Theme Customizer Modal (Draggable, non-dimming) */}
           <ThemeCustomizer
             profileId={activeProfile?.id ?? null}
@@ -1412,8 +1474,12 @@ function App() {
 
           {/* About Modal */}
           {showAbout && (
-            <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-              <div className="bg-gray-900 border border-white/10 rounded-2xl shadow-2xl w-full max-w-lg p-8">
+            <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50" onClick={() => setShowAbout(false)}>
+              <div
+                style={{ top: Math.max(chromeHeight, 56) }}
+                className="fixed right-0 bottom-0 bg-gray-900 border-l border-t border-white/10 rounded-tl-2xl shadow-2xl w-full max-w-md p-8 overflow-y-auto"
+                onClick={e => e.stopPropagation()}
+              >
                 <div className="flex justify-between items-start mb-6">
                   <h2 className="text-3xl font-bold">
                     <span className="text-theme-primary">Re</span>
@@ -1448,11 +1514,23 @@ function App() {
                       </li>
                       <li className="flex items-center gap-2">
                         <span className="text-theme-secondary">&#9679;</span>
-                        <span><strong>EarthMemory</strong> - Personal knowledge graph</span>
+                        <span><strong>Journal</strong> - Personal knowledge graph</span>
+                      </li>
+                      <li className="flex items-start gap-2">
+                        <span className="text-theme-primary mt-1">&#9679;</span>
+                        <span><strong>Sage</strong> - Local AI that summarizes what you read into your Journal and answers your questions from it &amp; the web, fully offline</span>
                       </li>
                       <li className="flex items-center gap-2">
                         <span className="text-theme-accent">&#9679;</span>
-                        <span><strong>EarthMultiMedia</strong> - Privacy-focused media player</span>
+                        <span><strong>Media</strong> - Privacy-focused media player</span>
+                      </li>
+                      <li className="flex items-start gap-2">
+                        <span className="text-theme-primary mt-1">&#9679;</span>
+                        <span><strong>Password Manager</strong> - Encrypted local vault with one-click autofill</span>
+                      </li>
+                      <li className="flex items-center gap-2">
+                        <span className="text-theme-secondary">&#9679;</span>
+                        <span><strong>Authenticator</strong> - Built-in 2FA / TOTP codes</span>
                       </li>
                     </ul>
                   </div>

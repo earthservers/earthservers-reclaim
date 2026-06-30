@@ -4,6 +4,9 @@
 import { useState, useEffect, useCallback } from 'react';
 import { invoke } from '../lib/tauri';
 import { RatingBadge, RatingForm, RatingDisplay } from './RatingComponents';
+import { LocalSearchResults } from './LocalSearchResults';
+import type { Retention, KindsMode } from './LocalSearchResults';
+import { SearchControls } from './SearchControls';
 
 interface Domain {
   id: number | null;
@@ -62,6 +65,18 @@ export function DomainManager({ profileId, onOpenUrl }: DomainManagerProps) {
   const [categories, setCategories] = useState<string[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
   const [urlInput, setUrlInput] = useState('');
+  // Active local-search query (rendered inline below the bar). nonce re-runs the
+  // same query string on repeat Enter.
+  const [liveQuery, setLiveQuery] = useState('');
+  const [searchNonce, setSearchNonce] = useState(0);
+  const [page, setPage] = useState(0);
+  // Search config — lifted here so it's selectable BEFORE a search.
+  const [retention, setRetention] = useState<Retention>('cache');
+  const [kindsMode, setKindsMode] = useState<KindsMode>('all');
+  const [sources, setSources] = useState<string[]>([]);
+  const [sourcesReady, setSourcesReady] = useState(false);
+  const [showDebug, setShowDebug] = useState(false);
+  const [domainsCollapsed, setDomainsCollapsed] = useState(false);
   const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -108,6 +123,14 @@ export function DomainManager({ profileId, onOpenUrl }: DomainManagerProps) {
   useEffect(() => {
     loadData();
   }, [loadData]);
+
+  // Initialize the selected search sources from the backend's default-enabled set.
+  useEffect(() => {
+    invoke<Array<{ id: string; defaultEnabled: boolean }>>('list_search_sources')
+      .then(list => setSources(list.filter(s => s.defaultEnabled).map(s => s.id)))
+      .catch(() => setSources(['web']))
+      .finally(() => setSourcesReady(true));
+  }, []);
 
   // Search domains
   const handleSearch = async () => {
@@ -248,20 +271,31 @@ export function DomainManager({ profileId, onOpenUrl }: DomainManagerProps) {
     ? domains.filter(d => d.category === selectedCategory)
     : domains;
 
-  // Open whatever is typed in the URL bar straight to a browser tab. Normalizes
-  // like the browser nav bar: a bare host gets https://; anything that isn't
-  // URL-shaped falls back to a DuckDuckGo search.
+  // A URL-shaped input (bare host or scheme) jumps straight to a browser tab; a
+  // free-text query runs the LOCAL search inline on this page (DuckDuckGo is still
+  // offered as an option in the results header, and via openInDuckDuckGo).
+  const isUrlShaped = (raw: string) =>
+    /^https?:\/\//i.test(raw) || raw.startsWith('earth://') || (raw.includes('.') && !raw.includes(' '));
+
   const goToUrl = () => {
     const raw = urlInput.trim();
     if (!raw) return;
-    let target = raw;
-    if (!/^https?:\/\//i.test(raw) && !raw.startsWith('earth://')) {
-      target = raw.includes('.') && !raw.includes(' ')
-        ? `https://${raw}`
-        : `https://duckduckgo.com/?q=${encodeURIComponent(raw)}`;
+    if (isUrlShaped(raw)) {
+      const target = /^https?:\/\//i.test(raw) || raw.startsWith('earth://') ? raw : `https://${raw}`;
+      onOpenUrl?.(target, { fromAddressBar: true });
+      setUrlInput('');
+      return;
     }
-    onOpenUrl?.(target, { fromAddressBar: true });
-    setUrlInput('');
+    // Free-text query → local search inline (bump nonce to re-run if unchanged).
+    setLiveQuery(raw);
+    setPage(0);
+    setSearchNonce(n => n + 1);
+    setDomainsCollapsed(true);
+  };
+
+  // Escape hatch the user asked to keep: open the query on DuckDuckGo in a tab.
+  const openInDuckDuckGo = (q: string) => {
+    onOpenUrl?.(`https://duckduckgo.com/?q=${encodeURIComponent(q)}`, { fromAddressBar: true });
   };
 
   if (!profileId) {
@@ -304,7 +338,7 @@ export function DomainManager({ profileId, onOpenUrl }: DomainManagerProps) {
             value={urlInput}
             onChange={(e) => setUrlInput(e.target.value)}
             onKeyDown={(e) => e.key === 'Enter' && goToUrl()}
-            placeholder="Enter a URL to visit (e.g. example.com)"
+            placeholder="Search or enter a URL to visit"
             className="w-full bg-black/30 border border-white/10 rounded-lg px-4 py-2.5 pl-10 text-white placeholder-gray-500 focus:outline-none focus:border-theme-primary transition-colors"
           />
           <svg className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -322,6 +356,43 @@ export function DomainManager({ profileId, onOpenUrl }: DomainManagerProps) {
         </button>
       </div>
 
+      {/* Search config — always visible so it can be set before a search. */}
+      <div className="text-xs font-semibold text-[var(--text-muted-color)] uppercase tracking-wide">SearchControls:</div>
+      <SearchControls
+        profileId={profileId}
+        retention={retention} setRetention={setRetention}
+        kindsMode={kindsMode} setKindsMode={setKindsMode}
+        sources={sources} setSources={setSources}
+        showDebug={showDebug} setShowDebug={setShowDebug}
+        query={liveQuery || urlInput}
+        onOpenInDuckDuckGo={openInDuckDuckGo}
+      />
+
+      {/* Inline local search results (a clicked result navigates this page away). */}
+      {liveQuery && (
+        <div>
+          <div className="flex items-center justify-between mb-2">
+            <div className="text-sm text-white truncate">Results for “{liveQuery}”</div>
+            <button onClick={() => { setLiveQuery(''); setDomainsCollapsed(false); }} className="text-xs text-gray-400 hover:text-white">Clear</button>
+          </div>
+          <LocalSearchResults
+            profileId={profileId}
+            query={liveQuery}
+            searchNonce={searchNonce}
+            retention={retention}
+            kindsMode={kindsMode}
+            sources={sources}
+            sourcesReady={sourcesReady}
+            showDebug={showDebug}
+            page={page}
+            onOpenUrl={onOpenUrl}
+            onOpenInDuckDuckGo={openInDuckDuckGo}
+            onNextPage={() => setPage(p => p + 1)}
+            onPrevPage={() => setPage(p => Math.max(0, p - 1))}
+          />
+        </div>
+      )}
+
       {/* Error Banner */}
       {error && (
         <div className="bg-red-500/20 border border-red-500/30 rounded-lg p-3 text-red-400 text-sm">
@@ -330,6 +401,18 @@ export function DomainManager({ profileId, onOpenUrl }: DomainManagerProps) {
         </div>
       )}
 
+      {/* Domain manager — collapsed while searching to keep results in focus. */}
+      <button
+        onClick={() => setDomainsCollapsed(c => !c)}
+        className="flex items-center gap-1.5 text-sm text-[var(--text-muted-color)] hover:text-white transition-colors"
+      >
+        <svg className={`w-3 h-3 transition-transform ${domainsCollapsed ? '' : 'rotate-90'}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+        </svg>
+        {domainsCollapsed ? 'Show domain manager' : 'Hide domain manager'}
+      </button>
+
+      {!domainsCollapsed && (<>
       {/* Main Content */}
       <div className="bg-theme-card/80 border border-white/10 rounded-2xl p-6 backdrop-blur-sm">
         {/* Search and Actions Bar */}
@@ -570,6 +653,7 @@ export function DomainManager({ profileId, onOpenUrl }: DomainManagerProps) {
           </div>
         )}
       </div>
+      </>)}
 
       {/* Add Domain Modal */}
       {showAddDomain && (

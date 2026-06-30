@@ -60,11 +60,13 @@ async fn searxng_available(base: &str) -> bool {
     }
 }
 
-async fn searxng_search(base: &str, query: &str) -> Result<Vec<SearchResult>, String> {
+async fn searxng_search(base: &str, query: &str, page: usize) -> Result<Vec<SearchResult>, String> {
     let client = reqwest::Client::new();
+    // SearXNG pageno is 1-based; `page` is 0-based here.
+    let pageno = (page + 1).to_string();
     let v: serde_json::Value = client
         .get(format!("{}/search", base))
-        .query(&[("q", query), ("format", "json")])
+        .query(&[("q", query), ("format", "json"), ("pageno", pageno.as_str())])
         .header("User-Agent", BROWSER_UA)
         .timeout(Duration::from_secs(15))
         .send()
@@ -184,15 +186,29 @@ async fn duckduckgo_search(query: &str) -> Result<Vec<SearchResult>, String> {
 /// Search the web. Uses SearXNG when reachable (max privacy), else DuckDuckGo.
 /// Internal entry point used by the agentic loop and the `web_search` command.
 pub async fn search(query: &str, searxng_url: Option<&str>) -> Result<Vec<SearchResult>, String> {
+    search_paged(query, searxng_url, 0).await
+}
+
+/// Paginated search (0-based `page`) for "more results / next page". SearXNG
+/// paginates via pageno; the DuckDuckGo fallback only serves the first page.
+pub async fn search_paged(
+    query: &str,
+    searxng_url: Option<&str>,
+    page: usize,
+) -> Result<Vec<SearchResult>, String> {
     let base = searxng_base(searxng_url);
     if searxng_available(&base).await {
-        // If SearXNG is up but returns nothing, fall back rather than dead-end.
-        match searxng_search(&base, query).await {
+        match searxng_search(&base, query, page).await {
             Ok(r) if !r.is_empty() => return Ok(r),
             _ => {}
         }
     }
-    duckduckgo_search(query).await
+    // DDG fallback has no stable pagination — only answer the first page.
+    if page == 0 {
+        duckduckgo_search(query).await
+    } else {
+        Ok(Vec::new())
+    }
 }
 
 /// Fetch a URL and return its readable text, truncated to ~2000 words.

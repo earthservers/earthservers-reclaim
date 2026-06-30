@@ -424,6 +424,46 @@ impl MemoryManager {
         }
     }
 
+    /// Explicitly set (not toggle) the favorite flag for a URL. Used by the search
+    /// index's favorites bridge so the knowledge-graph star stays in sync with the
+    /// pinned retention tier (single source of truth). Inserts a placeholder row if
+    /// the page isn't cached yet and we're favoriting.
+    pub fn set_favorite_by_url(
+        &self,
+        url: &str,
+        title: &str,
+        favorite: bool,
+        profile_id: i64,
+    ) -> Result<()> {
+        let conn = Connection::open(&self.db_path)?;
+        let fav = if favorite { 1 } else { 0 };
+        let existing: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM indexed_pages WHERE url = ?1 AND profile_id = ?2",
+                params![url, profile_id],
+                |row| row.get(0),
+            )
+            .ok();
+        match existing {
+            Some(id) => {
+                conn.execute(
+                    "UPDATE indexed_pages SET is_favorite = ?1 WHERE id = ?2 AND profile_id = ?3",
+                    params![fav, id, profile_id],
+                )?;
+            }
+            None if favorite => {
+                let now = chrono_now();
+                conn.execute(
+                    "INSERT INTO indexed_pages (url, title, content, summary, indexed_at, last_visited, visit_count, is_favorite, tags, profile_id)
+                     VALUES (?1, ?2, NULL, NULL, ?3, ?3, 0, 1, NULL, ?4)",
+                    params![url, title, now, profile_id],
+                )?;
+            }
+            None => { /* unfavoriting a page that was never cached: nothing to do */ }
+        }
+        Ok(())
+    }
+
     /// Whether the page at `url` is currently favorited (for the address-bar star).
     pub fn is_favorited_by_url(&self, url: &str, profile_id: i64) -> Result<bool> {
         let conn = Connection::open(&self.db_path)?;

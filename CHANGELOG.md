@@ -5,6 +5,70 @@ All notable changes to Earth Reclaim are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-06-30
+
+### Added
+
+- **Local search index — "Google, but completely local."** Type a query and get
+  fast results that are scraped, indexed, and grep-able on your device. It fuses the
+  local SearXNG meta-search, the web scraper, and the AI curator behind one
+  `local_search` command plus a new unified **FTS5 + vector** index with a fusion
+  ranker. The first search for a topic is slow (live discover → scrape → index);
+  every search after is instant off a warm local index — and the index only ever
+  contains things you actually searched (strong privacy property).
+  - **Two-speed streaming:** SearXNG-speed snippets paint immediately, then scraped
+    + indexed results stream in, then the list re-orders to a fused ranking.
+  - **Hybrid ranking:** FTS5/BM25 ⊕ vector cosine ⊕ SearXNG position ⊕ a private
+    click-log, fused with Reciprocal Rank Fusion.
+  - **Lifecycle ladder & retention tiers:** browse → auto-cache (TTL'd, no curation
+    cost) → favorite/pin (permanent, curated) → archived (summary kept, body/FTS/
+    embeddings dropped) → forgotten. Auto-GC only ever touches ephemeral/cache;
+    pinned/archived are protected. Login/credential pages are never cached or indexed.
+  - **Favorites = pins, one source of truth:** a pin control (distinct from the
+    bookmark star) in the address bar, History rows, and search results, all reading
+    the same retention tier. Bookmarks stay separate (URL-only, no indexing).
+  - **Review-pinned panel:** the curator *proposes* prune candidates (disuse, age,
+    semantic redundancy; a dead upstream is protected, not pruned) and *you dispose* —
+    nothing pinned is ever silently removed; the default destructive action is archive.
+- **Crawler results in unified search.** Pages from the web scraper's crawl jobs now
+  appear in search results, fused via the same RRF — read-only, capped per domain,
+  with a "from crawl: \<job\>" badge. Crawler storage is never modified.
+- **Comments & discussions search.** A typed-content filter (All / Comments &
+  discussions / Comments only) with per-platform adapters that pull posts and comments
+  from Reddit and forums (Discourse / Stack Exchange / generic) by default, plus
+  YouTube and TikTok via yt-dlp. Instagram/Facebook are best-effort and **off by
+  default** (public, logged-out only). An optional **opt-in** "use my own session"
+  toggle (default off, with a blunt Terms-of-Service warning) exists for the social
+  adapters — no credential automation, ever.
+- **Pagination** — "More results / next page" fetches a genuinely different page of
+  results (SearXNG `pageno`).
+- **Per-profile Local-AI settings** — the knowledge curator and assistant toggles now
+  persist per profile in the database.
+- README screenshots (hero + gallery).
+
+### Changed
+
+- **Search page UX:** the search controls (retention, kinds, sources, ranking-signals
+  debug, DuckDuckGo) are now an always-visible bar — selectable *before* a search. The
+  domain manager collapses while searching to keep results in focus, and the address
+  bar placeholder is now "Search or enter a URL to visit".
+- **Feature naming:** EarthMemory → **Journal**, EarthMultiMedia → **Media**, and the
+  local AI is now **Sage** (summarizes what you read into your Journal and answers from
+  it & the web, fully offline). The About panel is now a right-side drawer.
+
+### Fixed
+
+- **Secondary windows rendered as a blank "The URL can't be shown" box in packaged
+  builds.** Programmatic windows now match the main window's incognito web context, so
+  the app's asset protocol resolves (regression from the v1.0.8 single-instance change).
+- **The knowledge curator switched itself back on after every restart.** Its on/off
+  state was kept in the incognito WebView's localStorage (wiped each launch); it's now
+  persisted per profile in the database.
+- **Crawled pages polluted unrelated searches** (e.g. "best grapheneos phone" surfaced a
+  crawled site with none of those words). The crawler fan-in now requires *all* query
+  terms, is capped per domain, and live results are kept after ranking completes.
+- A GC scheduler panic on startup (background task spawned outside the Tokio runtime).
+
 ## [1.0.8] - 2026-06-29
 
 ### Security

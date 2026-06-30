@@ -2,6 +2,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod search;
+mod search_index;
+mod ai_settings;
 mod memory;
 mod ratings;
 mod ai;
@@ -69,6 +71,7 @@ pub struct AppState {
     pub multimedia_manager: MultimediaManager,
     pub scraper_manager: ScraperManager,
     pub vault_manager: vault::VaultManager,
+    pub search_index_manager: search_index::SearchIndexManager,
 }
 
 // ==================== Profile Commands ====================
@@ -2146,7 +2149,11 @@ async fn create_detached_window(
     .min_inner_size(800.0, 600.0)
     .decorations(false)
     .resizable(true)
-    .transparent(false);
+    .transparent(false)
+    // Match main's incognito context (tauri.conf.json) so the asset protocol
+    // resolves in packaged builds; otherwise WebKitGTK shows "The URL can't be
+    // shown" for this detached window.
+    .incognito(true);
 
     // Set position if provided (for drag-out to specific location)
     let builder = if let (Some(x), Some(y)) = (x, y) {
@@ -2409,6 +2416,14 @@ pub fn run() {
                 .maximized(true)
                 .decorations(false)
                 .transparent(false)
+                // MUST match the `main` window's `incognito: true` (tauri.conf.json).
+                // The app's asset protocol (tauri://localhost) is registered on the
+                // ephemeral web context that the incognito main window uses; a NON-
+                // incognito secondary window gets a different context with no handler
+                // → WebKitGTK shows "The URL can't be shown" (blank/white window) in
+                // packaged builds. Keeping every app window incognito is also the
+                // app's by-design posture.
+                .incognito(true)
                 .build()
             {
                 wire_media_drag_drop(&win);
@@ -2448,6 +2463,7 @@ pub fn run() {
             let multimedia_manager = MultimediaManager::new(db_path_str.clone());
             let scraper_manager = ScraperManager::new(db_path_str.clone());
             let vault_manager = vault::VaultManager::new(db_path_str.clone());
+            let search_index_manager = search_index::SearchIndexManager::new(db_path_str.clone());
 
             // Initialize database tables
             profile_manager.init().expect("Failed to initialize profile tables");
@@ -2463,6 +2479,23 @@ pub fn run() {
             }
             if let Err(e) = media_downloads::init(&db_path_str) {
                 log::error!("Failed to initialize media_downloads table: {}", e);
+            }
+            // Local search index: search_pages + FTS5 + embeddings + click-log.
+            if let Err(e) = search_index_manager.init() {
+                log::error!("Failed to initialize search index tables: {}", e);
+            }
+            // Auto-GC for the search index: sweep expired ephemeral/cache rows on
+            // startup and hourly (never touches pinned/archived).
+            search_index::gc::start(db_path_str.clone());
+            // Opt-in per-adapter logged-in sessions (default off).
+            if let Err(e) = search_index::sessions::init(&db_path_str) {
+                log::error!("Failed to initialize adapter_sessions table: {}", e);
+            }
+            // Per-profile Local-AI settings (curator/assistant). Persisted here so
+            // the curator toggle survives restart (localStorage is wiped because the
+            // browser window is incognito).
+            if let Err(e) = ai_settings::init(&db_path_str) {
+                log::error!("Failed to initialize ai_settings table: {}", e);
             }
             // Security subsystem: append-only vault audit log + live event sink for
             // the Security panel. Deterministic; no LLM involved.
@@ -2523,6 +2556,7 @@ pub fn run() {
                 multimedia_manager,
                 scraper_manager,
                 vault_manager,
+                search_index_manager,
             };
 
             app.manage(Mutex::new(state));
@@ -2776,6 +2810,9 @@ pub fn run() {
                             .maximized(true)
                             .decorations(false)
                             .transparent(false)
+                            // Match main's incognito context so the asset protocol
+                            // resolves in packaged builds (see single_instance above).
+                            .incognito(true)
                             .build()
                             {
                                 wire_media_drag_drop(&win);
@@ -2876,6 +2913,23 @@ pub fn run() {
             get_domain_categories,
             export_domains,
             import_domains,
+            // Local search index (query-driven FTS5 + vector fusion)
+            search_index::orchestrator::local_search,
+            search_index::orchestrator::log_result_click,
+            search_index::orchestrator::list_search_sources,
+            search_index::sessions::get_adapter_sessions,
+            search_index::sessions::set_adapter_session,
+            search_index::lifecycle::pin_result,
+            search_index::lifecycle::archive_result,
+            search_index::lifecycle::forget_result,
+            search_index::lifecycle::forget_query,
+            search_index::lifecycle::set_favorite,
+            search_index::lifecycle::favorite_state,
+            search_index::lifecycle::auto_cache_page,
+            search_index::lifecycle::review_pinned,
+            // Per-profile Local-AI settings (curator/assistant on-off persistence)
+            ai_settings::get_ai_settings,
+            ai_settings::set_ai_settings,
             // Memory commands (EarthMemory)
             get_indexed_pages,
             index_page,

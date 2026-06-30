@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { invoke, saveDialog, writeFile } from '../lib/tauri';
+import { FavoriteStar } from './FavoriteStar';
 
 // Types matching Rust structs
 interface HistoryEntry {
@@ -286,6 +287,8 @@ export function HistoryViewer({ profileId, isOpen, onClose }: HistoryViewerProps
                         <div className="text-sm text-gray-500 whitespace-nowrap">
                           {formatRelativeTime(entry.visited_at)}
                         </div>
+                        {/* Favorite (pin) star — same retention tier as everywhere else. */}
+                        <FavoriteStar url={entry.url} profileId={profileId} title={entry.title} />
                         <button
                           onClick={() => handleDeleteEntry(entry.id)}
                           className="p-1 text-gray-500 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-all"

@@ -1040,6 +1040,10 @@ pub async fn create_floating_controls_window(
     .resizable(false)
     .focused(false)
     .visible(true)
+    // Match main's incognito web context so the app asset protocol resolves in
+    // packaged builds (a non-incognito window would render WebKitGTK's
+    // "The URL can't be shown" error instead of the controls UI).
+    .incognito(true)
     .build()
     .map_err(|e| format!("Failed to create controls window: {}", e))?;
 

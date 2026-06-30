@@ -285,7 +285,10 @@ pub async fn detach_browser_to_window(
     .min_inner_size(400.0, 300.0)
     .decorations(true)
     .resizable(true)
-    .visible(true);
+    .visible(true)
+    // Match main's incognito web context (tauri.conf.json) so the asset protocol
+    // resolves for the App fallback in packaged builds.
+    .incognito(true);
 
     // Set position if provided
     if let (Some(x), Some(y)) = (x, y) {
