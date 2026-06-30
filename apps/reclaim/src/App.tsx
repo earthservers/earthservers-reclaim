@@ -9,6 +9,7 @@ import { PrivacyButton } from './components/PrivacyButton';
 import { SecurityMonitor } from './components/SecurityMonitor';
 import { SecurityButton } from './components/SecurityButton';
 import { HistoryViewer } from './components/HistoryViewer';
+import { ReviewPinnedPanel } from './components/ReviewPinnedPanel';
 import { ThemeCustomizer } from './components/ThemeCustomizer';
 import { ThemeProvider, useTheme } from './contexts/ThemeContext';
 import { BrowserProvider } from './contexts/BrowserContext';
@@ -171,6 +172,7 @@ function App() {
   const [activeProfile, setActiveProfile] = useState<Profile | null>(null);
   const [isIncognito, setIsIncognito] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
+  const [showReviewPinned, setShowReviewPinned] = useState(false);
   const [showThemeCustomizer, setShowThemeCustomizer] = useState(false);
   const [showAbout, setShowAbout] = useState(false);
   const [navbarCollapsed, setNavbarCollapsed] = useState(false);
@@ -1094,6 +1096,18 @@ function App() {
                     </svg>
                   </button>
 
+                  {/* Review pinned pages (curator suggestions; user disposes). */}
+                  <button
+                    onClick={() => setShowReviewPinned(true)}
+                    className={`hidden xs:block rounded-lg bg-white/10 border border-white/20 text-white/80 hover:bg-white/15 hover:text-white transition-all ${navbarCollapsed ? 'p-0.5 opacity-0 w-0 overflow-hidden' : 'p-1 sm:p-1.5 lg:p-2 opacity-100'}`}
+                    title="Review pinned pages"
+                    style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
+                  >
+                    <svg className="w-3.5 h-3.5 lg:w-4 lg:h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 3h6l-1 5 3 3v2h-4v6l-1 2-1-2v-6H7v-2l3-3-1-5z" />
+                    </svg>
+                  </button>
+
                   {/* Navbar Collapse Toggle - always visible */}
                   <button
                     onClick={() => setNavbarCollapsed(!navbarCollapsed)}
@@ -1388,6 +1402,13 @@ function App() {
             profileId={activeProfile?.id ?? null}
             isOpen={showHistory}
             onClose={() => setShowHistory(false)}
+          />
+
+          {/* Review Pinned Pages Modal (curator proposes; user disposes) */}
+          <ReviewPinnedPanel
+            profileId={activeProfile?.id ?? null}
+            isOpen={showReviewPinned}
+            onClose={() => setShowReviewPinned(false)}
           />
 
           {/* Theme Customizer Modal (Draggable, non-dimming) */}

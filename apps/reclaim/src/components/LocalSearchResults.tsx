@@ -8,6 +8,7 @@
 
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { invoke, listen, isTauri } from '../lib/tauri';
+import { FavoriteStar } from './FavoriteStar';
 
 type Retention = 'ephemeral' | 'cache' | 'pinned';
 
@@ -155,11 +156,6 @@ export function LocalSearchResults({
     onOpenUrl?.(row.url, { fromAddressBar: true });
   };
 
-  const pin = (row: ResultRow) => {
-    if (row.pageId == null) return;
-    invoke('pin_result', { pageId: row.pageId, profileId: profileId ?? 1 }).catch(() => {});
-    upsertRow(row.url, { pinned: true });
-  };
   const archive = (row: ResultRow) => {
     if (row.pageId == null) return;
     invoke('archive_result', { pageId: row.pageId, profileId: profileId ?? 1 }).catch(() => {});
@@ -259,12 +255,16 @@ export function LocalSearchResults({
                 </div>
               )}
             </div>
-            {/* Per-result actions (need a pageId = indexed) */}
+            {/* Per-result actions. Favorite = the shared pin (single source of truth);
+                archive/forget are maintenance. Need a pageId (= indexed) for these. */}
             {row.pageId != null && !row.archived && (
-              <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity flex-shrink-0">
-                {!row.pinned && <IconBtn title="Pin (keep permanently + curate)" onClick={() => pin(row)} d="M5 5l7-2 7 2v6c0 5-3.5 8-7 9-3.5-1-7-4-7-9V5z" />}
-                <IconBtn title="Archive (keep summary, drop body)" onClick={() => archive(row)} d="M4 7h16M6 7l1 12h10l1-12M9 11v5M15 11v5" />
-                <IconBtn title="Forget (delete now)" tone="red" onClick={() => forget(row)} d="M6 18L18 6M6 6l12 12" />
+              <div className="flex items-center gap-1 flex-shrink-0">
+                {/* Always-visible favorite pin so its state reads at a glance. */}
+                <FavoriteStar url={row.url} profileId={profileId} title={row.title} className="p-1.5" />
+                <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                  <IconBtn title="Archive (keep summary, drop body)" onClick={() => archive(row)} d="M4 7h16M6 7l1 12h10l1-12M9 11v5M15 11v5" />
+                  <IconBtn title="Forget (delete now)" tone="red" onClick={() => forget(row)} d="M6 18L18 6M6 6l12 12" />
+                </div>
               </div>
             )}
           </div>
