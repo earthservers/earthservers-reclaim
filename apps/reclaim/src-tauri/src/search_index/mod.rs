@@ -24,6 +24,7 @@ pub mod orchestrator;
 pub mod gc;
 pub mod curate;
 pub mod lifecycle;
+pub mod crawler;
 
 use rusqlite::Connection;
 
@@ -58,7 +59,13 @@ impl SearchIndexManager {
     /// Idempotent, forward-only migration. Safe to run on every startup.
     pub fn init(&self) -> rusqlite::Result<()> {
         let conn = self.conn()?;
-        schema::apply(&conn)
+        schema::apply(&conn)?;
+        // Read-only fan-in: index the crawler's existing scraped_pages so unified
+        // search can grep them. Best-effort — never block our own init on it.
+        if let Err(e) = crawler::ensure_fts(&conn) {
+            log::warn!("[search_index] crawler FTS init skipped: {}", e);
+        }
+        Ok(())
     }
 }
 
@@ -176,6 +183,66 @@ mod integration {
         assert_eq!(cache_gone, 0);
         assert_eq!(pinned_alive, 1, "pinned page survives forget_query");
         assert_eq!(query_gone, 0, "the query row itself is dropped");
+    }
+
+    fn temp_db_path(tag: &str) -> String {
+        std::env::temp_dir()
+            .join(format!("reclaim_si_{}_{}.db", tag, std::process::id()))
+            .to_string_lossy()
+            .to_string()
+    }
+
+    /// Set up a file DB with BOTH the search index and a stand-in crawler table +
+    /// its FTS, so rank() (which opens by path) can fan them in.
+    fn setup_unified(path: &str) -> Connection {
+        let _ = std::fs::remove_file(path);
+        let conn = SearchIndexManager::open(path).unwrap();
+        schema::apply(&conn).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS scraping_jobs (id INTEGER PRIMARY KEY, name TEXT);
+             CREATE TABLE IF NOT EXISTS scraped_pages (id INTEGER PRIMARY KEY, job_id INTEGER, url TEXT,
+                title TEXT, content TEXT, metadata TEXT, scraped_at TEXT);",
+        )
+        .unwrap();
+        crawler::ensure_fts(&conn).unwrap();
+        conn
+    }
+
+    #[tokio::test]
+    async fn ranker_fans_in_crawler_pages_and_dedups_by_url() {
+        let path = temp_db_path("fanin");
+        let conn = setup_unified(&path);
+        let qid = store::insert_query(&conn, "gizmo", "cache", 100, 1).unwrap();
+        // A query-driven search_pages result.
+        store::upsert_scraped(
+            &conn, 1, "https://sp.test/a", "SP", "the gizmo article body", "s", Some(qid),
+            "web", Some(0), "h", "cache", 100, Some(700),
+        ).unwrap();
+        // Crawler rows: one unique, one duplicating the search_pages URL.
+        conn.execute("INSERT INTO scraping_jobs (id, name) VALUES (1,'docs crawl')", []).unwrap();
+        conn.execute(
+            "INSERT INTO scraped_pages (id, job_id, url, title, content) VALUES (1,1,'https://crawl.test/x','Crawled','a gizmo from the crawl')",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO scraped_pages (id, job_id, url, title, content) VALUES (2,1,'https://sp.test/a/','Dupe','gizmo duplicate of sp')",
+            [],
+        ).unwrap();
+        drop(conn); // rank() opens its own connection by path
+
+        let ranked = super::rank::rank(&path, qid, "gizmo", 1, 20).await;
+        let tables: Vec<&str> = ranked.iter().map(|r| r.source_table).collect();
+        assert!(tables.contains(&"search_pages"), "sp result present");
+        assert!(tables.contains(&"scraped_pages"), "crawler result fused in");
+        // The crawler row whose URL duplicates the sp URL must NOT appear (dedup).
+        let crawl_urls: Vec<&str> = ranked.iter().filter(|r| r.source_table == "scraped_pages").map(|r| r.url.as_str()).collect();
+        assert!(crawl_urls.contains(&"https://crawl.test/x"));
+        assert!(!crawl_urls.iter().any(|u| u.starts_with("https://sp.test/a")), "duplicate crawler URL deduped");
+        // Provenance carried for badging.
+        let crawled = ranked.iter().find(|r| r.source_table == "scraped_pages").unwrap();
+        assert_eq!(crawled.provenance.as_deref(), Some("docs crawl"));
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

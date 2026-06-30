@@ -18,6 +18,8 @@ const W_VEC: f32 = 1.0;
 const W_POS: f32 = 0.5;
 /// Click-log personalization: + CLICK_BOOST * ln(1 + clicks_on_domain).
 const CLICK_BOOST: f32 = 0.15;
+/// How many crawler (scraped_pages) FTS hits to fan in per query.
+const CRAWLER_TOP_N: usize = 30;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -39,6 +41,19 @@ pub struct RankedResult {
     pub source_engine: String,
     pub fused_score: f32,
     pub signals: RankSignals,
+    /// Which index this row came from: "search_pages" (query-driven) or
+    /// "scraped_pages" (the crawler). The UI badges crawler rows and disables the
+    /// pin/archive/forget maintenance actions for them (page_id is a crawler rowid,
+    /// not a search_pages id).
+    pub source_table: &'static str,
+    /// For crawler rows: the crawl job name, for a "from crawl: <job>" badge.
+    pub provenance: Option<String>,
+}
+
+/// Normalize a URL for cross-index dedup: lowercase, drop fragment + trailing slash.
+fn norm_url(u: &str) -> String {
+    let s = u.split('#').next().unwrap_or(u).trim().trim_end_matches('/');
+    s.to_ascii_lowercase()
 }
 
 /// Sanitize arbitrary user input into a valid FTS5 MATCH expression: keep
@@ -73,20 +88,18 @@ pub async fn rank(
     limit: usize,
 ) -> Vec<RankedResult> {
     // ---- synchronous DB reads (no statement held across an await) ----
-    let (candidates, fts_rank, pos_rank, embeddings, clicks) = {
+    let (candidates, fts_rank, pos_rank, embeddings, clicks, crawler_cands, crawler_fts_rank) = {
         let conn = match super::SearchIndexManager::open(db_path) {
             Ok(c) => c,
             Err(_) => return Vec::new(),
         };
         let candidates = store::candidate_pages(&conn, query_id).unwrap_or_default();
-        if candidates.is_empty() {
-            return Vec::new();
-        }
         let id_set: std::collections::HashSet<i64> = candidates.iter().map(|c| c.id).collect();
+        let expr = sanitize_fts_query(query_text);
 
-        // FTS ranking, filtered to this query's candidates.
-        let fts_rank: HashMap<i64, usize> = match sanitize_fts_query(query_text) {
-            Some(expr) => store::fts_order(&conn, &expr)
+        // FTS ranking over search_pages, filtered to this query's candidates.
+        let fts_rank: HashMap<i64, usize> = match &expr {
+            Some(e) => store::fts_order(&conn, e)
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|id| id_set.contains(id))
@@ -102,10 +115,38 @@ pub async fn rank(
         let ids: Vec<i64> = candidates.iter().map(|c| c.id).collect();
         let embeddings = store::load_embeddings(&conn, &ids).unwrap_or_default();
         let clicks = store::domain_click_counts(&conn, profile_id).unwrap_or_default();
-        (candidates, fts_rank, pos_rank, embeddings, clicks)
+
+        // ---- read-time fan-in of the crawler index (its own id space + FTS) ----
+        let mut crawler_cands: Vec<super::crawler::CrawlerCand> = Vec::new();
+        let mut crawler_fts_rank: HashMap<i64, usize> = HashMap::new();
+        if let Some(e) = &expr {
+            let sp_urls: std::collections::HashSet<String> =
+                candidates.iter().map(|c| norm_url(&c.url)).collect();
+            let ids = super::crawler::fts_rowids(&conn, e, CRAWLER_TOP_N).unwrap_or_default();
+            let meta = super::crawler::load_candidates(&conn, &ids).unwrap_or_default();
+            let mut rank = 0usize;
+            for id in ids {
+                if let Some(c) = meta.get(&id) {
+                    // Dedup vs search_pages by normalized URL — prefer the (fresher,
+                    // retention-carrying) search_pages copy; drop the crawler dupe.
+                    if sp_urls.contains(&norm_url(&c.url)) {
+                        continue;
+                    }
+                    crawler_fts_rank.insert(id, rank);
+                    rank += 1;
+                    crawler_cands.push(c.clone());
+                }
+            }
+        }
+
+        if candidates.is_empty() && crawler_cands.is_empty() {
+            return Vec::new();
+        }
+        (candidates, fts_rank, pos_rank, embeddings, clicks, crawler_cands, crawler_fts_rank)
     };
 
-    // ---- async: embed the query, then compute vector ranking ----
+    // ---- async: embed the query, then compute vector ranking (search_pages only;
+    //      crawler rows participate via FTS alone in v1, which RRF tolerates) ----
     let vec_rank: HashMap<i64, usize> = match super::embed::embed_text(query_text).await {
         Some(qvec) => {
             let mut sims: Vec<(i64, f32)> = embeddings
@@ -121,37 +162,49 @@ pub async fn rank(
         None => HashMap::new(),
     };
 
-    // ---- pure RRF fusion + click boost ----
-    let mut out: Vec<RankedResult> = candidates
-        .into_iter()
-        .map(|c| {
-            let click_boost = domain_click_boost(&c.url, &clicks);
-            let f = fts_rank.get(&c.id).copied();
-            let v = vec_rank.get(&c.id).copied();
-            let p = pos_rank.get(&c.id).copied();
-            let fused = rrf_term(W_FTS, f) + rrf_term(W_VEC, v) + rrf_term(W_POS, p) + click_boost;
-            RankedResult {
-                page_id: c.id,
-                url: c.url,
-                title: c.title,
-                snippet: c.snippet,
-                source_engine: c.source_engine,
-                fused_score: fused,
-                signals: RankSignals {
-                    fts_rank: f,
-                    vec_rank: v,
-                    pos_rank: p,
-                    click_boost,
-                },
-            }
-        })
-        .collect();
+    // ---- pure RRF fusion + click boost, over the union of both indices ----
+    let mut out: Vec<RankedResult> = Vec::with_capacity(candidates.len() + crawler_cands.len());
+    for c in candidates {
+        let click_boost = domain_click_boost(&c.url, &clicks);
+        let f = fts_rank.get(&c.id).copied();
+        let v = vec_rank.get(&c.id).copied();
+        let p = pos_rank.get(&c.id).copied();
+        let fused = rrf_term(W_FTS, f) + rrf_term(W_VEC, v) + rrf_term(W_POS, p) + click_boost;
+        out.push(RankedResult {
+            page_id: c.id,
+            url: c.url,
+            title: c.title,
+            snippet: c.snippet,
+            source_engine: c.source_engine,
+            fused_score: fused,
+            signals: RankSignals { fts_rank: f, vec_rank: v, pos_rank: p, click_boost },
+            source_table: "search_pages",
+            provenance: None,
+        });
+    }
+    for c in crawler_cands {
+        let click_boost = domain_click_boost(&c.url, &clicks);
+        let f = crawler_fts_rank.get(&c.id).copied();
+        let fused = rrf_term(W_FTS, f) + click_boost; // no vec/pos for crawler in v1
+        out.push(RankedResult {
+            page_id: c.id,
+            url: c.url,
+            title: if c.title.is_empty() { c.snippet.chars().take(80).collect() } else { c.title },
+            snippet: c.snippet,
+            source_engine: "crawl".to_string(),
+            fused_score: fused,
+            signals: RankSignals { fts_rank: f, vec_rank: None, pos_rank: None, click_boost },
+            source_table: "scraped_pages",
+            provenance: c.job,
+        });
+    }
 
     out.sort_by(|a, b| {
         b.fused_score
             .partial_cmp(&a.fused_score)
             .unwrap_or(std::cmp::Ordering::Equal)
-            // stable tiebreak so equal scores keep a deterministic order
+            // stable tiebreak across the two id spaces: source first, then id
+            .then(a.source_table.cmp(b.source_table))
             .then(a.page_id.cmp(&b.page_id))
     });
     out.truncate(limit);

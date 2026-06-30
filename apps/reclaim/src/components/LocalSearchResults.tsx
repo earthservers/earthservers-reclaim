@@ -29,6 +29,8 @@ interface ResultRow {
   fusedScore?: number;
   signals?: Signals;
   curated?: boolean;
+  sourceTable?: string;   // 'search_pages' | 'scraped_pages' (crawler)
+  provenance?: string | null; // crawl job name for crawler rows
   // local lifecycle state for optimistic UI
   pinned?: boolean;
   archived?: boolean;
@@ -37,7 +39,7 @@ interface ResultRow {
 
 interface ShallowEvt { queryId: number; candidate: { url: string; title: string; snippet: string; sourceEngine: string } }
 interface DeepEvt { queryId: number; page: { pageId: number; url: string; title: string; snippet: string; sourceEngine: string; cacheHit: boolean } }
-interface RankedEvt { queryId: number; ranked: Array<{ pageId: number; url: string; title: string; snippet: string; sourceEngine: string; fusedScore: number; signals: Signals }> }
+interface RankedEvt { queryId: number; ranked: Array<{ pageId: number; url: string; title: string; snippet: string; sourceEngine: string; fusedScore: number; signals: Signals; sourceTable: string; provenance: string | null }> }
 
 export function LocalSearchResults({
   profileId,
@@ -113,7 +115,7 @@ export function LocalSearchResults({
         if (!isActive(payload.queryId)) return;
         setPhase('ranking');
         for (const r of payload.ranked) {
-          upsertRow(r.url, { pageId: r.pageId, fusedScore: r.fusedScore, signals: r.signals, sourceEngine: r.sourceEngine },
+          upsertRow(r.url, { pageId: r.pageId, fusedScore: r.fusedScore, signals: r.signals, sourceEngine: r.sourceEngine, sourceTable: r.sourceTable, provenance: r.provenance },
             { url: r.url, title: r.title, snippet: r.snippet, sourceEngine: r.sourceEngine });
         }
         setRankedOrder(payload.ranked.map(r => r.url));
@@ -242,7 +244,10 @@ export function LocalSearchResults({
               <div className="flex items-center gap-2">
                 <span className="text-[var(--primary-color)] text-sm font-medium truncate">{row.title || row.url}</span>
                 <Badge label={row.sourceEngine} />
-                {row.cacheHit ? <Badge label="from local index" tone="green" /> : row.pageId != null ? <Badge label="freshly scraped" tone="blue" /> : null}
+                {row.sourceTable === 'scraped_pages'
+                  ? <Badge label={row.provenance ? `from crawl: ${row.provenance}` : 'from crawl'} tone="violet" />
+                  : row.cacheHit ? <Badge label="from local index" tone="green" />
+                  : row.pageId != null ? <Badge label="freshly scraped" tone="blue" /> : null}
                 {row.pinned && <Badge label="pinned" tone="amber" />}
                 {row.archived && <Badge label="archived" tone="gray" />}
                 {row.curated && <Badge label="curated" tone="violet" />}
@@ -255,16 +260,19 @@ export function LocalSearchResults({
                 </div>
               )}
             </div>
-            {/* Per-result actions. Favorite = the shared pin (single source of truth);
-                archive/forget are maintenance. Need a pageId (= indexed) for these. */}
-            {row.pageId != null && !row.archived && (
+            {/* Per-result actions. Favorite = the shared pin (single source of truth),
+                works for any URL (favoriting a crawler row scrapes+indexes it).
+                Archive/forget are search_pages-only maintenance — a crawler row's
+                page_id is a crawler rowid, not a search_pages id. */}
+            {!row.archived && (
               <div className="flex items-center gap-1 flex-shrink-0">
-                {/* Always-visible favorite pin so its state reads at a glance. */}
                 <FavoriteStar url={row.url} profileId={profileId} title={row.title} className="p-1.5" />
-                <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                  <IconBtn title="Archive (keep summary, drop body)" onClick={() => archive(row)} d="M4 7h16M6 7l1 12h10l1-12M9 11v5M15 11v5" />
-                  <IconBtn title="Forget (delete now)" tone="red" onClick={() => forget(row)} d="M6 18L18 6M6 6l12 12" />
-                </div>
+                {row.pageId != null && row.sourceTable !== 'scraped_pages' && (
+                  <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                    <IconBtn title="Archive (keep summary, drop body)" onClick={() => archive(row)} d="M4 7h16M6 7l1 12h10l1-12M9 11v5M15 11v5" />
+                    <IconBtn title="Forget (delete now)" tone="red" onClick={() => forget(row)} d="M6 18L18 6M6 6l12 12" />
+                  </div>
+                )}
               </div>
             )}
           </div>
