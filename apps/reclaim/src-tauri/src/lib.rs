@@ -2912,6 +2912,7 @@ pub fn run() {
             // Local search index (query-driven FTS5 + vector fusion)
             search_index::orchestrator::local_search,
             search_index::orchestrator::log_result_click,
+            search_index::orchestrator::list_search_sources,
             search_index::lifecycle::pin_result,
             search_index::lifecycle::archive_result,
             search_index::lifecycle::forget_result,

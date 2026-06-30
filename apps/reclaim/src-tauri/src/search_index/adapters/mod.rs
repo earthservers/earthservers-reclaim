@@ -9,6 +9,7 @@
 
 pub mod web;
 pub mod reddit;
+pub mod forums;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -121,6 +122,15 @@ pub fn host_of(url: &str) -> Option<String> {
         .and_then(|u| u.host_str().map(|h| h.trim_start_matches("www.").to_ascii_lowercase()))
 }
 
+/// Adapter descriptor surfaced to the UI's per-source picker.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdapterMeta {
+    pub id: String,
+    pub reliability: String, // "reliable" | "best-effort" | "fragile"
+    pub default_enabled: bool,
+}
+
 /// Registry of available adapters. Keyed lookup by id, host routing for fetch.
 pub struct AdapterRegistry {
     adapters: Vec<Arc<dyn SourceAdapter>>,
@@ -128,14 +138,27 @@ pub struct AdapterRegistry {
 }
 
 impl AdapterRegistry {
-    /// The default set: generic web (backstop) + Reddit.
+    /// The default set: generic web (backstop) + Reddit + Forums.
     pub fn default_set(searxng_url: Option<String>) -> Self {
         let web: Arc<dyn SourceAdapter> = Arc::new(web::GenericWebAdapter::new(searxng_url));
         let reddit: Arc<dyn SourceAdapter> = Arc::new(reddit::RedditAdapter::new());
+        let forums: Arc<dyn SourceAdapter> = Arc::new(forums::ForumAdapter::new());
         Self {
-            adapters: vec![web.clone(), reddit],
+            adapters: vec![web.clone(), reddit, forums],
             web,
         }
+    }
+
+    /// Metadata for every registered adapter (for the UI's per-source list).
+    pub fn meta(&self) -> Vec<AdapterMeta> {
+        self.adapters
+            .iter()
+            .map(|a| AdapterMeta {
+                id: a.id().to_string(),
+                reliability: a.reliability().to_string(),
+                default_enabled: a.default_enabled(),
+            })
+            .collect()
     }
 
     pub fn by_id(&self, id: &str) -> Option<Arc<dyn SourceAdapter>> {

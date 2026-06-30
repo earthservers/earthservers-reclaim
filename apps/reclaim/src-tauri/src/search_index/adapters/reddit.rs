@@ -11,10 +11,12 @@
 //! engine is only a third-tier backstop (it breaks when Reddit changes defenses),
 //! so direct JSON is primary here.
 
-use super::{Candidate, FetchedDoc, SourceAdapter};
+use super::{Candidate, FetchedDoc, Segment, SourceAdapter};
+use crate::search_index::kinds::ContentKind;
 use std::time::Duration;
 
 const MAX_BODY_WORDS: usize = 6000; // discussions are long; allow more than web
+const MAX_COMMENTS: usize = 100; // cap comments indexed per thread (top by score)
 
 pub struct RedditAdapter;
 
@@ -165,6 +167,92 @@ impl SourceAdapter for RedditAdapter {
     fn handles_host(&self, host: &str) -> bool {
         host == "reddit.com" || host == "old.reddit.com" || host.ends_with(".reddit.com")
     }
+
+    fn max_units(&self) -> usize {
+        MAX_COMMENTS
+    }
+
+    /// A thread → a `post` segment (title + selftext) plus a `comment` segment per
+    /// comment (flattened from the nested tree), top-by-score and capped.
+    async fn fetch_segments(&self, url: &str, max_units: usize) -> Result<Vec<Segment>, String> {
+        let json_url = thread_json_url(url);
+        let v = self.get_json(&json_url).await?;
+        let arr = v.as_array().ok_or("reddit: unexpected thread shape")?;
+
+        let post = arr
+            .first()
+            .and_then(|p| p["data"]["children"].as_array())
+            .and_then(|c| c.first())
+            .map(|c| &c["data"]);
+        let title = post.and_then(|p| p["title"].as_str()).unwrap_or("").to_string();
+        let selftext = post.and_then(|p| p["selftext"].as_str()).unwrap_or("");
+        let post_author = post.and_then(|p| p["author"].as_str()).map(|s| s.to_string());
+        let post_score = post.and_then(|p| p["score"].as_i64());
+
+        let mut segs: Vec<Segment> = Vec::new();
+        let post_text = if selftext.trim().is_empty() {
+            title.clone()
+        } else {
+            format!("{}\n\n{}", title, selftext)
+        };
+        segs.push(Segment {
+            kind: ContentKind::Post,
+            url: url.to_string(),
+            parent_url: None,
+            title: Some(title),
+            text: post_text,
+            author: post_author,
+            engagement: post_score,
+        });
+
+        let mut comments: Vec<Segment> = Vec::new();
+        if let Some(listing) = arr.get(1) {
+            collect_comments(listing, url, &mut comments);
+        }
+        // Top comments by score, capped.
+        comments.sort_by(|a, b| b.engagement.unwrap_or(0).cmp(&a.engagement.unwrap_or(0)));
+        comments.truncate(max_units.min(MAX_COMMENTS));
+        segs.extend(comments);
+        Ok(segs)
+    }
+}
+
+/// Recursively collect each comment as its own typed Segment (unique permalink URL
+/// for dedup; author + score carried). Skips "more" stubs.
+fn collect_comments(listing: &serde_json::Value, thread_url: &str, out: &mut Vec<Segment>) {
+    let children = match listing["data"]["children"].as_array() {
+        Some(c) => c,
+        None => return,
+    };
+    for child in children {
+        if child["kind"].as_str() == Some("more") {
+            continue;
+        }
+        let d = &child["data"];
+        if let Some(body) = d["body"].as_str() {
+            let body = body.trim();
+            if !body.is_empty() {
+                // Unique URL per comment so upsert dedup doesn't merge them.
+                let url = match d["permalink"].as_str() {
+                    Some(p) => format!("https://www.reddit.com{}", p),
+                    None => format!("{}#{}", thread_url, d["id"].as_str().unwrap_or("")),
+                };
+                out.push(Segment {
+                    kind: ContentKind::Comment,
+                    url,
+                    parent_url: Some(thread_url.to_string()),
+                    title: None,
+                    text: body.to_string(),
+                    author: d["author"].as_str().map(|s| s.to_string()),
+                    engagement: d["score"].as_i64(),
+                });
+            }
+        }
+        let replies = &d["replies"];
+        if replies.is_object() {
+            collect_comments(replies, thread_url, out);
+        }
+    }
 }
 
 /// Turn any reddit thread URL into its `.json` endpoint (idempotent; strips query).
@@ -294,5 +382,32 @@ mod tests {
     fn urlencode_basic() {
         assert_eq!(urlencode("a b&c"), "a%20b%26c");
         assert_eq!(urlencode("rust-lang_1.0~x"), "rust-lang_1.0~x");
+    }
+
+    #[test]
+    fn collect_comments_yields_typed_segments() {
+        let listing = serde_json::json!({
+            "data": { "children": [
+                { "kind": "t1", "data": {
+                    "author": "alice", "body": "top comment", "score": 12,
+                    "permalink": "/r/x/comments/p/_/c1",
+                    "replies": { "data": { "children": [
+                        { "kind": "t1", "data": { "author": "bob", "body": "nested reply", "score": 3,
+                            "permalink": "/r/x/comments/p/_/c2", "replies": "" } },
+                        { "kind": "more", "data": { "count": 9 } }
+                    ] } }
+                } }
+            ] }
+        });
+        let mut out = Vec::new();
+        collect_comments(&listing, "https://www.reddit.com/r/x/comments/p", &mut out);
+        assert_eq!(out.len(), 2, "comment + nested reply, 'more' skipped");
+        assert!(out.iter().all(|s| s.kind == ContentKind::Comment));
+        assert_eq!(out[0].author.as_deref(), Some("alice"));
+        assert_eq!(out[0].engagement, Some(12));
+        assert_eq!(out[0].url, "https://www.reddit.com/r/x/comments/p/_/c1");
+        assert_eq!(out[1].parent_url.as_deref(), Some("https://www.reddit.com/r/x/comments/p"));
+        // unique URLs so upsert won't merge them
+        assert_ne!(out[0].url, out[1].url);
     }
 }

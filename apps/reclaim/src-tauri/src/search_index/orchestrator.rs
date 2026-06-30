@@ -348,6 +348,13 @@ fn reuse_cached(meta: &store::PageMeta, ttl: Duration, now: i64) -> bool {
     fresh_by_ttl && not_expired
 }
 
+/// List available search sources + their reliability for the UI's per-source
+/// picker. (Built without a SearXNG URL — only metadata is read.)
+#[tauri::command(rename_all = "camelCase")]
+pub async fn list_search_sources() -> Result<Vec<super::adapters::AdapterMeta>, String> {
+    Ok(AdapterRegistry::default_set(None).meta())
+}
+
 /// Click-logging command: records the click (private personalization signal) and
 /// bumps the page's usage if it's in the index.
 #[tauri::command(rename_all = "camelCase")]
