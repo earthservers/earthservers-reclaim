@@ -2899,6 +2899,9 @@ pub fn run() {
             get_domain_categories,
             export_domains,
             import_domains,
+            // Local search index (query-driven FTS5 + vector fusion)
+            search_index::orchestrator::local_search,
+            search_index::orchestrator::log_result_click,
             // Memory commands (EarthMemory)
             get_indexed_pages,
             index_page,
