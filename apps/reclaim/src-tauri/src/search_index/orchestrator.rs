@@ -114,6 +114,7 @@ pub async fn local_search(
     limit: Option<usize>,
     searxng_url: Option<String>,
     kinds: Option<Vec<String>>,
+    page: Option<usize>,
 ) -> Result<i64, String> {
     let db_path = {
         let state = app.state::<std::sync::Mutex<crate::AppState>>();
@@ -142,10 +143,11 @@ pub async fn local_search(
     //    candidate as it arrives so the box is never empty. Dedup by URL.
     let discover_adapters = registry.discovery_adapters(&sources);
     let mut discover_futs = futures_util::stream::FuturesUnordered::new();
+    let page = page.unwrap_or(0);
     for adapter in discover_adapters {
         let q = query.clone();
         discover_futs.push(async move {
-            (adapter.id(), adapter.discover(&q, limit).await)
+            (adapter.id(), adapter.discover_page(&q, limit, page).await)
         });
     }
 

@@ -58,6 +58,23 @@ pub trait SourceAdapter: Send + Sync {
     /// Find candidate results for a query (shallow, fast).
     async fn discover(&self, query: &str, limit: usize) -> Result<Vec<Candidate>, String>;
 
+    /// Paginated discovery (0-based `page`) for "more results / next page". The
+    /// default serves page 0 via `discover` and returns nothing for later pages
+    /// (so non-paginating adapters don't re-emit the same results); adapters that
+    /// genuinely paginate (web/SearXNG) override this.
+    async fn discover_page(
+        &self,
+        query: &str,
+        limit: usize,
+        page: usize,
+    ) -> Result<Vec<Candidate>, String> {
+        if page == 0 {
+            self.discover(query, limit).await
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
     /// Fetch + clean a single document for indexing (deep).
     async fn fetch(&self, url: &str) -> Result<FetchedDoc, String>;
 

@@ -27,7 +27,11 @@ impl SourceAdapter for GenericWebAdapter {
     }
 
     async fn discover(&self, query: &str, limit: usize) -> Result<Vec<Candidate>, String> {
-        let results = crate::research::search(query, self.searxng_url.as_deref()).await?;
+        self.discover_page(query, limit, 0).await
+    }
+
+    async fn discover_page(&self, query: &str, limit: usize, page: usize) -> Result<Vec<Candidate>, String> {
+        let results = crate::research::search_paged(query, self.searxng_url.as_deref(), page).await?;
         Ok(results
             .into_iter()
             .take(limit)
@@ -39,7 +43,8 @@ impl SourceAdapter for GenericWebAdapter {
                 source_engine: "web".to_string(),
                 // SearXNG already aggregated cross-engine relevance; the position
                 // in the returned list IS that aggregated rank (lower = better).
-                searxng_pos: Some(i),
+                // Offset by page so later-page results rank after earlier ones.
+                searxng_pos: Some(page * limit + i),
             })
             .collect())
     }
