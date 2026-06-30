@@ -33,6 +33,20 @@ pub struct FetchedDoc {
     pub body: String,
 }
 
+/// A typed unit extracted from one item (a thread → post + many comments). Each
+/// segment becomes its own search_pages row tagged by kind, so "comments only" is
+/// a cheap filter and each comment is independently rankable.
+#[derive(Debug, Clone)]
+pub struct Segment {
+    pub kind: crate::search_index::kinds::ContentKind,
+    pub url: String,                // canonical URL for this unit (comment permalink if available)
+    pub parent_url: Option<String>, // the thread/video/post it belongs to
+    pub title: Option<String>,
+    pub text: String,               // already cleaned plain text
+    pub author: Option<String>,
+    pub engagement: Option<i64>,
+}
+
 #[async_trait::async_trait]
 pub trait SourceAdapter: Send + Sync {
     /// Stable id, e.g. "reddit", "web".
@@ -52,6 +66,41 @@ pub trait SourceAdapter: Send + Sync {
     /// generic web adapter returns false; host adapters (Reddit) match their hosts.
     fn handles_host(&self, _host: &str) -> bool {
         false
+    }
+
+    /// Cap on units (segments) indexed per item — top-N comments, etc. Prevents a
+    /// 1000-comment thread from exploding the index. 1 = single-doc adapters.
+    fn max_units(&self) -> usize {
+        1
+    }
+
+    /// Reliability label for the UI/logs: "reliable" | "best-effort" | "fragile".
+    fn reliability(&self) -> &'static str {
+        "reliable"
+    }
+
+    /// Whether this adapter is enabled by default (fragile ones default OFF).
+    fn default_enabled(&self) -> bool {
+        true
+    }
+
+    /// Fetch one item as typed SEGMENTS. The default yields a single `article`
+    /// segment from `fetch()`; comment/forum adapters override this to return a
+    /// post plus its comments. (We express the "CommentSource" capability as a
+    /// defaulted trait method rather than a sub-trait, since Rust trait objects
+    /// can't be downcast to a sub-trait without extra machinery — same capability,
+    /// no `as_any` plumbing.)
+    async fn fetch_segments(&self, url: &str, _max_units: usize) -> Result<Vec<Segment>, String> {
+        let doc = self.fetch(url).await?;
+        Ok(vec![Segment {
+            kind: crate::search_index::kinds::ContentKind::Article,
+            url: doc.url,
+            parent_url: None,
+            title: Some(doc.title),
+            text: doc.body,
+            author: None,
+            engagement: None,
+        }])
     }
 }
 

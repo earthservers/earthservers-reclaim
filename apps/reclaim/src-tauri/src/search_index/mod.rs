@@ -16,6 +16,7 @@
 
 pub mod schema;
 pub mod retention;
+pub mod kinds;
 pub mod adapters;
 pub mod embed;
 pub mod store;
@@ -230,7 +231,7 @@ mod integration {
         ).unwrap();
         drop(conn); // rank() opens its own connection by path
 
-        let ranked = super::rank::rank(&path, qid, "gizmo", 1, 20).await;
+        let ranked = super::rank::rank(&path, qid, "gizmo", 1, 20, None).await;
         let tables: Vec<&str> = ranked.iter().map(|r| r.source_table).collect();
         assert!(tables.contains(&"search_pages"), "sp result present");
         assert!(tables.contains(&"scraped_pages"), "crawler result fused in");
@@ -243,6 +244,41 @@ mod integration {
         assert_eq!(crawled.provenance.as_deref(), Some("docs crawl"));
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn content_kind_filter_scopes_candidates() {
+        use adapters::Segment;
+        use kinds::ContentKind;
+        let conn = db();
+        let qid = store::insert_query(&conn, "q", "cache", 100, 1).unwrap();
+        // An article via the normal path.
+        store::upsert_scraped(
+            &conn, 1, "https://a.test/article", "Art", "the article body widget", "s", Some(qid),
+            "web", None, "h0", "cache", 100, Some(700),
+        ).unwrap();
+        // A post + a comment via the segment path.
+        let post = Segment { kind: ContentKind::Post, url: "https://r.test/p".into(), parent_url: None,
+            title: Some("Post".into()), text: "the post body widget".into(), author: Some("op".into()), engagement: Some(42) };
+        let comment = Segment { kind: ContentKind::Comment, url: "https://r.test/p/c1".into(),
+            parent_url: Some("https://r.test/p".into()), title: None, text: "a comment about widget".into(),
+            author: Some("bob".into()), engagement: Some(7) };
+        store::upsert_segment(&conn, 1, &post, Some(qid), "reddit", "h1", "cache", 100, Some(700)).unwrap();
+        store::upsert_segment(&conn, 1, &comment, Some(qid), "reddit", "h2", "cache", 100, Some(700)).unwrap();
+
+        let all = store::candidate_pages(&conn, qid, None).unwrap();
+        assert_eq!(all.len(), 3);
+
+        let comments_only = store::candidate_pages(&conn, qid, Some(&["comment".to_string()])).unwrap();
+        assert_eq!(comments_only.len(), 1);
+        assert_eq!(comments_only[0].content_kind, "comment");
+        assert_eq!(comments_only[0].author.as_deref(), Some("bob"));
+
+        let preset: Vec<String> = kinds::COMMENTS_AND_DISCUSSIONS.iter().map(|s| s.to_string()).collect();
+        let disc = store::candidate_pages(&conn, qid, Some(&preset)).unwrap();
+        let got: std::collections::HashSet<String> = disc.iter().map(|p| p.content_kind.clone()).collect();
+        assert!(got.contains("post") && got.contains("comment"));
+        assert!(!got.contains("article"), "article excluded by the discussions preset");
     }
 
     #[test]

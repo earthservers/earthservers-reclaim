@@ -86,6 +86,7 @@ pub async fn rank(
     query_text: &str,
     profile_id: i64,
     limit: usize,
+    kinds: Option<&[String]>,
 ) -> Vec<RankedResult> {
     // ---- synchronous DB reads (no statement held across an await) ----
     let (candidates, fts_rank, pos_rank, embeddings, clicks, crawler_cands, crawler_fts_rank) = {
@@ -93,9 +94,11 @@ pub async fn rank(
             Ok(c) => c,
             Err(_) => return Vec::new(),
         };
-        let candidates = store::candidate_pages(&conn, query_id).unwrap_or_default();
+        let candidates = store::candidate_pages(&conn, query_id, kinds).unwrap_or_default();
         let id_set: std::collections::HashSet<i64> = candidates.iter().map(|c| c.id).collect();
         let expr = sanitize_fts_query(query_text);
+        // Crawler rows are all 'article'; only fan them in when articles are wanted.
+        let want_articles = kinds.map(|k| k.iter().any(|s| s == "article")).unwrap_or(true);
 
         // FTS ranking over search_pages, filtered to this query's candidates.
         let fts_rank: HashMap<i64, usize> = match &expr {
@@ -119,7 +122,7 @@ pub async fn rank(
         // ---- read-time fan-in of the crawler index (its own id space + FTS) ----
         let mut crawler_cands: Vec<super::crawler::CrawlerCand> = Vec::new();
         let mut crawler_fts_rank: HashMap<i64, usize> = HashMap::new();
-        if let Some(e) = &expr {
+        if let (true, Some(e)) = (want_articles, &expr) {
             let sp_urls: std::collections::HashSet<String> =
                 candidates.iter().map(|c| norm_url(&c.url)).collect();
             let ids = super::crawler::fts_rowids(&conn, e, CRAWLER_TOP_N).unwrap_or_default();
@@ -303,6 +306,10 @@ mod tests {
             snippet: String::new(),
             source_engine: "web".into(),
             searxng_pos: pos,
+            content_kind: "article".into(),
+            parent_url: None,
+            author: None,
+            engagement: None,
         }
     }
 }

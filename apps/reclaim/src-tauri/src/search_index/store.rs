@@ -15,6 +15,10 @@ pub struct StoredPage {
     pub snippet: String,
     pub source_engine: String,
     pub searxng_pos: Option<i64>,
+    pub content_kind: String,
+    pub parent_url: Option<String>,
+    pub author: Option<String>,
+    pub engagement: Option<i64>,
 }
 
 /// Lightweight metadata for the orchestrator's cache check.
@@ -153,13 +157,14 @@ pub fn upsert_embedding(
     Ok(())
 }
 
-/// All pages attached to a query, as the ranker/UI needs them.
-pub fn candidate_pages(conn: &Connection, query_id: i64) -> rusqlite::Result<Vec<StoredPage>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, url, title, COALESCE(snippet,''), COALESCE(source_engine,'web'), searxng_pos
-           FROM search_pages WHERE query_id = ?1",
-    )?;
-    let rows = stmt.query_map(params![query_id], |r| {
+/// All pages attached to a query, as the ranker/UI needs them, optionally filtered
+/// to a set of content_kinds ("comments only", etc.). `kinds = None` = all kinds.
+pub fn candidate_pages(
+    conn: &Connection,
+    query_id: i64,
+    kinds: Option<&[String]>,
+) -> rusqlite::Result<Vec<StoredPage>> {
+    let map = |r: &rusqlite::Row| -> rusqlite::Result<StoredPage> {
         Ok(StoredPage {
             id: r.get(0)?,
             url: r.get(1)?,
@@ -167,9 +172,87 @@ pub fn candidate_pages(conn: &Connection, query_id: i64) -> rusqlite::Result<Vec
             snippet: r.get(3)?,
             source_engine: r.get(4)?,
             searxng_pos: r.get(5)?,
+            content_kind: r.get(6)?,
+            parent_url: r.get(7)?,
+            author: r.get(8)?,
+            engagement: r.get(9)?,
         })
-    })?;
-    rows.collect()
+    };
+    const COLS: &str = "id, url, title, COALESCE(snippet,''), COALESCE(source_engine,'web'), \
+                        searxng_pos, COALESCE(content_kind,'article'), parent_url, author, engagement";
+    match kinds {
+        Some(ks) if !ks.is_empty() => {
+            // Dynamic IN-list of placeholders, bound positionally after query_id.
+            let placeholders = std::iter::repeat("?").take(ks.len()).collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT {COLS} FROM search_pages WHERE query_id = ?1 AND content_kind IN ({placeholders})"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let mut binds: Vec<&dyn rusqlite::ToSql> = vec![&query_id];
+            for k in ks {
+                binds.push(k);
+            }
+            let rows = stmt.query_map(binds.as_slice(), map)?;
+            rows.collect()
+        }
+        _ => {
+            let mut stmt =
+                conn.prepare(&format!("SELECT {COLS} FROM search_pages WHERE query_id = ?1"))?;
+            let rows = stmt.query_map(params![query_id], map)?;
+            rows.collect()
+        }
+    }
+}
+
+/// Insert/update one typed segment (post/comment/forum_*). Mirrors upsert_scraped's
+/// pinned-retention protection, and additionally writes the typed columns.
+#[allow(clippy::too_many_arguments)]
+pub fn upsert_segment(
+    conn: &Connection,
+    profile_id: i64,
+    seg: &super::adapters::Segment,
+    query_id: Option<i64>,
+    source_engine: &str,
+    content_hash: &str,
+    retention: &str,
+    now: i64,
+    expires_at: Option<i64>,
+) -> rusqlite::Result<i64> {
+    let title = seg.title.clone().unwrap_or_default();
+    let snippet: String = seg.text.split_whitespace().take(40).collect::<Vec<_>>().join(" ");
+    conn.execute(
+        "INSERT INTO search_pages
+            (url, title, body, query_id, source_engine, content_hash, fetched_at,
+             expires_at, retention, snippet, content_kind, parent_url, author, engagement,
+             last_opened_at, open_count, profile_id)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?7,0,?15)
+         ON CONFLICT(url, profile_id) DO UPDATE SET
+            title = excluded.title,
+            body = excluded.body,
+            query_id = COALESCE(excluded.query_id, search_pages.query_id),
+            source_engine = excluded.source_engine,
+            content_hash = excluded.content_hash,
+            fetched_at = excluded.fetched_at,
+            snippet = excluded.snippet,
+            content_kind = excluded.content_kind,
+            parent_url = excluded.parent_url,
+            author = excluded.author,
+            engagement = excluded.engagement,
+            retention = CASE WHEN search_pages.retention IN ('pinned','archived')
+                             THEN search_pages.retention ELSE excluded.retention END,
+            expires_at = CASE WHEN search_pages.retention IN ('pinned','archived')
+                              THEN search_pages.expires_at ELSE excluded.expires_at END",
+        params![
+            seg.url, title, seg.text, query_id, source_engine, content_hash, now, expires_at,
+            retention, snippet, seg.kind.as_str(), seg.parent_url, seg.author, seg.engagement,
+            profile_id
+        ],
+    )?;
+    conn.query_row(
+        "SELECT id FROM search_pages WHERE url = ?1 AND profile_id = ?2",
+        params![seg.url, profile_id],
+        |r| r.get(0),
+    )
 }
 
 /// FTS5 rowids for a MATCH expression, best-first (BM25 `rank` ascending = best).

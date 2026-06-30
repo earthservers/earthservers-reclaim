@@ -24,6 +24,8 @@ const REDDIT_SCRAPE_CONCURRENCY: usize = 2;
 /// Default candidate count and how many of the misses we actually scrape.
 const DEFAULT_LIMIT: usize = 20;
 const SCRAPE_TOP_N: usize = 10;
+/// Per-item cap on streamed comment deep-events (all are still indexed + ranked).
+const MAX_COMMENT_DEEP_EMIT: usize = 15;
 
 pub fn now_secs() -> i64 {
     SystemTime::now()
@@ -75,6 +77,9 @@ struct DeepPage {
     source_engine: String,
     /// true = served from the warm local index, false = freshly scraped now.
     cache_hit: bool,
+    content_kind: String,
+    parent_url: Option<String>,
+    author: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -108,6 +113,7 @@ pub async fn local_search(
     sources: Option<Vec<String>>,
     limit: Option<usize>,
     searxng_url: Option<String>,
+    kinds: Option<Vec<String>>,
 ) -> Result<i64, String> {
     let db_path = {
         let state = app.state::<std::sync::Mutex<crate::AppState>>();
@@ -118,6 +124,8 @@ pub async fn local_search(
     let tier = Retention::parse(&retention);
     let now = now_secs();
     let limit = limit.unwrap_or(DEFAULT_LIMIT).clamp(1, 50);
+    // Normalized content-kind filter (None = everything).
+    let kinds_filter = super::kinds::normalize(&kinds);
 
     // 1. Record the search; emit started so the UI learns query_id immediately.
     let query_id = {
@@ -200,6 +208,9 @@ pub async fn local_search(
                             snippet: c.snippet.clone(),
                             source_engine: c.source_engine.clone(),
                             cache_hit: true,
+                            content_kind: "article".to_string(),
+                            parent_url: None,
+                            author: None,
                         },
                     },
                 );
@@ -228,54 +239,82 @@ pub async fn local_search(
             };
             let adapter = registry.fetch_adapter(&c.url);
             let source_engine = adapter.id().to_string();
-            match adapter.fetch(&c.url).await {
-                Ok(doc) => {
-                    let hash = content_hash(&doc.body);
-                    let expires_at = tier.expires_at(now);
-                    let page_id = {
-                        let conn = match super::SearchIndexManager::open(&db_path) {
-                            Ok(c) => c,
-                            Err(e) => {
-                                log::warn!("[local_search] db open failed: {}", e);
-                                return;
-                            }
-                        };
-                        match store::upsert_scraped(
-                            &conn, profile_id, &doc.url, &doc.title, &doc.body, &c.snippet,
-                            Some(query_id), &source_engine, c.searxng_pos, &hash, tier.as_str(), now, expires_at,
-                        ) {
-                            Ok(id) => id,
-                            Err(e) => {
-                                log::warn!("[local_search] index {} failed: {}", doc.url, e);
-                                return;
-                            }
+            // One item may yield many typed segments (a thread → post + comments).
+            // Default adapters return a single 'article' segment, so the article
+            // path is unchanged.
+            let segments = match adapter.fetch_segments(&c.url, adapter.max_units()).await {
+                Ok(s) => s,
+                Err(e) => {
+                    // One failed fetch must not abort the batch — log and move on.
+                    log::warn!("[local_search] fetch {} failed: {}", c.url, e);
+                    return;
+                }
+            };
+            let expires_at = tier.expires_at(now);
+            let mut comment_emits = 0usize;
+            for seg in segments {
+                if seg.text.trim().is_empty() {
+                    continue;
+                }
+                let hash = content_hash(&seg.text);
+                let kind = seg.kind;
+                let page_id = {
+                    let conn = match super::SearchIndexManager::open(&db_path) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            log::warn!("[local_search] db open failed: {}", e);
+                            return;
                         }
                     };
-                    // Embed (async, best-effort). Skipped silently if Ollama is down.
-                    if let Some(vec) = super::embed::embed_text(&doc.body).await {
+                    match store::upsert_segment(
+                        &conn, profile_id, &seg, Some(query_id), &source_engine, &hash,
+                        tier.as_str(), now, expires_at,
+                    ) {
+                        Ok(id) => id,
+                        Err(e) => {
+                            log::warn!("[local_search] index {} failed: {}", seg.url, e);
+                            continue;
+                        }
+                    }
+                };
+                // Embed only substantial bodies (posts/articles) — embedding every
+                // comment via Ollama would be prohibitively slow; comments rank via
+                // FTS alone (RRF tolerates the missing vector signal).
+                use super::kinds::ContentKind;
+                if matches!(kind, ContentKind::Article | ContentKind::Post | ContentKind::ForumPost) {
+                    if let Some(vec) = super::embed::embed_text(&seg.text).await {
                         if let Ok(conn) = super::SearchIndexManager::open(&db_path) {
                             let _ = store::upsert_embedding(&conn, page_id, &vec);
                         }
                     }
-                    let _ = app.emit(
-                        "local-search-deep",
-                        DeepEvent {
-                            query_id,
-                            page: DeepPage {
-                                page_id,
-                                url: doc.url,
-                                title: doc.title,
-                                snippet: c.snippet,
-                                source_engine,
-                                cache_hit: false,
-                            },
+                }
+                // Stream deep results, but bound comment emits per item so a big
+                // thread doesn't flood the event bus (all segments are still indexed
+                // and surface in the final ranking).
+                let is_comment = matches!(kind, ContentKind::Comment | ContentKind::ForumComment);
+                if is_comment {
+                    comment_emits += 1;
+                    if comment_emits > MAX_COMMENT_DEEP_EMIT {
+                        continue;
+                    }
+                }
+                let _ = app.emit(
+                    "local-search-deep",
+                    DeepEvent {
+                        query_id,
+                        page: DeepPage {
+                            page_id,
+                            url: seg.url,
+                            title: seg.title.unwrap_or_default(),
+                            snippet: seg.text.split_whitespace().take(40).collect::<Vec<_>>().join(" "),
+                            source_engine: source_engine.clone(),
+                            cache_hit: false,
+                            content_kind: kind.as_str().to_string(),
+                            parent_url: seg.parent_url,
+                            author: seg.author,
                         },
-                    );
-                }
-                Err(e) => {
-                    // One failed fetch must not abort the batch — log and move on.
-                    log::warn!("[local_search] fetch {} failed: {}", c.url, e);
-                }
+                    },
+                );
             }
         });
     }
@@ -284,8 +323,10 @@ pub async fn local_search(
     // failure resolves to () inside the block, so join never aborts the batch.
     futures_util::future::join_all(deep_futs).await;
 
-    // 5. Fused ranking over this query's pages, then done.
-    let ranked = super::rank::rank(&db_path, query_id, &query, profile_id, limit).await;
+    // 5. Fused ranking over this query's pages (filtered to requested kinds), done.
+    let ranked = super::rank::rank(
+        &db_path, query_id, &query, profile_id, limit, kinds_filter.as_deref(),
+    ).await;
     let _ = app.emit("local-search-ranked", RankedEvent { query_id, ranked });
     let _ = app.emit("local-search-done", DoneEvent { query_id });
 

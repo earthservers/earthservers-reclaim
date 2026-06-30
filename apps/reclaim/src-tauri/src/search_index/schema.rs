@@ -23,6 +23,13 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
 const MIGRATIONS: &[&str] = &[
     "ALTER TABLE search_pages ADD COLUMN searxng_pos INTEGER",
     "ALTER TABLE search_pages ADD COLUMN snippet TEXT",
+    // Typed content (comments & discussions). content_kind makes "comments only" a
+    // cheap filter; each comment is its own independently-rankable row.
+    "ALTER TABLE search_pages ADD COLUMN content_kind TEXT NOT NULL DEFAULT 'article'",
+    "ALTER TABLE search_pages ADD COLUMN parent_url TEXT",
+    "ALTER TABLE search_pages ADD COLUMN author TEXT",
+    "ALTER TABLE search_pages ADD COLUMN engagement INTEGER",
+    "CREATE INDEX IF NOT EXISTS idx_search_kind ON search_pages(content_kind)",
 ];
 
 pub const SCHEMA_SQL: &str = r#"
@@ -46,9 +53,14 @@ CREATE TABLE IF NOT EXISTS search_pages (
   upstream_gone  INTEGER NOT NULL DEFAULT 0,     -- 1 = live URL now 404/410; protect local copy
   searxng_pos    INTEGER,                        -- aggregated SearXNG rank (lower = better), for the ranker
   snippet        TEXT,                           -- discover-time snippet, kept for display
+  content_kind   TEXT NOT NULL DEFAULT 'article',-- 'article'|'post'|'comment'|'forum_post'|'forum_comment'
+  parent_url     TEXT,                           -- thread/video/post a comment belongs to
+  author         TEXT,                           -- display only
+  engagement     INTEGER,                        -- like/score count, for ranking + top-N caps
   profile_id     INTEGER,                        -- per-profile isolation, matches the rest of the app
   UNIQUE(url, profile_id)
 );
+CREATE INDEX IF NOT EXISTS idx_search_kind ON search_pages(content_kind);
 CREATE INDEX IF NOT EXISTS idx_searchpages_hash   ON search_pages(content_hash);
 CREATE INDEX IF NOT EXISTS idx_searchpages_url    ON search_pages(url);
 CREATE INDEX IF NOT EXISTS idx_searchpages_expiry ON search_pages(retention, expires_at);
