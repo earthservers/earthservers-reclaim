@@ -2146,7 +2146,11 @@ async fn create_detached_window(
     .min_inner_size(800.0, 600.0)
     .decorations(false)
     .resizable(true)
-    .transparent(false);
+    .transparent(false)
+    // Match main's incognito context (tauri.conf.json) so the asset protocol
+    // resolves in packaged builds; otherwise WebKitGTK shows "The URL can't be
+    // shown" for this detached window.
+    .incognito(true);
 
     // Set position if provided (for drag-out to specific location)
     let builder = if let (Some(x), Some(y)) = (x, y) {
@@ -2409,6 +2413,14 @@ pub fn run() {
                 .maximized(true)
                 .decorations(false)
                 .transparent(false)
+                // MUST match the `main` window's `incognito: true` (tauri.conf.json).
+                // The app's asset protocol (tauri://localhost) is registered on the
+                // ephemeral web context that the incognito main window uses; a NON-
+                // incognito secondary window gets a different context with no handler
+                // → WebKitGTK shows "The URL can't be shown" (blank/white window) in
+                // packaged builds. Keeping every app window incognito is also the
+                // app's by-design posture.
+                .incognito(true)
                 .build()
             {
                 wire_media_drag_drop(&win);
@@ -2776,6 +2788,9 @@ pub fn run() {
                             .maximized(true)
                             .decorations(false)
                             .transparent(false)
+                            // Match main's incognito context so the asset protocol
+                            // resolves in packaged builds (see single_instance above).
+                            .incognito(true)
                             .build()
                             {
                                 wire_media_drag_drop(&win);
