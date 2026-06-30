@@ -4,6 +4,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { invoke } from '../lib/tauri';
 import { RatingBadge, RatingForm, RatingDisplay } from './RatingComponents';
+import { LocalSearchResults } from './LocalSearchResults';
 
 interface Domain {
   id: number | null;
@@ -62,6 +63,10 @@ export function DomainManager({ profileId, onOpenUrl }: DomainManagerProps) {
   const [categories, setCategories] = useState<string[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
   const [urlInput, setUrlInput] = useState('');
+  // Active local-search query (rendered inline below the bar). nonce re-runs the
+  // same query string on repeat Enter.
+  const [liveQuery, setLiveQuery] = useState('');
+  const [searchNonce, setSearchNonce] = useState(0);
   const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -248,20 +253,29 @@ export function DomainManager({ profileId, onOpenUrl }: DomainManagerProps) {
     ? domains.filter(d => d.category === selectedCategory)
     : domains;
 
-  // Open whatever is typed in the URL bar straight to a browser tab. Normalizes
-  // like the browser nav bar: a bare host gets https://; anything that isn't
-  // URL-shaped falls back to a DuckDuckGo search.
+  // A URL-shaped input (bare host or scheme) jumps straight to a browser tab; a
+  // free-text query runs the LOCAL search inline on this page (DuckDuckGo is still
+  // offered as an option in the results header, and via openInDuckDuckGo).
+  const isUrlShaped = (raw: string) =>
+    /^https?:\/\//i.test(raw) || raw.startsWith('earth://') || (raw.includes('.') && !raw.includes(' '));
+
   const goToUrl = () => {
     const raw = urlInput.trim();
     if (!raw) return;
-    let target = raw;
-    if (!/^https?:\/\//i.test(raw) && !raw.startsWith('earth://')) {
-      target = raw.includes('.') && !raw.includes(' ')
-        ? `https://${raw}`
-        : `https://duckduckgo.com/?q=${encodeURIComponent(raw)}`;
+    if (isUrlShaped(raw)) {
+      const target = /^https?:\/\//i.test(raw) || raw.startsWith('earth://') ? raw : `https://${raw}`;
+      onOpenUrl?.(target, { fromAddressBar: true });
+      setUrlInput('');
+      return;
     }
-    onOpenUrl?.(target, { fromAddressBar: true });
-    setUrlInput('');
+    // Free-text query → local search inline (bump nonce to re-run if unchanged).
+    setLiveQuery(raw);
+    setSearchNonce(n => n + 1);
+  };
+
+  // Escape hatch the user asked to keep: open the query on DuckDuckGo in a tab.
+  const openInDuckDuckGo = (q: string) => {
+    onOpenUrl?.(`https://duckduckgo.com/?q=${encodeURIComponent(q)}`, { fromAddressBar: true });
   };
 
   if (!profileId) {
@@ -321,6 +335,18 @@ export function DomainManager({ profileId, onOpenUrl }: DomainManagerProps) {
           </svg>
         </button>
       </div>
+
+      {/* Inline local search results (a clicked result navigates this page away). */}
+      {liveQuery && (
+        <LocalSearchResults
+          profileId={profileId}
+          query={liveQuery}
+          searchNonce={searchNonce}
+          onOpenUrl={onOpenUrl}
+          onClear={() => setLiveQuery('')}
+          onOpenInDuckDuckGo={openInDuckDuckGo}
+        />
+      )}
 
       {/* Error Banner */}
       {error && (
