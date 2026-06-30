@@ -17,8 +17,10 @@
 pub mod schema;
 pub mod retention;
 pub mod adapters;
+pub mod embed;
+pub mod store;
+pub mod rank;
 // Added incrementally as later phases land:
-//   pub mod rank;         // Phase 5
 //   pub mod gc;           // Phase 6
 //   pub mod orchestrator; // Phase 4
 //   pub mod curate;       // Phase 7

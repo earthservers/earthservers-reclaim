@@ -7,11 +7,23 @@
 
 use rusqlite::Connection;
 
-/// Apply (or re-apply) the full search-index schema.
+/// Apply (or re-apply) the full search-index schema, then any forward-only column
+/// migrations for databases created by an earlier version of this schema.
 pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(SCHEMA_SQL)?;
+    for stmt in MIGRATIONS {
+        // Idempotent: "duplicate column" errors on already-migrated DBs are fine.
+        let _ = conn.execute(stmt, []);
+    }
     Ok(())
 }
+
+/// Forward-only ALTERs. New installs already have these columns from SCHEMA_SQL;
+/// these only matter for a DB created by an earlier build of this feature.
+const MIGRATIONS: &[&str] = &[
+    "ALTER TABLE search_pages ADD COLUMN searxng_pos INTEGER",
+    "ALTER TABLE search_pages ADD COLUMN snippet TEXT",
+];
 
 pub const SCHEMA_SQL: &str = r#"
 -- One row per scraped/indexed page in the QUERY-DRIVEN index. Separate from the
@@ -32,6 +44,8 @@ CREATE TABLE IF NOT EXISTS search_pages (
   open_count     INTEGER NOT NULL DEFAULT 0,
   pinned_at      INTEGER,                        -- when promoted to pinned
   upstream_gone  INTEGER NOT NULL DEFAULT 0,     -- 1 = live URL now 404/410; protect local copy
+  searxng_pos    INTEGER,                        -- aggregated SearXNG rank (lower = better), for the ranker
+  snippet        TEXT,                           -- discover-time snippet, kept for display
   profile_id     INTEGER,                        -- per-profile isolation, matches the rest of the app
   UNIQUE(url, profile_id)
 );
