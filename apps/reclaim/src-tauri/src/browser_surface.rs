@@ -900,13 +900,23 @@ pub(crate) mod imp {
 
     /// Handle a `reclaimVault` message from a page: relay autofill requests and
     /// login captures to the frontend (which owns profile + unlock context).
-    fn handle_vault_message(app: &tauri::AppHandle, jr: &webkit2gtk::JavascriptResult) {
+    ///
+    /// `real_url` is the page's REAL committed URL, read from the sending webview
+    /// by the connecting closure — the page cannot influence it. The `origin`
+    /// field inside the message is page-controlled and therefore UNTRUSTED: a
+    /// malicious page can call this handler directly with any string. We compute
+    /// the authoritative origin from `real_url` and use it for every
+    /// security-relevant relay; the page-supplied origin is only used to detect (and
+    /// audit) a forgery attempt. This is what makes a cross-origin fill impossible:
+    /// the prompt and the eventual fill are bound to the page actually on screen.
+    fn handle_vault_message(app: &tauri::AppHandle, jr: &webkit2gtk::JavascriptResult, real_url: Option<&str>) {
         use tauri::Emitter;
         let json = jr.js_value().map(|v| v.to_string()).unwrap_or_default();
         #[derive(serde::Deserialize)]
         struct Msg {
             #[serde(rename = "type")]
             kind: String,
+            #[serde(default)]
             origin: String,
             #[serde(default)]
             username: String,
@@ -919,19 +929,49 @@ pub(crate) mod imp {
             Ok(m) => m,
             Err(_) => return,
         };
+
+        // Authoritative origin = scheme://host of the page actually loaded. Without
+        // a real http(s) URL we cannot bind safely, so we refuse credential relays.
+        let real_url = match real_url {
+            Some(u) if u.starts_with("http://") || u.starts_with("https://") => u,
+            _ => {
+                // about:blank, data:, no-uri, etc. — never relay credentials.
+                return;
+            }
+        };
+        let real_host = host_of(real_url);
+        if real_host.is_empty() {
+            return;
+        }
+        // Flag (and audit) a page that tried to forge a different origin. The action
+        // still proceeds, but BOUND TO THE REAL ORIGIN, so the forgery yields nothing.
+        if !msg.origin.is_empty() && host_of(&msg.origin) != real_host {
+            crate::security::audit::deny(
+                None,
+                crate::security::audit::Action::OriginMismatch,
+                Some(&real_host),
+                Some("autofill-bridge"),
+                &format!("page claimed origin '{}' but is really '{}'", msg.origin, real_host),
+            );
+        }
+        // The single origin we trust downstream, derived from the real URL.
+        let origin = real_url.to_string();
+
         match msg.kind.as_str() {
             "autofill-request" => {
-                let _ = app.emit("autofill-request", AutofillEvent { origin: msg.origin });
+                let _ = app.emit("autofill-request", AutofillEvent { origin });
             }
             "autosave" => {
-                set_pending_autosave(msg.origin.clone(), msg.username.clone(), msg.password);
+                set_pending_autosave(origin.clone(), msg.username.clone(), msg.password);
                 let _ = app.emit(
                     "autofill-save-request",
-                    AutosaveEvent { origin: msg.origin, username: msg.username },
+                    AutosaveEvent { origin, username: msg.username },
                 );
             }
             "media-list" => {
-                let _ = app.emit("media-list", MediaListEvent { origin: msg.origin, items: msg.items });
+                // Media enumeration is not credential-sensitive; the real origin is
+                // still the honest label for the page the media came from.
+                let _ = app.emit("media-list", MediaListEvent { origin, items: msg.items });
             }
             _ => {}
         }
@@ -1053,6 +1093,21 @@ pub(crate) mod imp {
                     }
                 }
                 wire_downloads(app, &web_context);
+                // [BOUNDARY] Turn on WebKitGTK's built-in bubblewrap + seccomp-bpf
+                // sandbox for the web-content (and network) processes. This is the
+                // real containment for an exploited renderer: it can't make syscalls
+                // outside the whitelist or touch the filesystem outside the granted
+                // paths. Enabled unless explicitly disabled for debugging. We do NOT
+                // turn this off for convenience.
+                if std::env::var("RECLAIM_WEBKIT_SANDBOX").as_deref() != Ok("0") {
+                    web_context.set_sandbox_enabled(true);
+                    // Grant read access to the bundled NoScript extension dir so the
+                    // sandboxed web process can still load it.
+                    if let Some(dir) = NOSCRIPT_EXT_DIR.lock().ok().and_then(|g| g.clone()) {
+                        web_context.add_path_to_sandbox(std::path::Path::new(&dir), true);
+                    }
+                    eprintln!("[security] WebKitGTK sandbox enabled (bubblewrap + seccomp)");
+                }
                 web_context
             }
         };
@@ -1086,16 +1141,14 @@ pub(crate) mod imp {
         }
         {
             let a = app.clone();
-            ucm.connect_script_message_received(Some("reclaimVault"), move |_ucm, jr| {
-                handle_vault_message(&a, jr);
-            });
-        }
-        {
-            let a = app.clone();
             ucm.connect_script_message_received(Some("reclaimCurator"), move |_ucm, jr| {
                 handle_curator_message(&a, jr);
             });
         }
+        // NOTE: the `reclaimVault` handler is connected AFTER the webview is built
+        // (below) so it can capture the webview and read the page's REAL committed
+        // origin, instead of trusting the page-supplied `origin` field (which any
+        // page can forge by calling the message handler directly).
 
         let webview = webkit2gtk::WebView::builder()
             .web_context(&web_context)
@@ -1111,6 +1164,19 @@ pub(crate) mod imp {
             if let Ok(cfg) = PRIVACY_CONFIG.lock() {
                 apply_privacy_settings(&settings, &cfg);
             }
+        }
+
+        // Autofill/autosave bridge handler — connected here (post-build) so it can
+        // read the REAL committed origin from this webview. The origin a page puts
+        // in its message is treated as an untrusted hint only; security decisions
+        // use `wv.uri()`, which the page cannot forge.
+        {
+            let a = app.clone();
+            let wv = webview.clone();
+            ucm.connect_script_message_received(Some("reclaimVault"), move |_ucm, jr| {
+                let real_url = webkit2gtk::WebViewExt::uri(&wv).map(|s| s.to_string());
+                handle_vault_message(&a, jr, real_url.as_deref());
+            });
         }
 
         // NoScript: relay each observed request origin to the frontend.
@@ -1304,6 +1370,12 @@ pub(crate) mod imp {
             use webkit2gtk::WebViewExt;
             wv.run_javascript(&script, None::<&gtk::gio::Cancellable>, |_| {});
         });
+    }
+
+    /// The X11 surface's latest committed URL (authoritative origin source for the
+    /// fallback embed), tracked from the WebKit load/title signals. Thread-safe.
+    pub(crate) fn active_surface_url() -> Option<String> {
+        LATEST_URL.lock().ok().and_then(|g| g.clone())
     }
 
     /// XMoveResizeWindow on the surface's XID.
@@ -2042,6 +2114,20 @@ pub async fn browser_surface_reload() -> Result<(), String> {
 #[tauri::command(rename_all = "camelCase")]
 pub async fn browser_surface_destroy() -> Result<(), String> {
     imp::destroy().await
+}
+
+/// The authoritative URL of the page currently on screen, read from the live
+/// webview the backend controls — NOT from any page- or frontend-supplied value.
+/// This is the page a fill would actually inject into, so binding the vault's
+/// credential lookup to this origin makes cross-origin autofill structurally
+/// impossible (a page claiming `bank.com` cannot pull a `bank.com` credential
+/// while it is really served from `evil.com`). Routed to whichever embed is active.
+pub fn active_page_url() -> Option<String> {
+    if crate::browser_overlay::enabled() {
+        crate::browser_overlay::active_page_url()
+    } else {
+        imp::active_surface_url()
+    }
 }
 
 /// Fill the active page's login form via the injected `__reclaimFill`. Values are

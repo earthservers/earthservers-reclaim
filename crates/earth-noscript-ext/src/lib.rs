@@ -91,7 +91,6 @@ pub fn web_extension_initialize(extension: &WebExtension) {
 
             // Report newly seen origins to the UI (origin + first-party flag).
             if seen.borrow_mut().insert(origin.clone()) {
-                eprintln!("[noscript-ext] seen origin: {origin} (first_party={is_first_party})");
                 let payload = (origin.clone(), is_first_party).to_variant();
                 let m = UserMessage::new("noscript:seen", Some(&payload));
                 page.send_message_to_view(&m, None::<&gio::Cancellable>, |_res| {});

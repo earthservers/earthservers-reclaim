@@ -165,20 +165,31 @@ pub async fn download_video_ytdlp(
     let out_template = dir.join("%(title)s.%(ext)s").to_string_lossy().to_string();
 
     let url_for_proc = url.clone();
+    // Confine the downloader: it may only WRITE inside the downloads dir (+ tmp),
+    // can't gain privileges, and can't ptrace/inspect other processes. [BOUNDARY]
+    let confine_dir = dir.to_string_lossy().to_string();
     let output = tauri::async_runtime::spawn_blocking(move || {
-        std::process::Command::new("yt-dlp")
-            .arg("--no-playlist")
+        let mut cmd = std::process::Command::new("yt-dlp");
+        cmd.arg("--no-playlist")
             .arg("--no-progress")
             .arg("--print")
             .arg("after_move:filepath")
             .arg("-o")
             .arg(&out_template)
-            .arg(&url_for_proc)
-            .output()
+            .arg(&url_for_proc);
+        crate::security::sandbox::confine_command(
+            &mut cmd,
+            &crate::security::sandbox::HelperProfile::downloader(&confine_dir),
+        );
+        cmd.output()
     })
     .await
     .map_err(|e| e.to_string())?
     .map_err(|e| format!("failed to run yt-dlp (is it installed?): {}", e))?;
+
+    // Surface abnormal termination (seccomp SIGSYS / hardened_malloc SIGABRT /
+    // crash) to the Security monitor as "a component was contained/killed".
+    crate::security::monitor::note_helper_exit("yt-dlp", &output.status);
 
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr);

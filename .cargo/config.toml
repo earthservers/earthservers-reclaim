@@ -1,0 +1,46 @@
+# Compile-time hardening [HARDENING] for everything Reclaim builds.
+#
+# Applied workspace-wide so the flags are consistent across the app, the helper
+# crates, and the C/C++ dependencies (bundled SQLite, etc.). Kept to flags that
+# work on the STABLE toolchain the CI uses; the nightly-only extras (Rust stack
+# protector, CET via cf-protection for Rust) are documented at the bottom as an
+# opt-in rather than silently required.
+
+[target.'cfg(target_os = "linux")']
+rustflags = [
+    # Full RELRO + immediate binding: the GOT is mapped read-only after startup,
+    # closing the classic GOT-overwrite technique.
+    "-C", "link-arg=-Wl,-z,relro,-z,now",
+    # Non-executable stack (defense against stack-based shellcode).
+    "-C", "link-arg=-Wl,-z,noexecstack",
+    # Mark the binary so the loader knows it wants these protections.
+    "-C", "link-arg=-Wl,-z,separate-code",
+]
+# NOTE on PIE/ASLR: rustc already produces position-independent executables on
+# Linux by default, so full ASLR is in effect for the binary. No flag needed.
+
+# C/C++ dependencies (bundled SQLite via rusqlite, anything else built by `cc`).
+# `cc`/most -sys build scripts honor CFLAGS/CXXFLAGS. force = false so a user's own
+# CFLAGS wins; CI has a clean env, so the hardening applies there.
+#  -O2                       : also makes _FORTIFY_SOURCE effective (and silences
+#                              its "requires optimization" warning) in debug builds.
+#  -D_FORTIFY_SOURCE=3       : strongest libc fortification of buffer ops.
+#  -fstack-protector-strong  : stack canaries on functions with buffers.
+#  -fstack-clash-protection  : probe the stack so a guard-page jump can't be skipped.
+#  -fcf-protection=full      : Intel CET (shadow stack + IBT) for the C code; your
+#                              Zen CPU supports CET shadow stack. Harmless on CPUs
+#                              without it (the instructions are NOPs).
+[env]
+CFLAGS = { value = "-O2 -D_FORTIFY_SOURCE=3 -fstack-protector-strong -fstack-clash-protection -fcf-protection=full", force = false }
+CXXFLAGS = { value = "-O2 -D_FORTIFY_SOURCE=3 -fstack-protector-strong -fstack-clash-protection -fcf-protection=full", force = false }
+
+# ----------------------------------------------------------------------------
+# OPT-IN (nightly toolchain) — Rust-side stack protector + CET. These flags are
+# nightly-only, so they are NOT in the default rustflags above (CI uses stable).
+# To build a maximally-hardened binary on nightly:
+#
+#   RUSTFLAGS="$RUSTFLAGS -Z stack-protector=all -Z cf-protection=full" \
+#     cargo +nightly build --release
+#
+# Detect support before relying on it; glibc/kernel/toolchain CET coverage varies.
+# ----------------------------------------------------------------------------

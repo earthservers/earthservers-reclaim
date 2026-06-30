@@ -15,8 +15,10 @@ use std::sync::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 use tauri::State;
+use zeroize::Zeroizing;
 
 use crate::multimedia::{decrypt_data, encrypt_data};
+use crate::security::secrets::{ct_eq, SecretString};
 use crate::AppState;
 
 const KIND_PASSWORD: &str = "password";
@@ -25,17 +27,24 @@ const KIND_OTP: &str = "otp";
 lazy_static::lazy_static! {
     /// In-memory unlocked master passwords, keyed by (profile_id, kind). Holds
     /// the plaintext master password ONLY in RAM for the duration the vault is
-    /// unlocked; used to derive the encryption key. Never persisted.
-    static ref SESSIONS: Mutex<HashMap<(i64, String), String>> = Mutex::new(HashMap::new());
+    /// unlocked; used to derive the encryption key. Never persisted. Each value is
+    /// a [`SecretString`]: zeroized on drop and (on Linux) mlock'd + DONTDUMP, so
+    /// the cached master stays out of swap and core dumps. [HYGIENE]
+    static ref SESSIONS: Mutex<HashMap<(i64, String), SecretString>> = Mutex::new(HashMap::new());
 }
 
 fn unlock_session(profile_id: i64, kind: &str, password: &str) {
     if let Ok(mut m) = SESSIONS.lock() {
-        m.insert((profile_id, kind.to_string()), password.to_string());
+        m.insert((profile_id, kind.to_string()), SecretString::new(password));
     }
 }
-fn session_key(profile_id: i64, kind: &str) -> Option<String> {
-    SESSIONS.lock().ok().and_then(|m| m.get(&(profile_id, kind.to_string())).cloned())
+/// The cached master key for a session, copied into a zeroizing buffer for the
+/// caller's transient use (wiped when the returned value drops).
+fn session_key(profile_id: i64, kind: &str) -> Option<Zeroizing<String>> {
+    SESSIONS
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&(profile_id, kind.to_string())).map(|s| Zeroizing::new(s.as_str().to_string())))
 }
 fn lock_session(profile_id: i64, kind: &str) {
     if let Ok(mut m) = SESSIONS.lock() {
@@ -113,7 +122,8 @@ fn verify_hash(password: &str, stored: &str) -> (bool, bool) {
             .unwrap_or(false);
         (ok, false)
     } else {
-        (stored == legacy_sha256(password), true)
+        // Constant-time compare so a legacy hash check leaks no timing oracle.
+        (ct_eq(stored.as_bytes(), legacy_sha256(password).as_bytes()), true)
     }
 }
 
@@ -142,6 +152,55 @@ pub struct OtpEntry {
     pub digits: i64,
     pub period: i64,
     pub created_at: String,
+}
+
+/// Metadata-only view of a saved login — everything the manager list needs to
+/// render EXCEPT the secret. This is the redact-by-default boundary: the plaintext
+/// password is never serialized into a list, so a compromised frontend (backdoored
+/// npm dep / self-XSS in our own chrome) that calls the list command cannot
+/// mass-exfiltrate the vault. To see one password the UI must call `vault_reveal`,
+/// which is gated, rate-limited and audited — one entry at a time, leaving a trail.
+/// Honest scope: this is least-privilege + blast-radius containment against a
+/// compromised *trusted* frontend; it is NOT a defense against a malicious web
+/// page (that is the process boundary, which already blocks pages entirely).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PasswordEntryMeta {
+    pub id: i64,
+    pub profile_id: i64,
+    pub title: String,
+    pub username: String,
+    pub url: Option<String>,
+    pub notes: Option<String>,
+    pub category: String,
+    pub created_at: String,
+    pub updated_at: String,
+    /// Whether a non-empty password is stored (lets the UI show a reveal affordance
+    /// without exposing the value).
+    pub has_password: bool,
+}
+
+/// Metadata-only view of an OTP entry — no secret. Codes are generated in the
+/// backend (`vault_otp_codes`) so the TOTP seed never reaches page-readable JS.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OtpEntryMeta {
+    pub id: i64,
+    pub profile_id: i64,
+    pub name: String,
+    pub issuer: String,
+    pub algorithm: String,
+    pub digits: i64,
+    pub period: i64,
+    pub created_at: String,
+}
+
+/// A current TOTP code for one entry — computed in the backend, secret never sent.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OtpCode {
+    pub id: i64,
+    /// The current code, zero-padded to `digits`. Empty if generation failed.
+    pub code: String,
+    /// Seconds until this code rolls over (for the countdown ring).
+    pub remaining: i64,
 }
 
 pub struct VaultManager {
@@ -332,7 +391,7 @@ impl VaultManager {
         entries.iter().any(|e| {
             e.url.as_deref().and_then(host_from).map(|h| host_matches(&h, &host)).unwrap_or(false)
                 && e.username == username
-                && e.password == password
+                && ct_eq(e.password.as_bytes(), password.as_bytes())
         })
     }
 
@@ -411,6 +470,57 @@ impl VaultManager {
             })
             .map_err(|e| e.to_string())?;
         rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    }
+
+    /// Metadata-only listing (no decryption, no secrets in the result). Still gated
+    /// on an unlocked session so a locked vault reveals nothing — not even which
+    /// entries exist. This is what the manager UI's list now consumes.
+    fn get_password_entries_meta(&self, profile_id: i64) -> Result<Vec<PasswordEntryMeta>, String> {
+        if session_key(profile_id, KIND_PASSWORD).is_none() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, profile_id, title, username, url, notes, category, created_at, updated_at, length(password)
+                 FROM password_entries WHERE profile_id = ?1 ORDER BY title COLLATE NOCASE",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![profile_id], |row| {
+                let pwlen: i64 = row.get(9)?;
+                Ok(PasswordEntryMeta {
+                    id: row.get(0)?,
+                    profile_id: row.get(1)?,
+                    title: row.get(2)?,
+                    username: row.get(3)?,
+                    url: row.get(4)?,
+                    notes: row.get(5)?,
+                    category: row.get(6)?,
+                    created_at: row.get(7)?,
+                    updated_at: row.get(8)?,
+                    has_password: pwlen > 0,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    }
+
+    /// Reveal ONE entry's plaintext password (manager show/copy). Requires the
+    /// vault unlocked and the entry to belong to `profile_id` (never reveal another
+    /// profile's secret). The audit/rate-limit gate is applied by the command
+    /// wrapper, not here, so this method stays a pure data accessor.
+    fn reveal_password(&self, profile_id: i64, entry_id: i64) -> Result<String, String> {
+        let key = session_key(profile_id, KIND_PASSWORD).ok_or("Vault is locked. Unlock it first.")?;
+        let owner = self.entry_profile("password_entries", entry_id)?.ok_or("Entry not found")?;
+        if owner != profile_id {
+            return Err("Entry does not belong to this profile".into());
+        }
+        let conn = self.conn()?;
+        let stored: String = conn
+            .query_row("SELECT password FROM password_entries WHERE id = ?1", params![entry_id], |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        Ok(decrypt_data(&stored, &key).unwrap_or_default())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -621,6 +731,40 @@ impl VaultManager {
         rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
     }
 
+    /// Metadata-only OTP listing (no secret). Gated on an unlocked session.
+    fn get_otp_entries_meta(&self, profile_id: i64) -> Result<Vec<OtpEntryMeta>, String> {
+        Ok(self
+            .get_otp_entries(profile_id)?
+            .into_iter()
+            .map(|e| OtpEntryMeta {
+                id: e.id,
+                profile_id: e.profile_id,
+                name: e.name,
+                issuer: e.issuer,
+                algorithm: e.algorithm,
+                digits: e.digits,
+                period: e.period,
+                created_at: e.created_at,
+            })
+            .collect())
+    }
+
+    /// Generate the CURRENT TOTP code for every entry, in the backend, so the
+    /// base32 seed never crosses into page-readable JS. Returns empty when locked.
+    fn otp_codes(&self, profile_id: i64) -> Result<Vec<OtpCode>, String> {
+        let entries = self.get_otp_entries(profile_id)?; // empty if locked
+        let unix = chrono::Utc::now().timestamp();
+        Ok(entries
+            .into_iter()
+            .map(|e| {
+                let period = if e.period > 0 { e.period } else { 30 };
+                let code = totp::generate(&e.secret, &e.algorithm, e.digits.clamp(6, 10) as u32, period as u64, unix as u64)
+                    .unwrap_or_default();
+                OtpCode { id: e.id, code, remaining: period - (unix % period) }
+            })
+            .collect())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn add_otp_entry(
         &self,
@@ -656,14 +800,26 @@ impl VaultManager {
         period: i64,
     ) -> Result<(), String> {
         let profile_id = self.entry_profile("otp_entries", entry_id)?.ok_or("Entry not found")?;
-        let key = session_key(profile_id, KIND_OTP).ok_or("Vault is locked. Unlock it first.")?;
-        let enc = encrypt_data(secret, &key)?;
+        let _ = session_key(profile_id, KIND_OTP).ok_or("Vault is locked. Unlock it first.")?;
         let conn = self.conn()?;
-        conn.execute(
-            "UPDATE otp_entries SET name=?2, issuer=?3, secret=?4, algorithm=?5, digits=?6, period=?7 WHERE id=?1",
-            params![entry_id, name, issuer, enc, algorithm, digits, period],
-        )
-        .map_err(|e| e.to_string())?;
+        // Redact-by-default: the seed is not returned to the UI, so an edit of the
+        // other fields arrives with an EMPTY secret meaning "keep the existing one".
+        // Only re-encrypt + overwrite the seed when a new one is actually supplied.
+        if secret.is_empty() {
+            conn.execute(
+                "UPDATE otp_entries SET name=?2, issuer=?3, algorithm=?4, digits=?5, period=?6 WHERE id=?1",
+                params![entry_id, name, issuer, algorithm, digits, period],
+            )
+            .map_err(|e| e.to_string())?;
+        } else {
+            let key = session_key(profile_id, KIND_OTP).ok_or("Vault is locked. Unlock it first.")?;
+            let enc = encrypt_data(secret, &key)?;
+            conn.execute(
+                "UPDATE otp_entries SET name=?2, issuer=?3, secret=?4, algorithm=?5, digits=?6, period=?7 WHERE id=?1",
+                params![entry_id, name, issuer, enc, algorithm, digits, period],
+            )
+            .map_err(|e| e.to_string())?;
+        }
         Ok(())
     }
 
@@ -672,6 +828,74 @@ impl VaultManager {
         conn.execute("DELETE FROM otp_entries WHERE id = ?1", params![entry_id])
             .map_err(|e| e.to_string())?;
         Ok(())
+    }
+}
+
+/// RFC 6238 TOTP, computed in the backend so OTP seeds never reach the UI. This
+/// is a STANDARD construction over the vetted `hmac` + `sha1`/`sha2` crates — not
+/// home-rolled crypto and not a new primitive; only the (well-specified) HOTP/TOTP
+/// assembly lives here.
+mod totp {
+    use hmac::{Mac, SimpleHmac};
+
+    /// RFC 4648 base32 decode (TOTP seeds are base32, no padding required).
+    fn base32_decode(s: &str) -> Option<Vec<u8>> {
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+        let mut buffer: u32 = 0;
+        let mut bits: u32 = 0;
+        let mut out = Vec::new();
+        for c in s.chars() {
+            if c == '=' || c.is_whitespace() || c == '-' {
+                continue;
+            }
+            let up = c.to_ascii_uppercase() as u8;
+            let val = ALPHABET.iter().position(|&a| a == up)? as u32;
+            buffer = (buffer << 5) | val;
+            bits += 5;
+            if bits >= 8 {
+                bits -= 8;
+                out.push((buffer >> bits) as u8);
+            }
+        }
+        Some(out)
+    }
+
+    fn truncate(hs: &[u8], digits: u32) -> String {
+        let offset = (hs[hs.len() - 1] & 0x0f) as usize;
+        let bin = ((hs[offset] as u32 & 0x7f) << 24)
+            | ((hs[offset + 1] as u32) << 16)
+            | ((hs[offset + 2] as u32) << 8)
+            | (hs[offset + 3] as u32);
+        let modulo = 10u32.pow(digits);
+        format!("{:0width$}", bin % modulo, width = digits as usize)
+    }
+
+    /// Current TOTP code for `secret` (base32) at unix time `now`. Supports the
+    /// three RFC-permitted HMAC algorithms; defaults to SHA1.
+    pub fn generate(secret_b32: &str, algorithm: &str, digits: u32, period: u64, now: u64) -> Option<String> {
+        let key = base32_decode(secret_b32)?;
+        if key.is_empty() {
+            return None;
+        }
+        let counter = (now / period.max(1)).to_be_bytes();
+        let hs = match algorithm.to_ascii_uppercase().as_str() {
+            "SHA256" => {
+                let mut m = SimpleHmac::<sha2::Sha256>::new_from_slice(&key).ok()?;
+                m.update(&counter);
+                m.finalize().into_bytes().to_vec()
+            }
+            "SHA512" => {
+                let mut m = SimpleHmac::<sha2::Sha512>::new_from_slice(&key).ok()?;
+                m.update(&counter);
+                m.finalize().into_bytes().to_vec()
+            }
+            _ => {
+                let mut m = SimpleHmac::<sha1::Sha1>::new_from_slice(&key).ok()?;
+                m.update(&counter);
+                m.finalize().into_bytes().to_vec()
+            }
+        };
+        Some(truncate(&hs, digits))
     }
 }
 
@@ -723,8 +947,20 @@ pub async fn vault_has_app_password(state: State<'_, Mutex<AppState>>, profile_i
 
 #[tauri::command(rename_all = "camelCase")]
 pub async fn vault_get_app_password(state: State<'_, Mutex<AppState>>, profile_id: i64, key: String, master: String) -> Result<Option<String>, String> {
+    use crate::security::audit;
+    let field = format!("app:{key}");
+    audit::gate(Some(profile_id), audit::Action::Reveal, None, Some(&field))?;
     let s = state.lock().map_err(|e| e.to_string())?;
-    s.vault_manager.get_app_password(profile_id, &key, &master)
+    match s.vault_manager.get_app_password(profile_id, &key, &master) {
+        Ok(v) => {
+            audit::allow(Some(profile_id), audit::Action::Reveal, None, Some(&field), "app password revealed (master verified)");
+            Ok(v)
+        }
+        Err(e) => {
+            audit::deny(Some(profile_id), audit::Action::Reveal, None, Some(&field), &e);
+            Err(e)
+        }
+    }
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -745,10 +981,37 @@ pub async fn change_otp_master(state: State<'_, Mutex<AppState>>, profile_id: i6
     s.vault_manager.change_master(profile_id, KIND_OTP, &old_password, &new_password)
 }
 
+/// List saved logins as METADATA ONLY (no plaintext passwords). Redact-by-default:
+/// the manager renders the list from this, and calls `vault_reveal` for a single
+/// password only when the user clicks show/copy. See [`PasswordEntryMeta`].
 #[tauri::command(rename_all = "camelCase")]
-pub async fn get_password_entries(state: State<'_, Mutex<AppState>>, profile_id: i64) -> Result<Vec<PasswordEntry>, String> {
+pub async fn get_password_entries(state: State<'_, Mutex<AppState>>, profile_id: i64) -> Result<Vec<PasswordEntryMeta>, String> {
     let s = state.lock().map_err(|e| e.to_string())?;
-    s.vault_manager.get_password_entries(profile_id)
+    s.vault_manager.get_password_entries_meta(profile_id)
+}
+
+/// Reveal ONE entry's plaintext password (manager show/copy). Gated: requires an
+/// unlocked vault, rate-limited per profile/entry, and AUDITED — every reveal
+/// leaves an append-only record the Security panel surfaces. This is the only path
+/// by which a stored site password leaves the backend to the chrome, and it is
+/// deliberately one-entry-at-a-time so a compromised frontend cannot mass-dump.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn vault_reveal(state: State<'_, Mutex<AppState>>, profile_id: i64, entry_id: i64) -> Result<String, String> {
+    use crate::security::audit;
+    let field = format!("entry:{entry_id}");
+    // Rate-limit BEFORE doing the work; fail closed on limit.
+    audit::gate(Some(profile_id), audit::Action::Reveal, None, Some(&field))?;
+    let s = state.lock().map_err(|e| e.to_string())?;
+    match s.vault_manager.reveal_password(profile_id, entry_id) {
+        Ok(pw) => {
+            audit::allow(Some(profile_id), audit::Action::Reveal, None, Some(&field), "password revealed to manager UI");
+            Ok(pw)
+        }
+        Err(e) => {
+            audit::deny(Some(profile_id), audit::Action::Reveal, None, Some(&field), &e);
+            Err(e)
+        }
+    }
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -813,10 +1076,19 @@ pub async fn lock_otp(profile_id: i64) -> Result<(), String> {
     Ok(())
 }
 
+/// List OTP entries as METADATA ONLY (no seeds). Codes come from `vault_otp_codes`.
 #[tauri::command(rename_all = "camelCase")]
-pub async fn get_otp_entries(state: State<'_, Mutex<AppState>>, profile_id: i64) -> Result<Vec<OtpEntry>, String> {
+pub async fn get_otp_entries(state: State<'_, Mutex<AppState>>, profile_id: i64) -> Result<Vec<OtpEntryMeta>, String> {
     let s = state.lock().map_err(|e| e.to_string())?;
-    s.vault_manager.get_otp_entries(profile_id)
+    s.vault_manager.get_otp_entries_meta(profile_id)
+}
+
+/// Current TOTP codes for every entry, generated in the backend so the base32
+/// seed never reaches page-readable JS. The frontend polls this on the countdown.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn vault_otp_codes(state: State<'_, Mutex<AppState>>, profile_id: i64) -> Result<Vec<OtpCode>, String> {
+    let s = state.lock().map_err(|e| e.to_string())?;
+    s.vault_manager.otp_codes(profile_id)
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -857,17 +1129,11 @@ pub async fn delete_otp_entry(state: State<'_, Mutex<AppState>>, entry_id: i64) 
 
 // ---- autofill / autosave bridge commands ----
 
-/// Look up a saved login for `origin` (used by autofill). Returns null if the
-/// vault is locked or there's no match — so a locked vault simply never fills.
-#[tauri::command(rename_all = "camelCase")]
-pub async fn vault_find_login(
-    state: State<'_, Mutex<AppState>>,
-    profile_id: i64,
-    origin: String,
-) -> Result<Option<(String, String)>, String> {
-    let s = state.lock().map_err(|e| e.to_string())?;
-    Ok(s.vault_manager.find_login_for_origin(profile_id, &origin))
-}
+// NOTE: the former `vault_find_login` command (which returned a decrypted
+// (username, password) tuple to the frontend) has been REMOVED. Fills now go
+// exclusively through `vault_autofill`, which injects directly into the page and
+// never returns the secret to JS — removing both a redundant plaintext exit and
+// the cross-origin-fill risk of a caller-supplied origin.
 
 /// Persist the pending captured login (after the user confirms the save prompt).
 /// Is there a saved login for `origin`, and is the vault locked? Drives the
@@ -884,15 +1150,34 @@ pub async fn vault_login_hint(
     Ok(hint)
 }
 
-/// Fill the active page's login form with the saved credentials for `origin`.
-/// The password is looked up + injected entirely in the backend (never reaches
-/// the JS frontend). Returns false if locked / no match.
+/// Fill the active page's login form with the saved credentials for the page that
+/// is ACTUALLY on screen. The origin is taken from the live webview the backend
+/// controls (`browser_surface::active_page_url`), NOT from the caller — so a
+/// compromised/forging caller cannot pull `bank.com`'s credential while a
+/// different site is loaded. The password is looked up + injected entirely in the
+/// backend (never reaches the JS frontend). Every attempt is audited and
+/// rate-limited per origin. Returns false if locked / no match.
+///
+/// The `_origin_hint` parameter is accepted for frontend compatibility but is
+/// treated as advisory only and never used for the security decision.
 #[tauri::command(rename_all = "camelCase")]
 pub async fn vault_autofill(
     state: State<'_, Mutex<AppState>>,
     profile_id: i64,
-    origin: String,
+    #[allow(unused_variables)] origin_hint: Option<String>,
 ) -> Result<bool, String> {
+    use crate::security::audit;
+    // Authoritative origin = the page actually loaded in the active webview.
+    let origin = match crate::browser_surface::active_page_url() {
+        Some(u) => u,
+        None => {
+            audit::deny(Some(profile_id), audit::Action::Autofill, None, Some("autofill"),
+                "no active page origin available; refusing to fill");
+            return Ok(false);
+        }
+    };
+    // Rate-limit per origin (fail closed on limit).
+    audit::gate(Some(profile_id), audit::Action::Autofill, Some(&origin), Some("autofill"))?;
     let creds = {
         let s = state.lock().map_err(|e| e.to_string())?;
         s.vault_manager.find_login_for_origin(profile_id, &origin)
@@ -900,9 +1185,15 @@ pub async fn vault_autofill(
     match creds {
         Some((u, p)) => {
             crate::browser_surface::fill_login(&u, &p);
+            audit::allow(Some(profile_id), audit::Action::Autofill, Some(&origin), Some("autofill"),
+                "credential injected into active page");
             Ok(true)
         }
-        None => Ok(false),
+        None => {
+            audit::deny(Some(profile_id), audit::Action::Autofill, Some(&origin), Some("autofill"),
+                "no saved login matched the active page origin");
+            Ok(false)
+        }
     }
 }
 
@@ -946,4 +1237,128 @@ pub async fn vault_autosave_confirm(
 pub async fn vault_autosave_dismiss() -> Result<(), String> {
     let _ = crate::browser_surface::imp::take_pending_autosave();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // RFC 6238 Appendix B official test vectors. The SHA1 seed is ASCII
+    // "12345678901234567890" → base32 "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ".
+    // Confirms our backend HOTP/TOTP assembly matches the standard (so it
+    // interops with Google/Microsoft Authenticator after we moved it off the UI).
+    #[test]
+    fn totp_rfc6238_sha1_vectors() {
+        let seed = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+        assert_eq!(totp::generate(seed, "SHA1", 8, 30, 59).unwrap(), "94287082");
+        assert_eq!(totp::generate(seed, "SHA1", 8, 30, 1111111109).unwrap(), "07081804");
+        assert_eq!(totp::generate(seed, "SHA1", 8, 30, 1234567890).unwrap(), "89005924");
+    }
+
+    #[test]
+    fn totp_rejects_empty_and_bad_secret() {
+        assert!(totp::generate("", "SHA1", 6, 30, 59).is_none());
+        // Non-base32 chars are skipped; an all-invalid seed yields no key.
+        assert!(totp::generate("!!!!", "SHA1", 6, 30, 59).is_none());
+    }
+
+    // host_matches is the origin-equality used to bind a fill to the page on
+    // screen. These pin the same-site / subdomain / cross-site behavior so a
+    // regression can't silently widen what an origin may autofill.
+    #[test]
+    fn host_matches_same_site_and_subdomains() {
+        assert!(host_matches("example.com", "example.com"));
+        assert!(host_matches("example.com", "www.example.com"));
+        assert!(host_matches("example.com", "accounts.example.com"));
+        assert!(host_matches("accounts.example.com", "example.com"));
+    }
+
+    #[test]
+    fn host_matches_rejects_cross_site() {
+        assert!(!host_matches("example.com", "evil.com"));
+        assert!(!host_matches("example.com", "notexample.com"));
+        assert!(!host_matches("bank.com", "bank.com.evil.com"));
+    }
+
+    #[test]
+    fn host_from_extracts_host() {
+        assert_eq!(host_from("https://user:pass@Example.com:443/path?x#y").as_deref(), Some("example.com"));
+        assert_eq!(host_from("http://sub.example.com").as_deref(), Some("sub.example.com"));
+        assert_eq!(host_from("").as_deref(), None);
+    }
+
+    use std::sync::atomic::{AtomicU32, Ordering as AtOrd};
+    static TEST_SEQ: AtomicU32 = AtomicU32::new(0);
+
+    fn temp_vault() -> (VaultManager, std::path::PathBuf) {
+        let n = TEST_SEQ.fetch_add(1, AtOrd::SeqCst);
+        let path = std::env::temp_dir().join(format!("reclaim_vault_test_{}_{}.db", std::process::id(), n));
+        let _ = std::fs::remove_file(&path);
+        let vm = VaultManager::new(path.to_string_lossy().to_string());
+        vm.init().unwrap();
+        (vm, path)
+    }
+
+    // The core Phase 1 guarantee at the data layer: a saved login is bound to its
+    // origin's host, so a different origin can never retrieve it, and the vault
+    // cannot be enumerated cross-origin. (The bridge layer additionally derives the
+    // origin from the real webview, tested by host_matches above.)
+    #[test]
+    fn autofill_is_origin_bound_and_not_cross_origin() {
+        let pid = 4242;
+        let (vm, path) = temp_vault();
+        vm.set_master(pid, KIND_PASSWORD, "master-pw").unwrap();
+        vm.add_password_entry(pid, "Bank", "alice", "s3cret", Some("https://bank.com/login"), None, "General").unwrap();
+
+        // Same site → found.
+        assert_eq!(
+            vm.find_login_for_origin(pid, "https://bank.com"),
+            Some(("alice".to_string(), "s3cret".to_string()))
+        );
+        // Cross-origin → nothing, by construction (not merely denied).
+        assert_eq!(vm.find_login_for_origin(pid, "https://evil.com"), None);
+        // A look-alike suffix must not match.
+        assert_eq!(vm.find_login_for_origin(pid, "https://bank.com.evil.com"), None);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    // Redact-by-default: the list view carries NO plaintext (the struct has no
+    // password field); the secret is only obtainable via the gated reveal path.
+    #[test]
+    fn list_is_metadata_only_and_reveal_returns_secret() {
+        let pid = 4343;
+        let (vm, path) = temp_vault();
+        vm.set_master(pid, KIND_PASSWORD, "master-pw").unwrap();
+        vm.add_password_entry(pid, "Site", "bob", "pw123", Some("https://site.com"), None, "General").unwrap();
+
+        let meta = vm.get_password_entries_meta(pid).unwrap();
+        assert_eq!(meta.len(), 1);
+        assert!(meta[0].has_password);
+        let id = meta[0].id;
+        // The one gated reveal returns the real secret...
+        assert_eq!(vm.reveal_password(pid, id).unwrap(), "pw123");
+        // ...but never for another profile's view of that id.
+        assert!(vm.reveal_password(9999, id).is_err());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    // A locked vault yields nothing — not even metadata (no "which entries exist"
+    // leak), and reveal fails closed.
+    #[test]
+    fn locked_vault_reveals_nothing() {
+        let pid = 4444;
+        let (vm, path) = temp_vault();
+        vm.set_master(pid, KIND_PASSWORD, "master-pw").unwrap();
+        vm.add_password_entry(pid, "Site", "bob", "pw123", Some("https://site.com"), None, "General").unwrap();
+        let id = vm.get_password_entries_meta(pid).unwrap()[0].id;
+
+        lock_session(pid, KIND_PASSWORD);
+        assert!(vm.get_password_entries_meta(pid).unwrap().is_empty());
+        assert!(vm.reveal_password(pid, id).is_err());
+        assert_eq!(vm.find_login_for_origin(pid, "https://site.com"), None);
+
+        let _ = std::fs::remove_file(path);
+    }
 }

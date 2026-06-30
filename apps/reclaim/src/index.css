@@ -52,6 +52,13 @@ body {
   background: var(--background-gradient, linear-gradient(135deg, #0a0a0f 0%, #1a1a2e 100%)) !important;
 }
 
+/* Hide the mouse cursor over the media view while it's idle. Uses !important so it
+   beats the WebKitGTK `button { cursor: pointer }` rules below — otherwise the
+   cursor would stay visible whenever it happened to rest over a control. */
+.media-cursor-idle, .media-cursor-idle * {
+  cursor: none !important;
+}
+
 /* WebKitGTK fix: backdrop-filter can break click events */
 /* Force all buttons and interactive elements to be clickable */
 button, a, input, select, [role="button"], .cursor-pointer {

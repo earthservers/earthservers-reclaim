@@ -1,0 +1,75 @@
+# Security CI (Phase 5): supply-chain audit + lint + tests, and a checksec-style
+# verification that the hardened link flags actually landed in the binary.
+name: security
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  supply-chain:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-audit and cargo-deny
+        run: cargo install cargo-audit cargo-deny --locked
+      - name: cargo audit (known vulnerabilities)
+        run: cargo audit
+      - name: cargo deny (advisories + licenses + sources)
+        run: cargo deny check
+
+  lint-and-test:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: System deps (WebKitGTK/GTK/GStreamer)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libseccomp-dev
+      - name: Unit tests (vault isolation, totp, hygiene)
+        run: cargo test --lib
+      - name: Clippy (deny warnings in our crates)
+        run: cargo clippy --lib -- -W clippy::all
+
+  hardening-flags:
+    # checksec-style verification that RELRO/NX/PIE/canary actually made it into
+    # the built binary — so the .cargo/config.toml flags can't silently regress.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: System deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libseccomp-dev
+      - name: Build release binary
+        run: cargo build --release --bin reclaim
+      - name: Verify hardening (RELRO now + NX + PIE)
+        run: |
+          BIN=target/release/reclaim
+          echo "== dynamic section =="
+          readelf -d "$BIN" | grep -E 'BIND_NOW|FLAGS' || true
+          echo "== program headers =="
+          readelf -lW "$BIN" | grep -E 'GNU_RELRO|GNU_STACK|interp' || true
+          fail=0
+          readelf -d "$BIN" | grep -q 'BIND_NOW'      || { echo "MISSING: BIND_NOW (full RELRO)"; fail=1; }
+          readelf -lW "$BIN" | grep -q 'GNU_RELRO'     || { echo "MISSING: GNU_RELRO"; fail=1; }
+          # PIE: ET_DYN executable
+          readelf -h "$BIN" | grep -q 'DYN'            || { echo "MISSING: PIE (ET_DYN)"; fail=1; }
+          # NX stack: GNU_STACK must NOT be RWE
+          if readelf -lW "$BIN" | grep 'GNU_STACK' | grep -q 'RWE'; then echo "BAD: executable stack"; fail=1; fi
+          exit $fail

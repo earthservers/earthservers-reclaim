@@ -2,6 +2,7 @@
 // Video, Image, Audio player with split view support and optional history
 
 import { useState, useEffect, useCallback, useRef } from 'react';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 import { invoke, listen, emitTo, isTauri } from '../../lib/tauri';
 import VideoPlayer from './VideoPlayer';
 import ImageViewer from './ImageViewer';
@@ -204,6 +205,49 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
   const fullscreenHeaderTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
 
+  // Per-window namespace for BACKEND player IDs. "New Window" opens additional app
+  // windows that all share the global GStreamer player manager / video surfaces /
+  // controls server, so each window must use distinct pane player IDs — prefix them
+  // with this window's label (e.g. "main::pane-0"). DOM event names (media-*-pane-N)
+  // stay index-based since each window has its own DOM/event bus.
+  const [winLabel, setWinLabel] = useState<string>(() => {
+    try { return isTauri() ? (getCurrentWindow().label || 'main') : 'main'; }
+    catch { return 'main'; }
+  });
+  // The BACKEND is authoritative for the window label — getCurrentWindow().label in
+  // JS proved unreliable across "New Window" instances (it collapsed to "main", so
+  // a second window's controls drove the first). Correct it as soon as we know, and
+  // gate all backend pushes on `winReady` so a second window never pushes state under
+  // the wrong ("main") label before the real one resolves.
+  const [winReady, setWinReady] = useState<boolean>(() => !isTauri());
+  useEffect(() => {
+    if (!isTauri()) return;
+    invoke<string>('media_window_label')
+      .then((l) => { if (l) setWinLabel(l); })
+      .catch(() => {})
+      .finally(() => setWinReady(true));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  // Always-current mirror for mount-only listeners/closures (they'd otherwise
+  // capture the pre-correction label).
+  const winLabelRef = useRef(winLabel);
+  winLabelRef.current = winLabel;
+  const panePid = useCallback((i: number) => `${winLabel}::pane-${i}`, [winLabel]);
+  // Extract the pane index from a (possibly namespaced) player id like "main::pane-2".
+  const paneIndexOf = useCallback((id: string | null | undefined) => {
+    const m = (id || '').match(/pane-(\d+)/);
+    return m ? parseInt(m[1], 10) : 0;
+  }, []);
+
+  // Tell the backend to drop this window's controls state when it unloads, so the
+  // status broadcast stops polling a now-dead player and the maps don't leak.
+  useEffect(() => {
+    if (!isTauri()) return;
+    const onUnload = () => { invoke('forget_media_window', { window: winLabelRef.current }).catch(() => {}); };
+    window.addEventListener('beforeunload', onUnload);
+    return () => window.removeEventListener('beforeunload', onUnload);
+  }, []);
+
   // Playback state for floating controls
   const [playbackState, setPlaybackState] = useState({
     isPlaying: false,
@@ -288,12 +332,29 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
   // Mirror shuffle + repeat state to the backend so the floating media controls
   // reflect (and stay in sync with) it via the status broadcast.
   useEffect(() => {
-    if (!isTauri()) return;
+    if (!isTauri() || !winReady) return;
     invoke('set_media_playback_flags', {
+      window: winLabel,
       isShuffled: playbackState.isShuffled,
       repeatMode: playbackState.repeatMode,
     }).catch(() => {});
-  }, [playbackState.isShuffled, playbackState.repeatMode]);
+  }, [playbackState.isShuffled, playbackState.repeatMode, winLabel, winReady]);
+
+  // Mirror the ACTIVE pane's media title to the backend so the floating controls
+  // can show it (the backend's own GStreamer-tag title is usually empty for local
+  // files). Driven by activePane + its media, so it follows the focused video.
+  useEffect(() => {
+    if (!isTauri() || !winReady) return;
+    const title = mediaItems[activePane]?.title || '';
+    invoke('set_media_active_title', { window: winLabel, title }).catch(() => {});
+  }, [activePane, mediaItems, winLabel, winReady]);
+
+  // Mirror fullscreen state to the backend so the floating controls can show an
+  // exit-fullscreen button (the DOM exit affordance is occluded by the video).
+  useEffect(() => {
+    if (!isTauri() || !winReady) return;
+    invoke('set_media_fullscreen', { window: winLabel, isFullscreen }).catch(() => {});
+  }, [isFullscreen, winLabel, winReady]);
 
   // When the layout changes (queue panel opens/closes, fullscreen toggles), the
   // video panes resize. Nudge a window 'resize' after the DOM settles so every
@@ -315,37 +376,38 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
   useEffect(() => {
     let mounted = true;
 
-    if (isTauri()) {
-      console.log('[EarthMultiMedia] Component mounting - showing video surfaces');
-      // Show all video surfaces that might exist from previous session
-      // Use requestAnimationFrame + setTimeout to avoid blocking the UI thread
+    // CRITICAL: do NOT touch any native surface until we know THIS window's real
+    // label (winReady). Otherwise a second window, whose label is briefly the
+    // initial getCurrentWindow() value, would hide/show surfaces under the wrong
+    // ("main") namespace — unmapping the FIRST window's actively-playing surface and
+    // crashing the WebKit/GStreamer pipeline. Always use winLabelRef.current (the
+    // confirmed label), never a captured panePid.
+    if (isTauri() && winReady) {
+      const surfPid = (i: number) => `${winLabelRef.current}::pane-${i}`;
       const showSurfaces = () => {
         const showOne = async (i: number) => {
           if (!mounted || i >= 4) return;
-          const playerId = `pane-${i}`;
-          // Only re-show a surface if THIS pane currently holds video/audio.
-          // Otherwise a stale surface from a previous session (left hidden, not
-          // destroyed) would re-map as a black box over an empty pane when you
-          // return to the Media tab.
-          const m = mediaItems[i];
+          const m = mediaItemsRef.current[i];
           const hasMedia = !!m && (m.type === 'video' || m.type === 'audio');
-          try {
-            // Use Promise.race with a timeout to prevent blocking
-            await Promise.race([
-              invoke(hasMedia ? 'show_video_surface' : 'hide_video_surface', { playerId }),
-              new Promise((_, reject) => setTimeout(() => reject('timeout'), 100))
-            ]);
-          } catch {
-            // Surface might not exist yet or timed out, that's fine
+          // ONLY ever SHOW panes that actually hold media. Never hide on mount: a
+          // freshly-opened window has no stale surfaces to clear, and hiding under a
+          // shared namespace would unmap ANOTHER window's live surface and crash it.
+          if (hasMedia) {
+            try {
+              await Promise.race([
+                invoke('show_video_surface', { playerId: surfPid(i) }),
+                new Promise((_, reject) => setTimeout(() => reject('timeout'), 100))
+              ]);
+            } catch {
+              // Surface might not exist yet or timed out, that's fine
+            }
           }
-          // Use requestAnimationFrame for smoother UI
           requestAnimationFrame(() => {
             if (mounted) setTimeout(() => showOne(i + 1), 20);
           });
         };
         showOne(0);
       };
-      // Delay initial show to let the component render first
       requestAnimationFrame(() => {
         if (mounted) setTimeout(showSurfaces, 100);
       });
@@ -353,20 +415,16 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
 
     return () => {
       mounted = false;
-      if (isTauri()) {
-        console.log('[EarthMultiMedia] Component unmounting - hiding surfaces (keeping playback in background)');
-        // Only hide video surfaces - keep players running in background
-        // Use fire-and-forget to avoid blocking unmount
+      if (isTauri() && winReady) {
         for (let i = 0; i < 4; i++) {
-          const playerId = `pane-${i}`;
-          invoke('hide_video_surface', { playerId }).catch(() => {});
+          invoke('hide_video_surface', { playerId: `${winLabelRef.current}::pane-${i}` }).catch(() => {});
         }
       }
     };
-  }, []);
+  }, [winReady]);
 
   // Track which player is currently active (last clicked/interacted with)
-  const [activePlayerId, setActivePlayerId] = useState<string>('pane-0');
+  const [activePlayerId, setActivePlayerId] = useState<string>(`${winLabel}::pane-0`);
   // Mirror so the (mount-only) control-action listener targets the CURRENT active
   // player instead of the value captured at mount — without it the floating
   // controls always drove pane-0.
@@ -386,6 +444,9 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
   // pane stuck after a couple of advances.
   const playedItemsRef = useRef(playedItems);
   const paneStatesRef = useRef(paneStates);
+  // Stable handle to the idle-auto-hide "activity" pinger, so the mount-only
+  // control-action listener can call it without a forward reference.
+  const markMediaActivityRef = useRef<(() => void) | undefined>(undefined);
 
   // Keep refs in sync with state
   useEffect(() => {
@@ -404,26 +465,29 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
   // mirror that into activePlayerId so the controls retarget to that pane's
   // player. Each pane's playerId is `pane-${index}`.
   useEffect(() => {
-    setActivePlayerId(`pane-${activePane}`);
-  }, [activePane]);
+    setActivePlayerId(panePid(activePane));
+  }, [activePane, panePid]);
 
   // Tell the backend which player the floating controls should drive. The
   // controls talk to a WebSocket server that broadcasts ONE player's status and
   // routes commands to it — so without this the controls are stuck on pane-0.
+  //
+  // Only claim the shared (cross-window) active player when THIS window actually has
+  // media — otherwise merely opening an empty second window would hijack the active
+  // player to its empty pane-0 and freeze the controls that another window is driving.
   useEffect(() => {
-    if (!isTauri()) return;
+    if (!isTauri() || !winReady) return;
+    const hasMedia = mediaItems.some(Boolean) || queue.length > 0;
+    if (!hasMedia) return;
     invoke('set_active_media_player', { playerId: activePlayerId }).catch(() => {});
-  }, [activePlayerId]);
+  }, [activePlayerId, winReady, mediaItems, queue]);
 
   // Create X11 webview controls window with HTML controls
   // This creates a GTK window with WebKitGTK that loads the /media-controls route
   useEffect(() => {
-    console.log('[EarthMultiMedia] Controls effect RUNNING');
     if (!isTauri()) {
-      console.log('[EarthMultiMedia] Not in Tauri, skipping controls setup');
       return;
     }
-    console.log('[EarthMultiMedia] In Tauri, proceeding with controls setup');
 
     let mounted = true;
     const unlisteners: (() => void)[] = [];
@@ -433,14 +497,24 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
 
     // Listen for control actions from the floating controls window
     const setupEventListeners = async () => {
-      const unlisten = await listen<{ action: string; playerId?: string; volume?: number; time?: number }>('media-control-action', async (event) => {
+      // Frontend-state control actions (shuffle/repeat/playlist/skip/exit-fullscreen)
+      // arrive as a DOM CustomEvent eval'd by the backend straight into THIS window's
+      // webview (see dispatch_media_control_action in lib.rs). A broadcast Tauri event
+      // never reached a 2nd window's listener, so the controls couldn't drive it. No
+      // window filter is needed — the backend already targeted the right webview.
+      const onControlAction = (e: Event) => {
         if (!mounted) return;
+        const detail = (e as CustomEvent).detail as { action: string; playerId?: string; volume?: number; time?: number };
 
-        const { action, playerId, volume, time } = event.payload;
+        // Interacting with the floating controls counts as activity (those events
+        // originate in a separate window the main app's mousemove can't see), so the
+        // idle auto-hide doesn't pull the controls out from under the user.
+        markMediaActivityRef.current?.();
+
+        const { action, playerId, volume, time } = detail;
         const targetPlayerId = playerId || activePlayerIdRef.current;
 
-        console.log('[EarthMultiMedia] Control action:', action, 'for player:', targetPlayerId);
-
+        void (async () => {
         try {
           switch (action) {
             case 'toggle-play':
@@ -489,17 +563,24 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
             case 'toggle-playlist':
               setShowPlaylistPanel(p => !p);
               break;
+            case 'exit-fullscreen':
+              if (isFullscreenRef.current) {
+                if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+                setIsFullscreen(false);
+                onFullscreenChange?.(false);
+              }
+              break;
             case 'next-video': {
               // Reuse the auto-advance path so it respects shuffle (random next when
               // on) and repeat (repeat-all loops the queue). manual:true so it still
               // ADVANCES under repeat-one instead of replaying the same clip.
-              const idx = parseInt((activePlayerIdRef.current || 'pane-0').replace('pane-', ''), 10) || 0;
+              const idx = paneIndexOf(activePlayerIdRef.current);
               window.dispatchEvent(new CustomEvent(`media-ended-pane-${idx}`, { detail: { manual: true } }));
               break;
             }
             case 'prev-video': {
               // Positional previous in queue order; wraps to the end under repeat-all.
-              const idx = parseInt((activePlayerIdRef.current || 'pane-0').replace('pane-', ''), 10) || 0;
+              const idx = paneIndexOf(activePlayerIdRef.current);
               const q = queueRef.current;
               if (q.length === 0) break;
               const curSrc = mediaItemsRef.current[idx]?.source;
@@ -517,12 +598,13 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
         } catch (err) {
           console.error('[EarthMultiMedia] Control action failed:', err);
         }
-      });
-      unlisteners.push(unlisten);
+        })();
+      };
+      window.addEventListener('__earth_media_control_action', onControlAction);
+      unlisteners.push(() => window.removeEventListener('__earth_media_control_action', onControlAction));
 
       // Listen for controls ready event to send initial state
       const unlistenReady = await listen('media-controls-ready', () => {
-        console.log('[EarthMultiMedia] Controls ready, sending initial state');
         // Use ref to get fresh state (closure would have stale data)
         const currentStatuses = playerStatusesRef.current;
         const activeId = activePlayerIdRef.current;
@@ -542,20 +624,16 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
       unlisteners.push(unlistenReady);
     };
 
-    console.log('[EarthMultiMedia] About to call setupEventListeners (controls will be created when video plays)');
     // Don't create controls immediately - wait until a video is actually playing
     // setupX11WebviewControls(); // REMOVED - controls now created on-demand when video plays
     setupEventListeners();
-    console.log('[EarthMultiMedia] Called setup functions (they are async so will continue in background)');
 
     return () => {
-      console.log('[EarthMultiMedia] Cleanup function called (unmounting)');
       mounted = false;
       unlisteners.forEach(unlisten => unlisten());
       // DON'T hide controls on unmount - React Strict Mode causes rapid mount/unmount in dev
       // The controls should persist and just be shown/hidden as needed
       // Hiding immediately can interfere with creation in progress
-      console.log('[EarthMultiMedia] Cleanup complete (NOT hiding controls to avoid race with creation)');
     };
   }, []); // Empty deps - only run on mount/unmount, not on activePlayerId change
 
@@ -573,8 +651,9 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
     // that the no-media effect just hid.
     const createControlsIfNeeded = async () => {
       const hasMedia = mediaItems.some(Boolean) || queue.length > 0;
-      if (status.isPlaying && hasMedia && !floatingControlsCreatedRef.current) {
-        console.log('[EarthMultiMedia] Video is playing, creating controls on-demand');
+      // Don't create the controls window until we know our real window label, or a
+      // second window would create/tag its controls under "main".
+      if (status.isPlaying && hasMedia && winReady && !floatingControlsCreatedRef.current) {
         try {
           // Get window dimensions and position for positioning controls
           const { getCurrentWindow } = await import('@tauri-apps/api/window');
@@ -601,34 +680,30 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
             height: controlsHeight,
           };
 
-          console.log('[EarthMultiMedia] Window outer position:', outerPosition);
-          console.log('[EarthMultiMedia] Window inner size:', innerSize);
-          console.log('[EarthMultiMedia] Window outer size:', outerSize);
-          console.log('[EarthMultiMedia] Title bar height:', titleBarHeight);
-          console.log('[EarthMultiMedia] Controls absolute bounds:', bounds);
 
           // Separate X11 webview overlay for the controls. In dev it loads from the
           // Vite dev server; in packaged builds it loads from the embedded-asset
           // server (assets_server.rs on :9877) since a raw WebKitGTK webview can't
           // use tauri:// and the assets aren't on disk.
+          // Carry this window's label so the controls webview can (a) filter the
+          // status broadcast to its own window and (b) tag commands it sends back.
+          const winQuery = `?win=${encodeURIComponent(winLabelRef.current)}`;
           const controlsUrl = import.meta.env.DEV
-            ? 'http://localhost:1420/media-controls'
-            : 'http://127.0.0.1:9877/media-controls';
-          console.log('[EarthMultiMedia] Creating X11 controls at:', controlsUrl);
+            ? `http://localhost:1420/media-controls${winQuery}`
+            : `http://127.0.0.1:9877/media-controls${winQuery}`;
           // create_x11_webview_controls is idempotent (no-ops if the window already
           // exists), so this also covers re-entering the media tab. Always show
           // afterwards so a previously HIDDEN controls window becomes visible again.
           await invoke('create_x11_webview_controls', { bounds, url: controlsUrl });
           floatingControlsCreatedRef.current = true;
           invoke('show_x11_webview_controls').catch(() => {});
-          console.log('[EarthMultiMedia] ✓ Controls created on-demand');
         } catch (err) {
           console.warn('[EarthMultiMedia] Failed to create controls on-demand:', err);
         }
       }
     };
 
-    createControlsIfNeeded();
+    if (winReady) createControlsIfNeeded();
 
     // Try to emit state update to controls window
     const sendUpdate = () => {
@@ -647,7 +722,7 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
 
     // Send immediately
     sendUpdate();
-  }, [playerStatuses, activePlayerId, mediaItems, queue]);
+  }, [playerStatuses, activePlayerId, mediaItems, queue, winReady]);
 
   // Tear down the floating controls when the active media session has nothing to
   // control — no media loaded in any pane and an empty queue (e.g. a freshly
@@ -657,11 +732,17 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
     if (!isTauri()) return;
     const hasMedia = mediaItems.some(Boolean) || queue.length > 0;
     if (!hasMedia && floatingControlsCreatedRef.current) {
-      // HIDE, don't destroy — destroying the X11 window mid-render (e.g. while a
-      // video surface is tearing down on tab switch) crashes the app with an X11
-      // RenderBadPicture error. Reset the flag so the next playback re-shows it.
-      invoke('hide_x11_webview_controls').catch(() => {});
       floatingControlsCreatedRef.current = false;
+      // The controls are a single SHARED window. Only hide them if THIS window is the
+      // one currently driving them (or nobody is) — otherwise an empty window would
+      // hide controls another window is actively using. HIDE, don't destroy:
+      // destroying the X11 window mid-render (e.g. while a video surface is tearing
+      // down on tab switch) crashes the app with an X11 RenderBadPicture error.
+      invoke<string>('controls_active_window').then(owner => {
+        if (!owner || owner === winLabelRef.current) {
+          invoke('hide_x11_webview_controls').catch(() => {});
+        }
+      }).catch(() => {});
     }
   }, [mediaItems, queue]);
 
@@ -683,7 +764,7 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
   const stopCurrentPlayers = () => {
     mediaItems.forEach((m, i) => {
       if (m && (m.type === 'video' || m.type === 'audio')) {
-        const playerId = `pane-${i}`;
+        const playerId = panePid(i);
         invoke('player_stop', { playerId }).catch(() => {});
         invoke('hide_video_surface', { playerId }).catch(() => {});
       }
@@ -694,7 +775,7 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
   // state folded in (from the player status poller). Captured at snapshot time so
   // a tab restores to exactly where it was paused/playing. currentTime is seconds.
   const livePaneStates = (): PaneState[] => paneStates.map((ps, i) => {
-    const st = playerStatusesRef.current[`pane-${i}`];
+    const st = playerStatusesRef.current[panePid(i)];
     return st ? { ...ps, currentTime: st.currentTime, isPlaying: st.isPlaying } : ps;
   });
 
@@ -813,19 +894,33 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
     return () => document.removeEventListener('fullscreenchange', handleFullscreenChange);
   }, [onFullscreenChange]);
 
-  // Handle fullscreen mouse movement - show header and reset timeout
+  // Escape must always leave fullscreen. For VIDEO the native X11 surface renders
+  // above the DOM and we fall back to CSS-based fullscreen (no real document
+  // fullscreen), so the browser's built-in Escape does nothing — handle it
+  // explicitly here, covering both the native and CSS paths.
+  const isFullscreenRef = useRef(isFullscreen);
+  isFullscreenRef.current = isFullscreen;
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape' || !isFullscreenRef.current) return;
+      e.preventDefault();
+      if (document.fullscreenElement) {
+        document.exitFullscreen().catch(() => {});
+      }
+      setIsFullscreen(false);
+      onFullscreenChange?.(false);
+    };
+    // Capture phase so it wins even if a child stops propagation.
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
+  }, [onFullscreenChange]);
+
+  // Show the fullscreen header on movement. Hiding is owned by the unified idle
+  // timer (markMediaActivity) so the two don't fight (which caused a header flicker
+  // when the pointer crossed from the DOM chrome onto the native video surface).
   const handleFullscreenMouseMove = useCallback(() => {
     if (!isFullscreen) return;
-
     setShowFullscreenHeader(true);
-
-    if (fullscreenHeaderTimeoutRef.current) {
-      clearTimeout(fullscreenHeaderTimeoutRef.current);
-    }
-
-    fullscreenHeaderTimeoutRef.current = setTimeout(() => {
-      setShowFullscreenHeader(false);
-    }, 3000);
   }, [isFullscreen]);
 
   // Cleanup fullscreen header timeout
@@ -844,6 +939,77 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
       handleFullscreenMouseMove();
     }
   }, [isFullscreen, handleFullscreenMouseMove]);
+
+  // --- Idle auto-hide: hide the floating media controls + the mouse cursor when
+  // the pointer hasn't moved for a few seconds while media is loaded. Activity is
+  // any mouse move / click / key / wheel anywhere in the window, plus pointer
+  // motion forwarded from the native video surface (which sits above the DOM, so
+  // DOM mousemove never fires over the actual video). ---
+  const [controlsIdle, setControlsIdle] = useState(false);
+  const idleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const controlsIdleRef = useRef(false);
+  useEffect(() => { controlsIdleRef.current = controlsIdle; }, [controlsIdle]);
+
+  const markMediaActivity = useCallback(() => {
+    // Wake up: show cursor + controls + fullscreen header again.
+    if (controlsIdleRef.current) {
+      setControlsIdle(false);
+      if (isTauri()) {
+        // Reveal the cursor over the native video surfaces (CSS can't reach them).
+        invoke('set_video_surfaces_cursor_hidden', { window: winLabelRef.current, hidden: false }).catch(() => {});
+        if (floatingControlsCreatedRef.current) {
+          invoke('show_x11_webview_controls').catch(() => {});
+        }
+      }
+    }
+    setShowFullscreenHeader(true);
+    if (idleTimerRef.current) clearTimeout(idleTimerRef.current);
+    idleTimerRef.current = setTimeout(() => {
+      // Only auto-hide when there's actually media to control.
+      const hasMedia = mediaItemsRef.current.some(Boolean) || queueRef.current.length > 0;
+      if (!hasMedia) return;
+      setControlsIdle(true);
+      setShowFullscreenHeader(false);
+      if (isTauri()) {
+        // Hide the cursor over the native video surfaces too (CSS can't reach them).
+        invoke('set_video_surfaces_cursor_hidden', { window: winLabelRef.current, hidden: true }).catch(() => {});
+        if (floatingControlsCreatedRef.current) {
+          invoke('hide_x11_webview_controls').catch(() => {});
+        }
+      }
+    }, 3000);
+  }, []);
+  markMediaActivityRef.current = markMediaActivity;
+
+  useEffect(() => {
+    const onActivity = () => markMediaActivity();
+    window.addEventListener('mousemove', onActivity);
+    window.addEventListener('mousedown', onActivity);
+    window.addEventListener('keydown', onActivity);
+    window.addEventListener('wheel', onActivity, { passive: true });
+
+    // Pointer motion forwarded from the native video surface (Tauri event). The
+    // payload is the namespaced player id; only count motion over OUR window's
+    // surfaces so another window's video doesn't keep this window's controls awake.
+    let unlistenMotion: (() => void) | undefined;
+    if (isTauri()) {
+      import('@tauri-apps/api/event').then(({ listen }) => {
+        listen<string>('video-surface-motion', (e) => {
+          if ((e.payload || '').startsWith(`${winLabelRef.current}::`)) onActivity();
+        }).then((un) => { unlistenMotion = un; });
+      });
+    }
+
+    markMediaActivity(); // arm the timer on mount
+    return () => {
+      window.removeEventListener('mousemove', onActivity);
+      window.removeEventListener('mousedown', onActivity);
+      window.removeEventListener('keydown', onActivity);
+      window.removeEventListener('wheel', onActivity);
+      if (idleTimerRef.current) clearTimeout(idleTimerRef.current);
+      unlistenMotion?.();
+    };
+  }, [markMediaActivity]);
 
   // (Playback control handlers were removed — unused; VideoPlayer handles its
   // own controls. Re-add wired versions here if a global control bar returns.)
@@ -1140,11 +1306,18 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
     const imageItems = queue.filter(item => item.type === 'image');
     if (imageItems.length === 0) return;
     setMediaItems(prev => {
+      // Only place images that aren't already on screen. This makes the effect fill
+      // empty panes when NEW images are added, but NOT resurrect a pane the user just
+      // cleared by removing its item from the queue (the remaining images are already
+      // shown elsewhere, so nothing gets pulled in) — and it never duplicates an image.
+      const shown = new Set(prev.map(m => m?.source).filter(Boolean) as string[]);
+      const candidates = imageItems.filter(it => !shown.has(it.source));
+      if (candidates.length === 0) return prev;
       const updated = [...prev];
       let imgIdx = 0;
-      for (let p = 0; p < maxPanes && imgIdx < imageItems.length; p++) {
+      for (let p = 0; p < maxPanes && imgIdx < candidates.length; p++) {
         if (!updated[p]) {
-          const it = imageItems[imgIdx++];
+          const it = candidates[imgIdx++];
           updated[p] = { source: it.source, type: it.type, title: it.title };
         }
       }
@@ -1326,48 +1499,8 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
     const unlisteners: Array<() => void> = [];
     const track = (u: () => void) => { if (cancelled) u(); else unlisteners.push(u); };
 
-    // Tauri reports native drag positions in *physical* pixels relative to the
-    // webview's top-left; getBoundingClientRect() works in CSS (client) pixels.
-    // Divide by the device pixel ratio to bring them into the same space.
-    const toClientPoint = (position?: { x: number; y: number }) => {
-      if (!position) return null;
-      const dpr = window.devicePixelRatio || 1;
-      return { x: position.x / dpr, y: position.y / dpr };
-    };
-
     const setupFileOpenListener = async () => {
       try {
-        // Highlight the pane under the cursor while an OS file is dragged over
-        // the window. Position-only events (no element), so we hit-test bounds.
-        const unlistenDragOver = await listen<{ position?: { x: number; y: number } }>('tauri://drag-over', (event) => {
-          const point = toClientPoint(event.payload?.position);
-          if (!point) return;
-          const pane = hitTestPane(point.x, point.y);
-          setOsDropPane(pane >= 0 ? pane : null);
-        });
-
-        const unlistenDragLeave = await listen('tauri://drag-leave', () => {
-          setOsDropPane(null);
-        });
-
-        // Listen for OS file-drop events (Tauri v2 renamed this from 'tauri://file-drop').
-        const unlistenDrop = await listen<{ paths: string[]; position?: { x: number; y: number } }>('tauri://drag-drop', (event) => {
-          setOsDropPane(null);
-          if (event.payload.paths && event.payload.paths.length > 0) {
-            // Route the drop to the pane under the cursor; fall back to the
-            // active pane when the point matches none (e.g. dropped on chrome).
-            // Resolve the target pane synchronously, before any async folder
-            // expansion, so it reflects the cursor position at drop time.
-            const point = toClientPoint(event.payload.position);
-            const targetPane = point ? hitTestPane(point.x, point.y) : -1;
-            const startPane = targetPane >= 0 ? targetPane : activePaneRef.current;
-            // Dropped folders are expanded into their (top-level) media files.
-            expandDroppedPaths(event.payload.paths).then(files => {
-              if (files.length > 0) initializeFromFiles(files, startPane);
-            });
-          }
-        });
-
         // Listen for file association events (when opening files with "Open with")
         const unlistenOpen = await listen<string[]>('tauri://file-open', (event) => {
           if (event.payload && event.payload.length > 0) {
@@ -1390,9 +1523,6 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
           }
         });
 
-        track(unlistenDragOver);
-        track(unlistenDragLeave);
-        track(unlistenDrop);
         track(unlistenOpen);
         track(unlistenCliFiles);
       } catch (err) {
@@ -1406,39 +1536,103 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
       cancelled = true;
       unlisteners.forEach(u => u());
     };
-  }, [initializeFromFiles, hitTestPane, expandDroppedPaths]);
+  }, [initializeFromFiles]);
 
-  // Native video surface clicks. The X11 video window renders above the DOM, so
-  // it forwards a `video-surface-clicked` event from the backend. Two-stage:
-  // the first click on an unfocused pane just FOCUSES it (so the floating controls
-  // target it); clicking the already-focused pane toggles its play/pause.
+  // OS file drag/drop arrives from the BACKEND as a DOM CustomEvent eval'd straight
+  // into THIS window's webview (see wire_media_drag_drop in lib.rs). We do NOT use
+  // Tauri's event bus or webview drag-drop APIs: for code-created windows the JS
+  // identity reports label "main", and a broadcast `app.emit` never reached a 2nd
+  // window's `listen(...)` (the JS-listener registry is keyed by the listening
+  // webview's label). The backend holds the exact webview handle, so an eval'd
+  // CustomEvent lands in the right window with no routing.
+  //
+  // Registered ONCE for the component's lifetime and delegated to refs (updated every
+  // render, below) so the latest hitTestPane/expandDroppedPaths/initializeFromFiles
+  // are used without re-registering — re-registering on a multi-dep async effect
+  // accumulated listeners and fired every drop 2-3×.
+  const dragOverHandlerRef = useRef<(d: { x: number; y: number }) => void>(() => {});
+  const dropHandlerRef = useRef<(d: { paths: string[]; x: number; y: number }) => void>(() => {});
+  // Tauri reports native drag positions in *physical* pixels relative to the webview's
+  // top-left; getBoundingClientRect() is in CSS (client) pixels — divide by DPR.
+  const toClientPoint = (x: number, y: number) => {
+    const dpr = window.devicePixelRatio || 1;
+    return { x: x / dpr, y: y / dpr };
+  };
+  dragOverHandlerRef.current = (d) => {
+    const point = toClientPoint(d.x, d.y);
+    const pane = hitTestPane(point.x, point.y);
+    setOsDropPane(pane >= 0 ? pane : null);
+  };
+  dropHandlerRef.current = (d) => {
+    setOsDropPane(null);
+    const paths = d?.paths;
+    if (!paths || paths.length === 0) return;
+    // Route the drop to the pane under the cursor; fall back to the active pane when
+    // the point matches none (e.g. dropped on chrome).
+    const point = toClientPoint(d.x, d.y);
+    const targetPane = hitTestPane(point.x, point.y);
+    const startPane = targetPane >= 0 ? targetPane : activePaneRef.current;
+    // Dropped folders are expanded into their (top-level) media files.
+    expandDroppedPaths(paths).then(files => {
+      if (files.length > 0) initializeFromFiles(files, startPane);
+    });
+  };
   useEffect(() => {
     if (!isTauri()) return;
-    let cancelled = false;
-    let unlisten: (() => void) | undefined;
-    listen<{ playerId: string }>('video-surface-clicked', (event) => {
-      const pid = event.payload.playerId;
-      const idx = parseInt(pid.replace('pane-', ''), 10);
-      const alreadyActive = !isNaN(idx) && activePaneRef.current === idx;
-      if (!isNaN(idx)) setActivePane(idx);
+    const onOver = (e: Event) => dragOverHandlerRef.current((e as CustomEvent).detail);
+    const onLeave = () => setOsDropPane(null);
+    const onDrop = (e: Event) => dropHandlerRef.current((e as CustomEvent).detail);
+    window.addEventListener('__earth_media_drag_over', onOver);
+    window.addEventListener('__earth_media_drag_leave', onLeave);
+    window.addEventListener('__earth_media_drop', onDrop);
+    return () => {
+      window.removeEventListener('__earth_media_drag_over', onOver);
+      window.removeEventListener('__earth_media_drag_leave', onLeave);
+      window.removeEventListener('__earth_media_drop', onDrop);
+    };
+  }, []);
+
+  // Native video surface clicks. The X11 video window renders above the DOM, so the
+  // backend eval's a `__earth_video_surface_clicked` DOM event into THIS window's
+  // webview (a broadcast Tauri event never reaches a 2nd window). Two-stage: the first
+  // click on an unfocused pane just FOCUSES it (so the floating controls target it);
+  // clicking the already-focused pane toggles its play/pause.
+  useEffect(() => {
+    if (!isTauri()) return;
+    const onSurfaceClick = (e: Event) => {
+      const pid = ((e as CustomEvent).detail as { playerId: string }).playerId;
+      // Eval already targeted this window, but guard anyway.
+      if (!pid || !pid.startsWith(`${winLabelRef.current}::`)) return;
+      const idx = paneIndexOf(pid);
+      const alreadyActive = activePaneRef.current === idx;
+      setActivePane(idx);
       setActivePlayerId(pid);
+      // Re-claim the shared controls for THIS pane on EVERY click. The claim effect
+      // only fires when activePlayerId changes, so clicking back to a window whose
+      // video was already its focused pane (e.g. after another window grabbed the
+      // controls) wouldn't otherwise switch the controls back. A native surface click
+      // always means this pane has a video, so claim it directly.
+      invoke('set_active_media_player', { playerId: pid }).catch(() => {});
       // Only toggle play/pause when this pane was already the focused one — a
       // focus click shouldn't also start/stop the video.
       if (alreadyActive) {
         window.dispatchEvent(new CustomEvent('media-playpause-player', { detail: { playerId: pid } }));
       }
-    }).then(u => { if (cancelled) u(); else unlisten = u; });
-    return () => { cancelled = true; unlisten?.(); };
+    };
+    window.addEventListener('__earth_video_surface_clicked', onSurfaceClick);
+    return () => window.removeEventListener('__earth_video_surface_clicked', onSurfaceClick);
   }, []);
 
   // Hide the browser (web page) native surface while the Media tab is mounted, so
   // the page you were on doesn't bleed through behind the media UI. The native
   // WebKit surface renders above the DOM, so it must be explicitly unmapped here
   // (belt-and-suspenders alongside App's own show/hide on service change).
+  // ONLY the main window owns that (single, global) browser surface — a secondary
+  // window must not hide it or it would blank the main window's page.
   useEffect(() => {
-    if (!isTauri()) return;
+    if (!isTauri() || !winReady || winLabelRef.current !== 'main') return;
     invoke('browser_surface_hide').catch(() => {});
-  }, []);
+  }, [winReady]);
 
   // Load initial data
   useEffect(() => {
@@ -1556,15 +1750,25 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
     // X11 window here races the player teardown / unmount and triggers a fatal
     // X11 BadWindow error that crashes the whole app. Hidden surfaces are reused
     // when the pane is reopened.
-    const playerId = `pane-${paneIndex}`;
+    const playerId = panePid(paneIndex);
     invoke('player_stop', { playerId }).catch(() => {});
     invoke('player_remove', { playerId }).catch(() => {});
     invoke('hide_video_surface', { playerId }).catch(() => {});
 
-    const newItems = [...mediaItems];
-    newItems[paneIndex] = null;
-    setMediaItems(newItems);
-  }, [mediaItems]);
+    // Functional updates (so several closeMedia calls in a loop don't clobber each
+    // other) and clear BOTH mediaItems AND paneStates for this pane — leaving
+    // paneStates.currentItem set let the pane get re-populated.
+    setMediaItems(prev => {
+      const u = [...prev];
+      u[paneIndex] = null;
+      return u;
+    });
+    setPaneStates(prev => {
+      const u = [...prev];
+      u[paneIndex] = { ...u[paneIndex], currentItem: null, isPlaying: false };
+      return u;
+    });
+  }, []);
 
   // Open media in active pane (no automatic tab creation)
   const openMedia = useCallback((source: string, type?: MediaType, title?: string) => {
@@ -1806,7 +2010,7 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
               key={`pane-${index}-${layout}-${activeTabId}`}
               source={media.source}
               title={media.title}
-              playerId={`pane-${index}`}
+              playerId={panePid(index)}
               // Resume in the tab's saved play state at its saved position when
               // this pane is (re)mounted by a tab switch. Fresh media has
               // isPlaying=true / currentTime=0, so it just plays from the start.
@@ -1826,6 +2030,9 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
               source={media.source}
               title={media.title}
               className="w-full h-full"
+              // The pane indicator (multi-pane) and fullscreen header already show
+              // the title — suppress the viewer's own overlay to avoid a duplicate.
+              showTitle={false}
             />
           )
         ) : (
@@ -1918,7 +2125,7 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
   return (
     <div
       ref={containerRef}
-      className={`flex flex-col h-full ${isFullscreen ? 'bg-black' : 'bg-[var(--background-color)]'}`}
+      className={`flex flex-col h-full ${isFullscreen ? 'bg-black' : 'bg-[var(--background-color)]'} ${controlsIdle ? 'media-cursor-idle' : ''}`}
       onMouseMove={isFullscreen ? handleFullscreenMouseMove : undefined}
     >
       {/* Fullscreen Header - Auto-hides */}
@@ -1977,6 +2184,35 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
                 ))}
               </div>
 
+              {/* Shuffle + Repeat (apply to the whole queue — videos & photos).
+                  Sits to the LEFT of the slideshow controls. */}
+              <div className="flex items-center gap-1 bg-black/30 rounded p-1">
+                <button
+                  onClick={() => setPlaybackState(prev => ({ ...prev, isShuffled: !prev.isShuffled }))}
+                  className={`p-1.5 rounded transition-colors ${playbackState.isShuffled ? 'bg-[var(--primary-color)]/20 text-[var(--primary-color)]' : 'text-gray-400 hover:text-white'}`}
+                  title={playbackState.isShuffled ? 'Shuffle: on (re-shuffles each repeat pass)' : 'Shuffle: off'}
+                >
+                  <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M16 3h5v5 M4 20L21 3 M21 16v5h-5 M15 15l6 6 M4 4l5 5" />
+                  </svg>
+                </button>
+                <button
+                  onClick={() => setPlaybackState(prev => {
+                    const order = ['none', 'all', 'one'] as const;
+                    return { ...prev, repeatMode: order[(order.indexOf(prev.repeatMode) + 1) % order.length] };
+                  })}
+                  className={`relative p-1.5 rounded transition-colors ${playbackState.repeatMode !== 'none' ? 'bg-[var(--primary-color)]/20 text-[var(--primary-color)]' : 'text-gray-400 hover:text-white'}`}
+                  title={playbackState.repeatMode === 'none' ? 'Repeat: off' : playbackState.repeatMode === 'all' ? 'Repeat: all (loop the queue)' : 'Repeat: one'}
+                >
+                  <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 1l4 4-4 4 M3 11V9a4 4 0 014-4h14 M7 23l-4-4 4-4 M21 13v2a4 4 0 01-4 4H3" />
+                  </svg>
+                  {playbackState.repeatMode === 'one' && (
+                    <span className="absolute -top-1 -right-1 text-[9px] font-bold leading-none">1</span>
+                  )}
+                </button>
+              </div>
+
               {/* Slideshow Controls */}
               <div className="flex items-center gap-1 bg-black/30 rounded p-1">
                 {/* Slideshow toggle */}
@@ -2032,34 +2268,6 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
                     )}
                   </button>
                 )}
-              </div>
-
-              {/* Shuffle + Repeat (apply to the whole queue — videos & photos) */}
-              <div className="flex items-center gap-1 bg-black/30 rounded p-1">
-                <button
-                  onClick={() => setPlaybackState(prev => ({ ...prev, isShuffled: !prev.isShuffled }))}
-                  className={`p-1.5 rounded transition-colors ${playbackState.isShuffled ? 'bg-[var(--primary-color)]/20 text-[var(--primary-color)]' : 'text-gray-400 hover:text-white'}`}
-                  title={playbackState.isShuffled ? 'Shuffle: on (re-shuffles each repeat pass)' : 'Shuffle: off'}
-                >
-                  <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M16 3h5v5 M4 20L21 3 M21 16v5h-5 M15 15l6 6 M4 4l5 5" />
-                  </svg>
-                </button>
-                <button
-                  onClick={() => setPlaybackState(prev => {
-                    const order = ['none', 'all', 'one'] as const;
-                    return { ...prev, repeatMode: order[(order.indexOf(prev.repeatMode) + 1) % order.length] };
-                  })}
-                  className={`relative p-1.5 rounded transition-colors ${playbackState.repeatMode !== 'none' ? 'bg-[var(--primary-color)]/20 text-[var(--primary-color)]' : 'text-gray-400 hover:text-white'}`}
-                  title={playbackState.repeatMode === 'none' ? 'Repeat: off' : playbackState.repeatMode === 'all' ? 'Repeat: all (loop the queue)' : 'Repeat: one'}
-                >
-                  <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 1l4 4-4 4 M3 11V9a4 4 0 014-4h14 M7 23l-4-4 4-4 M21 13v2a4 4 0 01-4 4H3" />
-                  </svg>
-                  {playbackState.repeatMode === 'one' && (
-                    <span className="absolute -top-1 -right-1 text-[9px] font-bold leading-none">1</span>
-                  )}
-                </button>
               </div>
 
               {/* Queue info */}
@@ -2616,8 +2824,10 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
                             e.stopPropagation();
                             // Remove from queue
                             setQueue(prev => prev.filter(q => q.id !== item.id));
-                            // If this item is currently displayed in any pane, close it
-                            mediaItems.forEach((media, paneIndex) => {
+                            setPlayedItems(prev => { const n = new Set(prev); n.delete(item.id); return n; });
+                            // Close any pane currently showing this item (read the live
+                            // pane contents via ref so it's correct mid-removal).
+                            mediaItemsRef.current.forEach((media, paneIndex) => {
                               if (media?.source === item.source) {
                                 closeMedia(paneIndex);
                               }
@@ -2669,7 +2879,7 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
                       setMediaItems([null, null, null, null]);
                       setPaneStates(prev => prev.map(p => ({ ...p, currentItem: null, isPlaying: false })));
                       for (let i = 0; i < 4; i++) {
-                        const playerId = `pane-${i}`;
+                        const playerId = panePid(i);
                         invoke('player_stop', { playerId }).catch(() => {});
                         invoke('player_remove', { playerId }).catch(() => {});
                         invoke('hide_video_surface', { playerId }).catch(() => {});

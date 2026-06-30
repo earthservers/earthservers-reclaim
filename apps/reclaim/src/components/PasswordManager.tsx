@@ -15,17 +15,21 @@ const RECLAIM_FEATURES: { key: string; label: string }[] = [
   { key: 'local-ai', label: 'Local AI / History' },
 ];
 
+// Redact-by-default: the list holds METADATA ONLY — never the plaintext password.
+// A single password is fetched on demand via `vault_reveal` (gated, rate-limited,
+// audited) only when the user clicks show/copy/edit. This contains the blast
+// radius of a compromised frontend: it can't mass-dump the vault from one call.
 export interface PasswordEntry {
   id: number;
   profile_id: number;
   title: string;
   username: string;
-  password: string; // Encrypted in production
   url: string | null;
   notes: string | null;
   category: string;
   created_at: string;
   updated_at: string;
+  has_password: boolean;
 }
 
 interface PasswordManagerProps {
@@ -151,6 +155,19 @@ export function PasswordManager({ profileId, isOpen, onClose }: PasswordManagerP
     }
   };
 
+  // Copy a password: reveal exactly that one entry from the backend (audited +
+  // rate-limited), copy it, and drop the reference. The plaintext is never held
+  // in the list state — only in this transient closure for the moment of copying.
+  const copyPassword = async (entryId: number) => {
+    try {
+      const pw = await invoke<string>('vault_reveal', { profileId, entryId });
+      await copyToClipboard(pw, `password-${entryId}`);
+    } catch (err) {
+      console.error('Failed to reveal password:', err);
+      alert('Could not reveal password (vault locked or rate-limited).');
+    }
+  };
+
   const categories = [...new Set(entries.map(e => e.category))];
   const filteredEntries = entries.filter(e => {
     const matchesSearch = !searchQuery ||
@@ -270,6 +287,7 @@ export function PasswordManager({ profileId, isOpen, onClose }: PasswordManagerP
                     entry={entry}
                     copiedField={copiedField}
                     onCopy={copyToClipboard}
+                    onCopyPassword={copyPassword}
                     onEdit={() => setEditingEntry(entry)}
                     onDelete={() => deleteEntry(entry.id)}
                   />
@@ -311,12 +329,14 @@ function PasswordEntryCard({
   entry,
   copiedField,
   onCopy,
+  onCopyPassword,
   onEdit,
   onDelete,
 }: {
   entry: PasswordEntry;
   copiedField: string | null;
   onCopy: (text: string, field: string) => void;
+  onCopyPassword: (entryId: number) => void;
   onEdit: () => void;
   onDelete: () => void;
 }) {
@@ -387,11 +407,12 @@ function PasswordEntryCard({
           )}
         </button>
 
-        {/* Copy Password */}
+        {/* Copy Password — reveals exactly this entry on demand (audited) */}
         <button
-          onClick={() => onCopy(entry.password, `password-${entry.id}`)}
-          className="p-1.5 hover:bg-gray-600 rounded transition-colors"
-          title="Copy password"
+          onClick={() => onCopyPassword(entry.id)}
+          className="p-1.5 hover:bg-gray-600 rounded transition-colors disabled:opacity-30"
+          disabled={!entry.has_password}
+          title={entry.has_password ? 'Copy password' : 'No password stored'}
         >
           {copiedField === `password-${entry.id}` ? (
             <svg className="w-4 h-4 text-green-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -436,11 +457,24 @@ function PasswordEntryModal({
 }) {
   const [title, setTitle] = useState(entry?.title || '');
   const [username, setUsername] = useState(entry?.username || '');
-  const [password, setPassword] = useState(entry?.password || '');
+  const [password, setPassword] = useState('');
   const [url, setUrl] = useState(entry?.url || '');
   const [notes, setNotes] = useState(entry?.notes || '');
   const [category, setCategory] = useState(entry?.category || 'General');
   const [showPassword, setShowPassword] = useState(false);
+
+  // Editing: the list never carries the plaintext, so fetch this one entry's
+  // current password on demand (gated + audited) to prefill the field. A new
+  // entry starts blank.
+  useEffect(() => {
+    let cancelled = false;
+    if (entry?.id && entry.has_password) {
+      invoke<string>('vault_reveal', { profileId, entryId: entry.id })
+        .then(pw => { if (!cancelled) setPassword(pw); })
+        .catch(() => { /* locked / rate-limited — leave blank */ });
+    }
+    return () => { cancelled = true; };
+  }, [entry?.id, entry?.has_password, profileId]);
 
   const generatePassword = () => {
     const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()_+-=[]{}|;:,.<>?';

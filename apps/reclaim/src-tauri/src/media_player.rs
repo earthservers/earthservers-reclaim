@@ -241,6 +241,33 @@ pub async fn player_get_all_statuses() -> Result<HashMap<String, PlayerStatus>, 
     player_get_all_statuses_internal().await
 }
 
+/// The player_ids namespaced to a window (`<label>::pane-N`).
+pub fn players_for_window(window_label: &str) -> Vec<String> {
+    let prefix = format!("{}::", window_label);
+    GLOBAL_PLAYER_MANAGER
+        .list_players()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|id| id.starts_with(&prefix))
+        .collect()
+}
+
+/// Stop a player's pipeline and BLOCK until it reaches NULL, so the video sink has
+/// released its X11 surface before that surface is destroyed (avoids the close-time
+/// RenderBadPicture crash). No-op if the player doesn't exist.
+pub fn stop_and_wait(player_id: &str) {
+    if let Err(e) = GLOBAL_PLAYER_MANAGER.stop_and_wait(player_id) {
+        log::warn!("stop_and_wait: {}: {}", player_id, e);
+    }
+}
+
+/// Remove (drop) a player from the manager.
+pub fn remove_player(player_id: &str) {
+    if let Err(e) = GLOBAL_PLAYER_MANAGER.remove_player(player_id) {
+        log::warn!("remove_player: {}: {}", player_id, e);
+    }
+}
+
 /// Stop all players
 #[tauri::command(rename_all = "camelCase")]
 pub async fn player_stop_all() -> Result<(), String> {

@@ -109,6 +109,26 @@ mod imp {
         });
     }
 
+    /// The active tab's live, committed URL — read from the real webview on the
+    /// GTK thread. This is the page a fill would actually inject into, so binding
+    /// credential lookup to it (instead of any page- or frontend-supplied origin)
+    /// makes cross-origin autofill structurally impossible. None if no active tab.
+    pub fn active_page_url() -> Option<String> {
+        use std::sync::mpsc;
+        let (tx, rx) = mpsc::channel();
+        glib::MainContext::default().invoke(move || {
+            let url = STATE.with(|s| {
+                s.borrow().as_ref().and_then(|st| {
+                    let active = st.active?;
+                    let tv = st.tabs.get(&active)?;
+                    webkit2gtk::WebViewExt::uri(&tv.webview).map(|u| u.to_string())
+                })
+            });
+            let _ = tx.send(url);
+        });
+        rx.recv().ok().flatten()
+    }
+
     /// True if `wv` is the active tab's webview. The load-reveal logic checks this
     /// so a BACKGROUND tab finishing its load doesn't pop over the active page.
     pub fn is_active_webview(wv: &webkit2gtk::WebView) -> bool {
@@ -454,6 +474,11 @@ pub fn reload() {
 pub fn eval_js(script: String) {
     imp::eval_js(script)
 }
+/// The active tab's authoritative committed URL (origin source of truth for fills).
+#[cfg(target_os = "linux")]
+pub fn active_page_url() -> Option<String> {
+    imp::active_page_url()
+}
 /// True if `wv` is the active tab's webview (used by the load-reveal gating in
 /// `browser_surface` so a background tab's load doesn't pop over the active page).
 #[cfg(target_os = "linux")]
@@ -488,3 +513,7 @@ pub fn forward() {}
 pub fn reload() {}
 #[cfg(not(target_os = "linux"))]
 pub fn eval_js(_script: String) {}
+#[cfg(not(target_os = "linux"))]
+pub fn active_page_url() -> Option<String> {
+    None
+}

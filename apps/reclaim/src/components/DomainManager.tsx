@@ -35,7 +35,9 @@ interface DomainStats {
 
 interface DomainManagerProps {
   profileId: number | null;
-  onOpenUrl?: (url: string) => void;
+  // opts.fromAddressBar = the URL was TYPED (navigate current tab); a domain CLICK
+  // omits it so it respects the "When opening links" toggle (e.g. opens a new tab).
+  onOpenUrl?: (url: string, opts?: { fromAddressBar?: boolean }) => void;
 }
 
 const DEFAULT_CATEGORIES = [
@@ -258,7 +260,7 @@ export function DomainManager({ profileId, onOpenUrl }: DomainManagerProps) {
         ? `https://${raw}`
         : `https://duckduckgo.com/?q=${encodeURIComponent(raw)}`;
     }
-    onOpenUrl?.(target);
+    onOpenUrl?.(target, { fromAddressBar: true });
     setUrlInput('');
   };
 

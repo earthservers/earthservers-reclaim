@@ -27,14 +27,6 @@ pub struct SurfaceBounds {
     pub height: i32,
 }
 
-/// Emitted to the frontend when the native video surface is clicked, so the UI
-/// can focus that pane and toggle play/pause (the native X11 window sits above
-/// the DOM, so React click handlers never fire over the video).
-#[derive(Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-struct VideoSurfaceClick {
-    player_id: String,
-}
 
 /// Store video surface info - both the DrawingArea XID (for GStreamer) and GTK Window XID (for positioning)
 /// GTK objects are not Send/Sync, so we only store the window IDs
@@ -131,8 +123,19 @@ pub async fn create_video_surface(
             let app_click = app.clone();
             let pid_click = player_id_for_closure.clone();
             drawing_area.connect_button_press_event(move |_widget, _event| {
-                use tauri::Emitter;
-                let _ = app_click.emit("video-surface-clicked", VideoSurfaceClick { player_id: pid_click.clone() });
+                // Deliver the click by eval-ing a DOM event into the OWNING window's
+                // webview (derived from the player_id's `<label>::` prefix), not a
+                // broadcast `app.emit` — a broadcast never reaches a 2nd window's
+                // listener, so its own surface clicks would be lost (same reason
+                // drag-drop / control actions use eval).
+                use tauri::Manager;
+                let label = crate::controls_server::window_label_of(&pid_click);
+                if let Some(wv) = app_click.get_webview_window(&label) {
+                    let detail = serde_json::json!({ "playerId": pid_click });
+                    let _ = wv.eval(format!(
+                        "window.dispatchEvent(new CustomEvent('__earth_video_surface_clicked',{{detail:{detail}}}))"
+                    ));
+                }
                 glib::Propagation::Proceed
             });
 
@@ -457,6 +460,75 @@ pub async fn destroy_video_surface(player_id: String) -> Result<(), String> {
 #[cfg(not(target_os = "linux"))]
 #[tauri::command(rename_all = "camelCase")]
 pub async fn destroy_video_surface(_player_id: String) -> Result<(), String> {
+    Ok(())
+}
+
+/// Hide or show the mouse cursor over every native video surface. The surfaces are
+/// separate X11 windows above the DOM, so a CSS `cursor: none` on the webview can't
+/// reach them — we set an invisible X cursor on each surface window directly. Used
+/// by the media view's idle auto-hide. This only ever (un)defines a cursor, so it
+/// can't crash the way destroying a surface mid-render can.
+#[cfg(target_os = "linux")]
+#[tauri::command(rename_all = "camelCase")]
+pub async fn set_video_surfaces_cursor_hidden(window: String, hidden: bool) -> Result<(), String> {
+    use x11::xlib;
+    use std::ptr;
+
+    // Snapshot the surface window XIDs for THIS window's panes only (player ids are
+    // namespaced "<label>::pane-N"), covering both the GTK window and the drawing
+    // area since the pointer can be over either; then release the lock.
+    let prefix = format!("{}::", window);
+    let xids: Vec<u64> = {
+        let surfaces = match VIDEO_SURFACES.try_lock() {
+            Ok(s) => s,
+            Err(_) => return Ok(()), // best-effort; skip if busy
+        };
+        surfaces
+            .iter()
+            .filter(|(pid, _)| pid.starts_with(&prefix))
+            .flat_map(|(_, info)| [info.gtk_window_xid, info.drawing_area_xid])
+            .filter(|x| *x != 0)
+            .collect()
+    };
+    if xids.is_empty() {
+        return Ok(());
+    }
+
+    unsafe {
+        let display = xlib::XOpenDisplay(ptr::null());
+        if display.is_null() {
+            return Err("Failed to open X11 display for cursor toggle".to_string());
+        }
+
+        if hidden {
+            // Build a 1x1 fully-transparent cursor.
+            let root = xlib::XDefaultRootWindow(display);
+            let zero: [std::os::raw::c_char; 1] = [0];
+            let pixmap = xlib::XCreateBitmapFromData(display, root, zero.as_ptr(), 1, 1);
+            let mut black: xlib::XColor = std::mem::zeroed();
+            let cursor = xlib::XCreatePixmapCursor(display, pixmap, pixmap, &mut black, &mut black, 0, 0);
+            for xid in &xids {
+                xlib::XDefineCursor(display, *xid as xlib::Window, cursor);
+            }
+            xlib::XFreePixmap(display, pixmap);
+            // The cursor is intentionally not freed: it stays referenced by the
+            // windows while hidden and is cheap; XUndefineCursor reverts them.
+        } else {
+            for xid in &xids {
+                xlib::XUndefineCursor(display, *xid as xlib::Window);
+            }
+        }
+
+        xlib::XFlush(display);
+        xlib::XCloseDisplay(display);
+    }
+
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+#[tauri::command(rename_all = "camelCase")]
+pub async fn set_video_surfaces_cursor_hidden(_window: String, _hidden: bool) -> Result<(), String> {
     Ok(())
 }
 
@@ -1039,9 +1111,14 @@ struct X11WebviewControlsInfo {
 }
 
 lazy_static! {
-    static ref X11_WEBVIEW_CONTROLS: tokio::sync::Mutex<Option<X11WebviewControlsInfo>> = tokio::sync::Mutex::new(None);
-    /// Flag to prevent race conditions during creation
-    static ref X11_WEBVIEW_CONTROLS_CREATING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    /// Per-app-window controls windows, keyed by window label ("main", "reclaim-…").
+    /// Each app window ("New Window") owns its own floating controls window.
+    static ref X11_WEBVIEW_CONTROLS: tokio::sync::Mutex<HashMap<String, X11WebviewControlsInfo>> =
+        tokio::sync::Mutex::new(HashMap::new());
+    /// Labels whose controls window is mid-creation (prevents a duplicate create for
+    /// the same window racing in).
+    static ref X11_WEBVIEW_CONTROLS_CREATING: Mutex<std::collections::HashSet<String>> =
+        Mutex::new(std::collections::HashSet::new());
 }
 
 /// Create an X11 window containing a WebKitGTK webview for HTML media controls
@@ -1058,31 +1135,33 @@ pub async fn create_x11_webview_controls(
     use x11::xlib;
     use std::ptr;
 
-    log::info!("=== create_x11_webview_controls CALLED ===");
+    let label = window.label().to_string();
+    log::info!("=== create_x11_webview_controls CALLED (window: {}) ===", label);
     log::info!("  URL: {}", url);
     log::info!("  Bounds: x={}, y={}, w={}, h={}", bounds.x, bounds.y, bounds.width, bounds.height);
 
-    // Check if already created or creation in progress (prevent race conditions)
+    // Check if already created or creation in progress for THIS window (race guard).
     {
-        use std::sync::atomic::Ordering;
-
-        // Check if already being created by another call
-        if X11_WEBVIEW_CONTROLS_CREATING.swap(true, Ordering::SeqCst) {
-            log::warn!("⚠ X11 webview controls creation already in progress");
-            return Ok(0);
+        // Mark this window as creating; bail if it already is.
+        if let Ok(mut creating) = X11_WEBVIEW_CONTROLS_CREATING.lock() {
+            if creating.contains(&label) {
+                log::warn!("⚠ X11 controls creation already in progress for {}", label);
+                return Ok(0);
+            }
+            creating.insert(label.clone());
         }
-        log::info!("✓ Set CREATING flag");
+        log::info!("✓ Marked {} as creating", label);
 
-        // Check if already created (async lock)
-        log::info!("Acquiring lock to check if controls exist...");
+        // CRASH-STOP: only ever allow ONE native WebKitGTK controls webview total.
+        // Creating a second one (for a second app window) crashes the shared WebKit
+        // web process. Focus-follow re-parents this single webview to the focused
+        // window instead. So abort if ANY controls webview already exists.
         let existing = X11_WEBVIEW_CONTROLS.lock().await;
-        log::info!("✓ Lock acquired");
-        if existing.is_some() {
-            X11_WEBVIEW_CONTROLS_CREATING.store(false, Ordering::SeqCst);
-            log::warn!("⚠ X11 webview controls already exist, aborting");
+        if !existing.is_empty() {
+            if let Ok(mut creating) = X11_WEBVIEW_CONTROLS_CREATING.lock() { creating.remove(&label); }
+            log::warn!("⚠ X11 controls already exist (a window has them); not creating a 2nd for {}", label);
             return Ok(0);
         }
-        log::info!("✓ No existing controls, proceeding with creation");
         drop(existing);
     }
 
@@ -1100,7 +1179,7 @@ pub async fn create_x11_webview_controls(
         || display.is_some();
 
     if !is_x11 {
-        X11_WEBVIEW_CONTROLS_CREATING.store(false, std::sync::atomic::Ordering::SeqCst);
+        if let Ok(mut creating) = X11_WEBVIEW_CONTROLS_CREATING.lock() { creating.remove(&label); }
         log::error!("✗ Not running on X11!");
         return Err("X11 webview controls require X11".to_string());
     }
@@ -1113,19 +1192,19 @@ pub async fn create_x11_webview_controls(
                 RawWindowHandle::Xlib(xlib_handle) => xlib_handle.window as u64,
                 RawWindowHandle::Xcb(xcb_handle) => xcb_handle.window.get() as u64,
                 _ => {
-                    X11_WEBVIEW_CONTROLS_CREATING.store(false, std::sync::atomic::Ordering::SeqCst);
+                    if let Ok(mut creating) = X11_WEBVIEW_CONTROLS_CREATING.lock() { creating.remove(&label); }
                     return Err("Unsupported window handle type".to_string());
                 }
             }
         }
         Err(e) => {
-            X11_WEBVIEW_CONTROLS_CREATING.store(false, std::sync::atomic::Ordering::SeqCst);
+            if let Ok(mut creating) = X11_WEBVIEW_CONTROLS_CREATING.lock() { creating.remove(&label); }
             return Err(format!("Failed to get window handle: {}", e));
         }
     };
 
     let scale_factor = window.scale_factor().map_err(|e| {
-        X11_WEBVIEW_CONTROLS_CREATING.store(false, std::sync::atomic::Ordering::SeqCst);
+        if let Ok(mut creating) = X11_WEBVIEW_CONTROLS_CREATING.lock() { creating.remove(&label); }
         e.to_string()
     })?;
     let x = (bounds.x as f64 * scale_factor) as i32;
@@ -1367,17 +1446,15 @@ pub async fn create_x11_webview_controls(
         let _ = tx.send(result);
     });
 
-    use std::sync::atomic::Ordering;
-
     log::info!("Waiting for GTK thread result...");
     let window_xid = rx.recv()
         .map_err(|e| {
-            X11_WEBVIEW_CONTROLS_CREATING.store(false, Ordering::SeqCst);
+            if let Ok(mut creating) = X11_WEBVIEW_CONTROLS_CREATING.lock() { creating.remove(&label); }
             log::error!("✗ Failed to receive from GTK thread: {}", e);
             format!("Failed to receive from GTK thread: {}", e)
         })?
         .map_err(|e| {
-            X11_WEBVIEW_CONTROLS_CREATING.store(false, Ordering::SeqCst);
+            if let Ok(mut creating) = X11_WEBVIEW_CONTROLS_CREATING.lock() { creating.remove(&label); }
             log::error!("✗ X11 webview controls creation failed: {}", e);
             format!("X11 webview controls creation failed: {}", e)
         })?;
@@ -1387,12 +1464,12 @@ pub async fn create_x11_webview_controls(
     log::info!("Storing controls info...");
     {
         let mut controls = X11_WEBVIEW_CONTROLS.lock().await;
-        *controls = Some(X11WebviewControlsInfo { gtk_window_xid: window_xid });
+        controls.insert(label.clone(), X11WebviewControlsInfo { gtk_window_xid: window_xid });
     }
-    log::info!("✓ Controls info stored");
+    log::info!("✓ Controls info stored for {}", label);
 
     // Reset creation flag (creation complete)
-    X11_WEBVIEW_CONTROLS_CREATING.store(false, Ordering::SeqCst);
+    if let Ok(mut creating) = X11_WEBVIEW_CONTROLS_CREATING.lock() { creating.remove(&label); }
     log::info!("✓ CREATING flag cleared");
 
     log::info!("=== ✓ X11 webview controls created successfully with XID: 0x{:x} ===", window_xid);
@@ -1421,12 +1498,13 @@ pub async fn update_x11_webview_controls(
     use x11::xlib;
     use std::ptr;
 
+    let label = window.label().to_string();
     // Use async lock
     let controls = X11_WEBVIEW_CONTROLS.lock().await;
-    let xid = match controls.as_ref() {
+    let xid = match controls.get(&label) {
         Some(info) => info.gtk_window_xid,
         None => {
-            log::warn!("Controls not created yet in update");
+            log::warn!("Controls not created yet in update for {}", label);
             return Ok(()); // Controls not created yet
         }
     };
@@ -1502,23 +1580,42 @@ pub async fn update_x11_webview_controls(
     Err("X11 webview controls only supported on Linux/X11".to_string())
 }
 
+/// The single shared controls webview is a SINGLETON — only one is ever created (see
+/// the guard in create_x11_webview_controls), but it's stored in the map keyed by the
+/// label of the window that created it (e.g. "main"). Every OTHER window — and the WS
+/// handler, which keys off the last-active player's window — would miss it with a
+/// by-label `.get(label)` lookup, leaving a second window unable to show/hide/move the
+/// controls. So all operations resolve the singleton by value, ignoring the key.
+#[cfg(target_os = "linux")]
+async fn singleton_controls_xid() -> Option<u64> {
+    let controls = X11_WEBVIEW_CONTROLS.lock().await;
+    controls.values().next().map(|info| info.gtk_window_xid)
+}
+
+/// Non-blocking variant for the WebSocket drag path (skips the frame if the lock is
+/// held rather than awaiting).
+#[cfg(target_os = "linux")]
+fn singleton_controls_xid_try() -> Option<u64> {
+    X11_WEBVIEW_CONTROLS
+        .try_lock()
+        .ok()
+        .and_then(|c| c.values().next().map(|info| info.gtk_window_xid))
+}
+
 /// Show X11 webview controls
 #[cfg(target_os = "linux")]
 #[tauri::command(rename_all = "camelCase")]
-pub async fn show_x11_webview_controls() -> Result<(), String> {
+pub async fn show_x11_webview_controls(_window: tauri::Window) -> Result<(), String> {
     use x11::xlib;
     use std::ptr;
 
-    // Use tokio::sync::Mutex which is async-compatible
-    let controls = X11_WEBVIEW_CONTROLS.lock().await;
-    let xid = match controls.as_ref() {
-        Some(info) => info.gtk_window_xid,
+    let xid = match singleton_controls_xid().await {
+        Some(xid) => xid,
         None => {
             log::warn!("Controls not created yet in show");
             return Ok(()); // Controls not created yet
         }
     };
-    drop(controls); // Release lock before X11 operations
 
     unsafe {
         let display = xlib::XOpenDisplay(ptr::null());
@@ -1539,7 +1636,7 @@ pub async fn show_x11_webview_controls() -> Result<(), String> {
 
 #[cfg(not(target_os = "linux"))]
 #[tauri::command(rename_all = "camelCase")]
-pub async fn show_x11_webview_controls() -> Result<(), String> {
+pub async fn show_x11_webview_controls(_window: tauri::Window) -> Result<(), String> {
     Ok(())
 }
 
@@ -1548,18 +1645,16 @@ pub async fn show_x11_webview_controls() -> Result<(), String> {
 /// shrink too, or the collapsed bar floats inside a full-size window. `width`/
 /// `height` are PHYSICAL pixels (the frontend multiplies by devicePixelRatio).
 /// XResizeWindow keeps the current position; GTK re-allocates the inner webview.
+/// `label` selects the requesting window's controls. Called from the WS handler
+/// (not a Tauri command).
 #[cfg(target_os = "linux")]
-#[tauri::command(rename_all = "camelCase")]
-pub async fn resize_x11_webview_controls(width: u32, height: u32) -> Result<(), String> {
+pub async fn resize_x11_webview_controls(_label: &str, width: u32, height: u32) -> Result<(), String> {
     use x11::xlib;
     use std::ptr;
 
-    let xid = {
-        let controls = X11_WEBVIEW_CONTROLS.lock().await;
-        match controls.as_ref() {
-            Some(info) => info.gtk_window_xid,
-            None => return Ok(()), // not created yet
-        }
+    let xid = match singleton_controls_xid().await {
+        Some(xid) => xid,
+        None => return Ok(()), // not created yet
     };
 
     unsafe {
@@ -1576,28 +1671,24 @@ pub async fn resize_x11_webview_controls(width: u32, height: u32) -> Result<(), 
 }
 
 #[cfg(not(target_os = "linux"))]
-#[tauri::command(rename_all = "camelCase")]
-pub async fn resize_x11_webview_controls(_width: u32, _height: u32) -> Result<(), String> {
+pub async fn resize_x11_webview_controls(_label: &str, _width: u32, _height: u32) -> Result<(), String> {
     Ok(())
 }
 
 /// Hide X11 webview controls
 #[cfg(target_os = "linux")]
 #[tauri::command(rename_all = "camelCase")]
-pub async fn hide_x11_webview_controls() -> Result<(), String> {
+pub async fn hide_x11_webview_controls(_window: tauri::Window) -> Result<(), String> {
     use x11::xlib;
     use std::ptr;
 
-    // Use tokio::sync::Mutex which is async-compatible
-    let controls = X11_WEBVIEW_CONTROLS.lock().await;
-    let xid = match controls.as_ref() {
-        Some(info) => info.gtk_window_xid,
+    let xid = match singleton_controls_xid().await {
+        Some(xid) => xid,
         None => {
             log::warn!("Controls not created yet in hide");
             return Ok(()); // Controls not created yet
         }
     };
-    drop(controls); // Release lock before X11 operations
 
     unsafe {
         let display = xlib::XOpenDisplay(ptr::null());
@@ -1617,24 +1708,25 @@ pub async fn hide_x11_webview_controls() -> Result<(), String> {
 
 #[cfg(not(target_os = "linux"))]
 #[tauri::command(rename_all = "camelCase")]
-pub async fn hide_x11_webview_controls() -> Result<(), String> {
+pub async fn hide_x11_webview_controls(_window: tauri::Window) -> Result<(), String> {
     Ok(())
 }
 
-/// Destroy X11 webview controls
+/// Destroy X11 webview controls for a window
 #[cfg(target_os = "linux")]
 #[tauri::command(rename_all = "camelCase")]
-pub async fn destroy_x11_webview_controls() -> Result<(), String> {
+pub async fn destroy_x11_webview_controls(_window: tauri::Window) -> Result<(), String> {
     use x11::xlib;
     use std::ptr;
 
-    // Use async lock
-    let mut controls = X11_WEBVIEW_CONTROLS.lock().await;
+    // The controls are a singleton; drain the (one) entry regardless of which window's
+    // label it was created under, so any window can tear it down.
+    let drained: Vec<(String, u64)> = {
+        let mut controls = X11_WEBVIEW_CONTROLS.lock().await;
+        controls.drain().map(|(k, info)| (k, info.gtk_window_xid)).collect()
+    };
 
-    if let Some(info) = controls.take() {
-        let xid = info.gtk_window_xid;
-        drop(controls); // Release lock before X11 operations
-
+    for (label, xid) in drained {
         unsafe {
             let display = xlib::XOpenDisplay(ptr::null());
             if !display.is_null() {
@@ -1644,10 +1736,10 @@ pub async fn destroy_x11_webview_controls() -> Result<(), String> {
                 xlib::XCloseDisplay(display);
             }
         }
-        log::info!("Destroyed X11 webview controls (XID: 0x{:x})", xid);
+        log::info!("Destroyed X11 webview controls for {} (XID: 0x{:x})", label, xid);
 
         // Reset the creation flag so controls can be recreated
-        X11_WEBVIEW_CONTROLS_CREATING.store(false, std::sync::atomic::Ordering::SeqCst);
+        if let Ok(mut creating) = X11_WEBVIEW_CONTROLS_CREATING.lock() { creating.remove(&label); }
     }
 
     Ok(())
@@ -1655,29 +1747,21 @@ pub async fn destroy_x11_webview_controls() -> Result<(), String> {
 
 #[cfg(not(target_os = "linux"))]
 #[tauri::command(rename_all = "camelCase")]
-pub async fn destroy_x11_webview_controls() -> Result<(), String> {
+pub async fn destroy_x11_webview_controls(_window: tauri::Window) -> Result<(), String> {
     Ok(())
 }
 
-/// Move X11 webview controls window by delta (for drag functionality)
+/// Move a window's X11 webview controls by delta (for drag functionality)
 #[cfg(target_os = "linux")]
-pub fn move_x11_webview_controls_by_delta(delta_x: i32, delta_y: i32) -> Result<(), String> {
+pub fn move_x11_webview_controls_by_delta(_label: &str, delta_x: i32, delta_y: i32) -> Result<(), String> {
     use x11::xlib;
     use std::ptr;
 
-    // Try to get XID without blocking - if lock is busy, skip this move
-    // This prevents blocking the WebSocket thread during drags
-    let xid = match X11_WEBVIEW_CONTROLS.try_lock() {
-        Ok(controls) => {
-            match controls.as_ref() {
-                Some(info) => info.gtk_window_xid,
-                None => return Ok(()), // Controls not created
-            }
-        }
-        Err(_) => {
-            // Lock is busy, skip this frame - dragging will send many events
-            return Ok(());
-        }
+    // Try to get the singleton XID without blocking - if the lock is busy, skip this
+    // frame (dragging sends many events, and blocking would stall the WebSocket thread).
+    let xid = match singleton_controls_xid_try() {
+        Some(xid) => xid,
+        None => return Ok(()), // not created, or lock busy this frame
     };
     // Lock is automatically dropped here
 
@@ -1710,6 +1794,6 @@ pub fn move_x11_webview_controls_by_delta(delta_x: i32, delta_y: i32) -> Result<
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn move_x11_webview_controls_by_delta(_delta_x: i32, _delta_y: i32) -> Result<(), String> {
+pub fn move_x11_webview_controls_by_delta(_label: &str, _delta_x: i32, _delta_y: i32) -> Result<(), String> {
     Ok(())
 }

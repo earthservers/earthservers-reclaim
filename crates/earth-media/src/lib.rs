@@ -580,6 +580,23 @@ impl MediaPlayer {
         Ok(())
     }
 
+    /// Stop playback and BLOCK until the pipeline has actually reached NULL.
+    ///
+    /// Plain `stop()` / dropping the player calls `set_state(Null)`, which is
+    /// asynchronous — the streaming thread tears the elements down afterwards. The
+    /// video sink only releases its X11 window during that teardown, so a caller that
+    /// destroys the native video surface right after `stop()` races the sink and
+    /// crashes X11 ("RenderBadPicture"). This waits (bounded) for the transition to
+    /// complete so the sink has provably let go of the window first.
+    pub fn stop_and_wait(&self) -> Result<(), MediaError> {
+        self.pipeline.set_state(gst::State::Null)
+            .map_err(|e| MediaError::PlaybackError(format!("Failed to stop: {:?}", e)))?;
+        // Block until NULL is reached (or the timeout elapses). gst returns the state
+        // once settled; we don't care about the value, only that teardown finished.
+        let _ = self.pipeline.state(gst::ClockTime::from_seconds(2));
+        Ok(())
+    }
+
     /// Seek to position in milliseconds
     pub fn seek(&self, position_ms: i64) -> Result<(), MediaError> {
         if position_ms < 0 {
@@ -868,6 +885,17 @@ impl MediaPlayerManager {
         } else {
             Err(MediaError::PlayerError(format!("Player {} not found", player_id)))
         }
+    }
+
+    /// Stop a specific player and BLOCK until its pipeline reaches NULL. Unlike `stop`,
+    /// does NOT auto-create — a missing player is simply a no-op. Used on window close
+    /// so the video sink releases its X11 surface before that surface is destroyed.
+    pub fn stop_and_wait(&self, player_id: &str) -> Result<(), MediaError> {
+        let players = recover_lock(self.players.lock())?;
+        if let Some(player) = players.get(player_id) {
+            player.stop_and_wait()?;
+        }
+        Ok(())
     }
 
     /// Seek on a specific player (auto-creates if needed)

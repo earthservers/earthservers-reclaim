@@ -279,14 +279,20 @@ async fn stream_answer(
     messages: &serde_json::Value,
 ) -> Result<String, String> {
     use tauri::Emitter;
-    let payload = serde_json::json!({ "model": model, "stream": true, "messages": messages });
     let client = reqwest::Client::new();
-    let mut resp = client
-        .post("http://localhost:11434/api/chat")
-        .json(&payload)
-        .send()
-        .await
-        .map_err(|e| format!("Ollama isn't reachable: {}", e))?;
+
+    // Ask reasoning models to expose their thinking as a separate `thinking` field
+    // (`think: true`). Models that don't support it make Ollama reject the request,
+    // so we retry once without `think`.
+    let send = |think: bool| {
+        let mut payload = serde_json::json!({ "model": model, "stream": true, "messages": messages });
+        if think {
+            payload["think"] = serde_json::Value::Bool(true);
+        }
+        client.post("http://localhost:11434/api/chat").json(&payload).send()
+    };
+
+    let mut resp = send(true).await.map_err(|e| format!("Ollama isn't reachable: {}", e))?;
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
@@ -295,7 +301,17 @@ async fn stream_answer(
             .ok()
             .and_then(|v| v["error"].as_str().map(str::to_string))
             .unwrap_or(body);
-        return Err(format!("Ollama: {} (HTTP {})", detail.trim(), status));
+        // If the model just doesn't support thinking, retry without it.
+        if detail.to_lowercase().contains("think") {
+            resp = send(false).await.map_err(|e| format!("Ollama isn't reachable: {}", e))?;
+            if !resp.status().is_success() {
+                let s = resp.status();
+                let b = resp.text().await.unwrap_or_default();
+                return Err(format!("Ollama: {} (HTTP {})", b.trim(), s));
+            }
+        } else {
+            return Err(format!("Ollama: {} (HTTP {})", detail.trim(), status));
+        }
     }
     let mut buf = String::new();
     let mut full = String::new();
@@ -308,6 +324,12 @@ async fn stream_answer(
                 continue;
             }
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                // The model's reasoning, streamed separately so the UI can show it.
+                if let Some(t) = v["message"]["thinking"].as_str() {
+                    if !t.is_empty() {
+                        let _ = app.emit("assistant-thinking", t);
+                    }
+                }
                 if let Some(c) = v["message"]["content"].as_str() {
                     if !c.is_empty() {
                         full.push_str(c);
@@ -472,51 +494,12 @@ pub async fn assistant_chat_stream(
     };
     let model = resolve_model(model).await;
     let msgs = build_chat_messages(&db_path, profile_id, &message, &history);
-    let payload = serde_json::json!({
-        "model": model,
-        "stream": true,
-        "messages": msgs.iter().map(|(r, c)| serde_json::json!({"role": r, "content": c})).collect::<Vec<_>>(),
-    });
-
-    let client = reqwest::Client::new();
-    let mut resp = client
-        .post("http://localhost:11434/api/chat")
-        .json(&payload)
-        .send()
-        .await
-        .map_err(|e| format!("Ollama isn't reachable: {}", e))?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        // Ollama puts a useful message in the body (e.g. model not found) — surface it.
-        let detail = serde_json::from_str::<serde_json::Value>(&body)
-            .ok()
-            .and_then(|v| v["error"].as_str().map(str::to_string))
-            .unwrap_or(body);
-        return Err(format!("Ollama: {} (HTTP {})", detail.trim(), status));
-    }
-
-    let mut buf = String::new();
-    let mut full = String::new();
-    while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
-        buf.push_str(&String::from_utf8_lossy(&chunk));
-        // Ollama streams newline-delimited JSON objects.
-        while let Some(nl) = buf.find('\n') {
-            let line: String = buf.drain(..=nl).collect();
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-                if let Some(c) = v["message"]["content"].as_str() {
-                    if !c.is_empty() {
-                        full.push_str(c);
-                        let _ = app.emit("assistant-chunk", c);
-                    }
-                }
-            }
-        }
-    }
+    // Stream via the shared helper so plain chat also exposes the model's thinking
+    // (and the think-unsupported fallback) consistently with research mode.
+    let messages = serde_json::Value::Array(
+        msgs.iter().map(|(r, c)| serde_json::json!({ "role": r, "content": c })).collect(),
+    );
+    let full = stream_answer(&app, &model, &messages).await?;
     let _ = app.emit("assistant-done", ());
 
     if journal && !full.trim().is_empty() {

@@ -158,8 +158,16 @@ function AssistantWorkspace({ profileId, journal }: { profileId: number | null; 
     // In research mode, `research-step` lines (🔎 searching / 📄 reading) are
     // shown inline above the streamed answer.
     let steps = '';
+    let thinking = '';
     let acc = '';
-    const compose = () => (steps ? steps + (acc ? '\n\n' + acc : '') : acc);
+    // Show, in order: research steps, the model's reasoning (💭), then the answer.
+    const compose = () => {
+      const parts: string[] = [];
+      if (steps) parts.push(steps);
+      if (thinking.trim()) parts.push('💭 Thinking\n' + thinking.trim());
+      if (acc) parts.push(acc);
+      return parts.join('\n\n');
+    };
     const writeTail = (content: string) => setSessions(prev => prev.map(s => s.id === targetId ? {
       ...s,
       messages: s.messages.map((m, i) => i === s.messages.length - 1 ? { role: 'assistant', content } : m),
@@ -167,6 +175,7 @@ function AssistantWorkspace({ profileId, journal }: { profileId: number | null; 
     } : s));
 
     const unlistenChunk = await listen<string>('assistant-chunk', (e) => { acc += e.payload; writeTail(compose()); });
+    const unlistenThinking = await listen<string>('assistant-thinking', (e) => { thinking += e.payload; writeTail(compose()); });
     const unlistenStep = research
       ? await listen<string>('research-step', (e) => { steps += (steps ? '\n' : '') + e.payload; writeTail(compose()); })
       : undefined;
@@ -183,6 +192,7 @@ function AssistantWorkspace({ profileId, journal }: { profileId: number | null; 
       writeTail(compose() || `⚠ ${String(e).replace(/^.*?:\s*/, '')}`);
     } finally {
       unlistenChunk();
+      unlistenThinking();
       unlistenStep?.();
       setBusy(false);
     }

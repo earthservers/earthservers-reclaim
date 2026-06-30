@@ -2,6 +2,12 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
+    // Allocator hardening: preload GrapheneOS hardened_malloc for this process and
+    // every child it spawns. MUST run first — it may re-exec the process before any
+    // allocation-heavy work. No-op if the library isn't built or is disabled
+    // (RECLAIM_HARDENED_MALLOC=0). See security::allocator. [HARDENING]
+    reclaim_lib::preload_hardened_malloc();
+
     // Initialize logging
     env_logger::init();
 

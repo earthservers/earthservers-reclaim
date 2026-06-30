@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)] // Phase 5: this crate needs no unsafe; enforce it.
 //! Earth IPC - Inter-process communication utilities
 //!
 //! This crate provides IPC mechanisms for communication between:

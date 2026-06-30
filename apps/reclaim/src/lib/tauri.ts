@@ -1,9 +1,14 @@
 // Tauri utilities with browser fallback for development
 // Detects if running in Tauri or browser and provides mock data for browser dev
 
-// Check if we're running in Tauri
+// Check if we're running in Tauri.
+// NOTE: `__TAURI__` (the global API) is only injected into the config-defined main
+// window. Code-created windows (tray "New Window" / single-instance) only get
+// `__TAURI_INTERNALS__`. Checking only `__TAURI__` made those windows fall back to
+// browser/mock mode — no window controls, no dragging, mock data. Detect either.
 export const isTauri = () => {
-  return typeof window !== 'undefined' && '__TAURI__' in window;
+  return typeof window !== 'undefined' &&
+    ('__TAURI_INTERNALS__' in window || '__TAURI__' in window);
 };
 
 // Mock file save dialog
@@ -34,40 +39,26 @@ export async function writeFile(path: string, contents: string): Promise<void> {
   URL.revokeObjectURL(url);
 }
 
-// Window control functions for custom titlebar
+// Window control functions for the custom titlebar.
+// These go through the BACKEND (invoke), where Tauri injects the calling window
+// reliably. JS `getCurrentWindow()` can target the wrong window for code-created
+// windows (tray "New Window" / single-instance), which left secondary windows
+// unable to drag, close, minimize or maximize.
 export async function minimizeWindow(): Promise<void> {
-  if (isTauri()) {
-    const { getCurrentWindow } = await import('@tauri-apps/api/window');
-    await getCurrentWindow().minimize();
-  }
+  if (isTauri()) await invoke('window_minimize').catch(() => {});
 }
 
 export async function maximizeWindow(): Promise<void> {
-  if (isTauri()) {
-    const { getCurrentWindow } = await import('@tauri-apps/api/window');
-    const win = getCurrentWindow();
-    const isMaximized = await win.isMaximized();
-    if (isMaximized) {
-      await win.unmaximize();
-    } else {
-      await win.maximize();
-    }
-  }
+  if (isTauri()) await invoke('window_toggle_maximize').catch(() => {});
 }
 
 export async function closeWindow(): Promise<void> {
-  if (isTauri()) {
-    const { getCurrentWindow } = await import('@tauri-apps/api/window');
-    await getCurrentWindow().close();
-  }
+  if (isTauri()) await invoke('window_close').catch(() => {});
 }
 
 // Start dragging the window (for custom titlebar on Linux)
 export async function startDragging(): Promise<void> {
-  if (isTauri()) {
-    const { getCurrentWindow } = await import('@tauri-apps/api/window');
-    await getCurrentWindow().startDragging();
-  }
+  if (isTauri()) await invoke('window_start_dragging').catch(() => {});
 }
 
 // Toggle fullscreen mode
@@ -768,7 +759,20 @@ const mockCommands: Record<string, (args?: any) => any> = {
     passwordManagerMaster[args.profile_id] = args.password;
     return true;
   },
-  get_password_entries: (args: any) => passwordEntries.filter(e => e.profile_id === args.profile_id),
+  // Redact-by-default: the list returns metadata only (no plaintext password).
+  get_password_entries: (args: any) =>
+    passwordEntries
+      .filter(e => e.profile_id === (args.profileId ?? args.profile_id))
+      .map((e: any) => ({
+        id: e.id, profile_id: e.profile_id, title: e.title, username: e.username,
+        url: e.url, notes: e.notes, category: e.category,
+        created_at: e.created_at, updated_at: e.updated_at, has_password: !!e.password,
+      })),
+  // Single-entry reveal (the audited path in production).
+  vault_reveal: (args: any) => {
+    const e = passwordEntries.find(p => p.id === (args.entryId ?? args.entry_id));
+    return e ? (e as any).password : '';
+  },
   add_password_entry: (args: any) => {
     const entry = {
       id: Date.now(),
@@ -814,7 +818,19 @@ const mockCommands: Record<string, (args?: any) => any> = {
     otpMaster[args.profile_id] = args.password;
     return true;
   },
-  get_otp_entries: (args: any) => otpEntries.filter(e => e.profile_id === args.profile_id),
+  // Redact-by-default: metadata only (no base32 seed).
+  get_otp_entries: (args: any) =>
+    otpEntries
+      .filter(e => e.profile_id === (args.profileId ?? args.profile_id))
+      .map((e: any) => ({
+        id: e.id, profile_id: e.profile_id, name: e.name, issuer: e.issuer,
+        algorithm: e.algorithm, digits: e.digits, period: e.period, created_at: e.created_at,
+      })),
+  // Codes generated "in the backend" — mock returns a stable placeholder.
+  vault_otp_codes: (args: any) =>
+    otpEntries
+      .filter(e => e.profile_id === (args.profileId ?? args.profile_id))
+      .map(e => ({ id: e.id, code: '•'.repeat((e as any).digits || 6), remaining: 30 - (Math.floor(Date.now() / 1000) % 30) })),
   add_otp_entry: (args: any) => {
     const entry = {
       id: Date.now(),
@@ -835,7 +851,7 @@ const mockCommands: Record<string, (args?: any) => any> = {
     if (entry) {
       entry.name = args.name;
       entry.issuer = args.issuer;
-      entry.secret = args.secret;
+      if (args.secret) entry.secret = args.secret; // blank = keep current (redact-by-default)
       entry.algorithm = args.algorithm;
       entry.digits = args.digits;
       entry.period = args.period;

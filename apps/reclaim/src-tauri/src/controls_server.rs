@@ -29,6 +29,10 @@ pub struct PlayerStatus {
     pub title: String,
     pub is_shuffled: bool,
     pub repeat_mode: String, // "none", "all", "one"
+    /// Whether the owning app window is in media fullscreen — drives the floating
+    /// controls' exit-fullscreen button (the DOM exit affordance is occluded by the
+    /// native video surface in fullscreen).
+    pub is_fullscreen: bool,
 }
 
 impl Default for PlayerStatus {
@@ -43,6 +47,7 @@ impl Default for PlayerStatus {
             title: String::new(),
             is_shuffled: false,
             repeat_mode: "none".to_string(),
+            is_fullscreen: false,
         }
     }
 }
@@ -63,17 +68,20 @@ pub enum ControlCommand {
     SkipBackward { #[serde(rename = "playerId")] player_id: Option<String>, seconds: i64 },
     // Request current status (controls just connected)
     GetStatus,
-    // Move the controls window by delta
-    MoveWindow { #[serde(rename = "deltaX")] delta_x: i32, #[serde(rename = "deltaY")] delta_y: i32 },
+    // Move the controls window by delta. `window` = the sending controls' window
+    // label, so we move that window's controls (not some other window's).
+    MoveWindow { #[serde(rename = "deltaX")] delta_x: i32, #[serde(rename = "deltaY")] delta_y: i32, window: Option<String> },
     // Resize the controls window (physical px) — used on collapse/expand
-    ResizeWindow { width: u32, height: u32 },
-    // Playlist/queue controls
-    ToggleShuffle { #[serde(rename = "playerId")] player_id: Option<String> },
-    ToggleRepeat { #[serde(rename = "playerId")] player_id: Option<String> },
-    TogglePlaylist,
+    ResizeWindow { width: u32, height: u32, window: Option<String> },
+    // Playlist/queue controls. `window` routes the emitted action to that app window.
+    ToggleShuffle { #[serde(rename = "playerId")] player_id: Option<String>, window: Option<String> },
+    ToggleRepeat { #[serde(rename = "playerId")] player_id: Option<String>, window: Option<String> },
+    TogglePlaylist { window: Option<String> },
     // Skip to the previous / next item in the queue (whole video, not seek).
-    PreviousVideo,
-    NextVideo,
+    PreviousVideo { window: Option<String> },
+    NextVideo { window: Option<String> },
+    // Leave media fullscreen (the DOM exit affordance is hidden behind the video).
+    ExitFullscreen { window: Option<String> },
 }
 
 /// Callback type for handling commands
@@ -236,52 +244,102 @@ impl ControlsServer {
     }
 }
 
-/// Global controls server instance
-lazy_static::lazy_static! {
-    pub static ref CONTROLS_SERVER: Arc<ControlsServer> = Arc::new(ControlsServer::new(9876));
-    /// Which player the floating controls currently drive. The status-broadcast
-    /// loop reads this each tick and the controls echo it back on commands, so
-    /// updating it (via `set_active_player_id`) retargets the controls to the
-    /// focused pane. Defaults to the first pane.
-    static ref ACTIVE_PLAYER_ID: std::sync::RwLock<String> =
-        std::sync::RwLock::new("pane-0".to_string());
-    /// Frontend-owned playback flags (shuffle + repeat mode) mirrored here so the
-    /// status-broadcast loop can report them to the floating controls. The frontend
-    /// is the source of truth and pushes updates via `set_playback_flags`.
-    static ref PLAYBACK_FLAGS: std::sync::RwLock<(bool, String)> =
-        std::sync::RwLock::new((false, "none".to_string()));
+/// Window label embedded in a namespaced player id like "main::pane-2". Falls back
+/// to "main" for legacy/un-namespaced ids ("pane-0").
+pub fn window_label_of(player_id: &str) -> String {
+    player_id
+        .split_once("::")
+        .map(|(label, _)| label.to_string())
+        .unwrap_or_else(|| "main".to_string())
 }
 
-/// Update the shuffle + repeat flags the controls display (called from the frontend
-/// whenever its playback state changes).
-pub fn set_playback_flags(is_shuffled: bool, repeat_mode: String) {
-    if let Ok(mut g) = PLAYBACK_FLAGS.write() {
-        *g = (is_shuffled, repeat_mode);
+/// Global controls server instance.
+///
+/// SINGLE shared controls model: there is ONE native controls webview (a 2nd one
+/// crashes the WebKit web process), so it follows the LAST-CLICKED media pane across
+/// all app windows. `LAST_ACTIVE_PLAYER` is that globally-focused player id; the
+/// broadcast publishes only it. Per-window maps below still hold each window's
+/// flags/title/fullscreen, looked up by the active player's window label.
+lazy_static::lazy_static! {
+    pub static ref CONTROLS_SERVER: Arc<ControlsServer> = Arc::new(ControlsServer::new(9876));
+    /// The globally last-focused player id (last-clicked pane in any window).
+    static ref LAST_ACTIVE_PLAYER: std::sync::RwLock<String> = std::sync::RwLock::new(String::new());
+    /// window label -> (is_shuffled, repeat_mode), pushed from the frontend.
+    static ref PLAYBACK_FLAGS: std::sync::RwLock<std::collections::HashMap<String, (bool, String)>> =
+        std::sync::RwLock::new(std::collections::HashMap::new());
+    /// window label -> active media title (frontend-owned; GStreamer tags are usually empty).
+    static ref ACTIVE_TITLE: std::sync::RwLock<std::collections::HashMap<String, String>> =
+        std::sync::RwLock::new(std::collections::HashMap::new());
+    /// window label -> media fullscreen flag (drives the exit-fullscreen button).
+    static ref FULLSCREEN: std::sync::RwLock<std::collections::HashMap<String, bool>> =
+        std::sync::RwLock::new(std::collections::HashMap::new());
+}
+
+/// Update whether a window is in media fullscreen (called from the frontend).
+pub fn set_fullscreen(window: String, is_fullscreen: bool) {
+    if let Ok(mut g) = FULLSCREEN.write() {
+        g.insert(window, is_fullscreen);
     }
 }
 
-/// Current (is_shuffled, repeat_mode) for the controls broadcast.
-pub fn get_playback_flags() -> (bool, String) {
-    PLAYBACK_FLAGS
-        .read()
-        .map(|g| g.clone())
-        .unwrap_or_else(|_| (false, "none".to_string()))
+/// A window's media fullscreen state for the controls broadcast.
+pub fn get_fullscreen(window: &str) -> bool {
+    FULLSCREEN.read().ok().and_then(|g| g.get(window).copied()).unwrap_or(false)
 }
 
-/// Set the player the floating controls drive (called from the frontend when the
-/// focused pane changes).
+/// Update a window's active media title shown by its controls (from the frontend).
+pub fn set_active_title(window: String, title: String) {
+    if let Ok(mut g) = ACTIVE_TITLE.write() {
+        g.insert(window, title);
+    }
+}
+
+/// A window's active media title for the controls broadcast.
+pub fn get_active_title(window: &str) -> String {
+    ACTIVE_TITLE.read().ok().and_then(|g| g.get(window).cloned()).unwrap_or_default()
+}
+
+/// Update a window's shuffle + repeat flags (from the frontend).
+pub fn set_playback_flags(window: String, is_shuffled: bool, repeat_mode: String) {
+    if let Ok(mut g) = PLAYBACK_FLAGS.write() {
+        g.insert(window, (is_shuffled, repeat_mode));
+    }
+}
+
+/// A window's (is_shuffled, repeat_mode) for the controls broadcast.
+pub fn get_playback_flags(window: &str) -> (bool, String) {
+    PLAYBACK_FLAGS
+        .read()
+        .ok()
+        .and_then(|g| g.get(window).cloned())
+        .unwrap_or_else(|| (false, "none".to_string()))
+}
+
+/// Set the player the single shared controls drive: this is the last-clicked pane in
+/// any window. Stored globally (drives the broadcast) and per-window (so flags/title
+/// lookups by label still work).
 pub fn set_active_player_id(id: String) {
-    if let Ok(mut g) = ACTIVE_PLAYER_ID.write() {
+    if let Ok(mut g) = LAST_ACTIVE_PLAYER.write() {
         *g = id;
     }
 }
 
-/// Current active player id for the controls (defaults to "pane-0").
-pub fn get_active_player_id() -> String {
-    ACTIVE_PLAYER_ID
-        .read()
-        .map(|g| g.clone())
-        .unwrap_or_else(|_| "pane-0".to_string())
+/// The globally last-focused player id (empty string if none yet).
+pub fn get_last_active_player() -> String {
+    LAST_ACTIVE_PLAYER.read().map(|g| g.clone()).unwrap_or_default()
+}
+
+/// Drop all per-window state for a closed window so the broadcast loop stops polling
+/// its (now-gone) player and the maps don't accumulate dead entries.
+pub fn forget_window(window: &str) {
+    if let Ok(mut g) = PLAYBACK_FLAGS.write() { g.remove(window); }
+    if let Ok(mut g) = ACTIVE_TITLE.write() { g.remove(window); }
+    if let Ok(mut g) = FULLSCREEN.write() { g.remove(window); }
+    // If the globally-active player belonged to the closed window, clear it so the
+    // broadcast stops polling a dead player.
+    if let Ok(mut g) = LAST_ACTIVE_PLAYER.write() {
+        if window_label_of(g.as_str()) == window { g.clear(); }
+    }
 }
 
 /// Initialize and start the controls server
@@ -318,6 +376,7 @@ mod tests {
             title: "Test Video".to_string(),
             is_shuffled: false,
             repeat_mode: "none".to_string(),
+            is_fullscreen: false,
         };
 
         let json = serde_json::to_string(&status).unwrap();

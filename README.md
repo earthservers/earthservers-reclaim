@@ -49,6 +49,17 @@ Everything below runs **on your machine**. The only outbound traffic is the page
 - **🔬 Web Research mode** — agentic **search + read**: the assistant uses local tool‑calling to `web_search` and `fetch_url`, shows each step (🔎 searching / 📄 reading), then streams a grounded answer that **cites the URLs it actually read**. Searches route through a local **SearXNG** instance when available (fully private), or **DuckDuckGo** as a fallback. All reasoning stays on‑device.
 - **Password‑protected tab** — lock the whole Local AI / History tab behind its own unique Argon2id password (separate from the vault, media, and bookmark passwords).
 
+### 🔒 Security (defense‑in‑depth)
+Two attacker classes are defended against: a malicious/exploited **web page or renderer**, and a **memory‑corruption bug** in the C/C++ surface (WebKitGTK). Each protection is honestly tagged by how strong a boundary it really is — tripwires aren't sold as walls.
+- **Vault unreachable from web content [BOUNDARY].** Decrypted secrets live only in the Rust backend; browsed pages can't call vault commands or enumerate it. Autofill is bound to the page's *real* origin and injected directly into the page — the password never reaches page‑readable JS.
+- **Redact‑by‑default [HARDENING].** Password/OTP lists are metadata‑only; a single secret is revealed through one **gated, rate‑limited, audited** path, and OTP codes are generated in the backend so the seed never leaves it. Every vault access is logged.
+- **Sandboxing [BOUNDARY].** WebKitGTK renderer sandbox (bubblewrap + seccomp) is on; the `yt‑dlp` helper runs confined (no‑new‑privs + Landlock + seccomp) — write‑limited to your downloads folder.
+- **In‑process hygiene [HYGIENE].** Secrets are zeroized on drop, mlock'd, kept out of swap/core dumps; constant‑time secret comparison.
+- **Hardened build [HARDENING].** Full RELRO, PIE/ASLR, non‑exec stack, FORTIFY/stack‑protector/CET for bundled C; CI verifies the flags and runs `cargo‑audit`/`cargo‑deny`. Optional GrapheneOS **hardened_malloc** preload (`scripts/build-hardened-malloc.sh`).
+- **Security panel.** A right‑dock panel shows live posture (engine isolation — **Servo = safe Rust** vs **WebKit = C/C++**, sandbox/allocator/integrity) and an event feed. An optional, clearly‑labeled **AI assistant is advisory only** — it explains/triages, never authorizes or unblocks, treats logs as untrusted data, and stores its analysis separately from your browsing data.
+
+> **Out of scope:** none of this stops an attacker who already runs code as your user. For that, run Reclaim on a hardened OS base (e.g. [secureblue](https://secureblue.dev)) with full‑disk encryption.
+
 ---
 
 ## Prerequisites
@@ -179,6 +190,12 @@ Bundles are written to `apps/reclaim/src-tauri/target/release/bundle/` (`.deb`, 
 
 ### Useful flags
 - `EARTH_EMBED=x11` — opt into the legacy X11 page‑surface embed (default is the GTK overlay embed).
+
+#### Security toggles (all default to ON / safe; set to `0` to disable)
+- `RECLAIM_WEBKIT_SANDBOX=0` — disable the WebKitGTK renderer sandbox (debugging only).
+- `RECLAIM_SANDBOX_HELPERS=0` — disable Landlock/seccomp confinement of helper processes (yt‑dlp).
+- `RECLAIM_HARDENED_MALLOC=0` — disable hardened_malloc preload (only active if you built it via `scripts/build-hardened-malloc.sh`; `RECLAIM_HMALLOC_VARIANT=light` for the light variant).
+- `RECLAIM_SECURITY_CURATOR=0` — disable the optional advisory AI in the Security panel (the deterministic panel keeps working).
 
 ---
 

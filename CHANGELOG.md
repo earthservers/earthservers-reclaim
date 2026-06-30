@@ -5,6 +5,101 @@ All notable changes to Earth Reclaim are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.8] - 2026-06-29
+
+### Security
+Defense-in-depth hardening against memory-corruption exploits and in-process theft of
+secrets (the password/OTP vault, cookies, tokens). Each item is tagged by how strong a
+boundary it really is — we don't oversell tripwires.
+
+- **Vault isolation [BOUNDARY].** Saved logins are bound to the *real* page origin (read
+  from the live webview, never a page- or caller-supplied string), so a malicious page can
+  no longer trick an autofill into leaking another site's credential. Autofill injects the
+  password directly into the page in the backend and never returns it to JS. A page cannot
+  read or enumerate the vault by construction.
+- **Redact-by-default [HARDENING].** The password/OTP lists now return *metadata only* — no
+  plaintext. A single secret is fetched on demand through one gated, **rate-limited and
+  audited** path (`vault_reveal`), and OTP codes are generated in the backend so the TOTP
+  seed never reaches the UI. This contains the blast radius of a compromised UI: no silent
+  mass-dump.
+- **Append-only vault audit log + live security feed.** Every secret access (allowed or
+  denied), origin mismatch, and rate-limit hit is recorded and surfaced.
+- **In-process secret hygiene [HYGIENE].** Decrypted secrets are zeroized on drop and the
+  cached master is mlock'd + kept out of core dumps; constant-time comparison for secrets;
+  the backend disables core dumps so a crash can't spill plaintext to disk.
+- **Sandboxing [BOUNDARY].** The WebKitGTK renderer sandbox (bubblewrap + seccomp) is now
+  enabled, and the `yt-dlp` helper runs confined (no-new-privs + Landlock + seccomp): it can
+  only write to your downloads folder and can't inspect other processes.
+- **Allocator hardening [HARDENING].** Optional GrapheneOS hardened_malloc preload for the
+  process tree (build it with `scripts/build-hardened-malloc.sh`; disable with
+  `RECLAIM_HARDENED_MALLOC=0`).
+- **Compile-time hardening [HARDENING].** Full RELRO + immediate binding, PIE/ASLR, non-exec
+  stack, and FORTIFY/stack-protector/stack-clash/CET for bundled C code; a CI job verifies
+  the flags actually land in the binary, plus `cargo-audit`/`cargo-deny` supply-chain checks.
+- **Security panel.** A new right-dock **Security** panel shows a live posture header (engine
+  isolation — Servo = safe Rust vs WebKit = C/C++, sandbox/allocator/integrity status) and an
+  event feed, each item honestly tagged. A startup integrity self-check
+  [DEFENSE-IN-DEPTH] flags corruption/tampering (not anti-tamper against root — we say so).
+- **AI security assistant (advisory only).** An optional, clearly-labeled "AI · advisory"
+  overlay summarizes/translates/triages events. It can never authorize, unblock, or suppress
+  anything; security log text is treated as untrusted (prompt-injection-guarded) and stored
+  separately from your browsing data. The panel works fully with it disabled.
+
+### Added
+- **Multiple windows.** Opening a new window (desktop tray / launcher) used to start a
+  whole second copy of the app — two processes fighting over the same controls server
+  and GPU video path, which caused crashes, duplicate control bars, and one window's
+  controls driving the other. New windows now open **inside the running app**
+  (single-instance), so they share one backend and behave predictably.
+- **One shared media-controls bar across all windows** that follows the **last-clicked
+  video pane** in any window. Each window's videos are independent players.
+- **Per-window drag-and-drop** of media files, and working **window controls** (move,
+  minimize, maximize, close) on every window; new windows open maximized.
+- **Model reasoning in the AI Research/chat tool.** Thinking-capable models (e.g.
+  deepseek-r1, qwen3, gpt-oss) now stream their reasoning under a 💭 *Thinking* header
+  above the answer (with a graceful fallback for models that don't support it).
+- **Idle auto-hide** for the floating media controls and the mouse cursor — they hide
+  after a few seconds of inactivity and return on movement.
+
+### Fixed
+- **Escape now exits video fullscreen.** The native video surface renders above the
+  page, hiding the on-screen exit control, so there was no way out; Escape is now wired
+  up for both the native and CSS fullscreen paths.
+- **The floating controls now show the active video's title** and an **exit-fullscreen
+  button** (the in-page title/exit are occluded by the video in fullscreen).
+- **Clearing/removing the queue no longer leaves images stuck** in unselected panes, and
+  panes no longer show duplicate images.
+- **Duplicate image title** stacked in the fullscreen overlay is gone.
+- **Typing a URL navigates the current tab** (classic address-bar behavior). The
+  "When opening links" toggle now only affects link/domain **clicks** — clicking a
+  domain opens a new tab (New Tab) or reuses the tab (Overwrite) per the setting.
+- Code-created windows no longer fall into browser/mock mode (they were missing window
+  controls and real data). Secondary windows are **media-only** (the browser engine is
+  single-window), so the Search button is hidden there and they open on Media.
+- **Drag-and-drop now works on a second window.** Dropping video files onto a second
+  window's Media panes did nothing — the drop was being routed to the main window (or
+  nowhere) because the webview's reported identity was wrong for code-created windows.
+  Drops are now delivered straight to the window they land on. A dropped file is also no
+  longer added two or three times.
+- **The floating controls now appear and work for a second window's video.** They used
+  to stay hidden unless you first played something in the main window, and you couldn't
+  drive a second window's video from them. The controls now show for whichever window
+  starts playing.
+- **The controls follow the last-clicked video across windows — in both directions.**
+  Clicking back to the first window's video now returns the controls (and its shuffle/
+  repeat/skip/playlist actions) to it; previously they got stuck on the other window.
+- **Closing a second window while videos are playing no longer crashes the app.** The
+  window's video pipelines are now stopped and their native surfaces torn down before the
+  window closes, instead of being destroyed out from under the still-running video (which
+  triggered an X11 `RenderBadPicture` crash).
+- **Second windows reliably open on the Media tab.** Restoring the shared profile's last
+  tab could flip a freshly-opened second window to Search; that restore now only runs in
+  the main window.
+
+### Changed
+- **Fullscreen header:** Shuffle/Repeat moved to the left of the slideshow controls.
+- Quieted noisy debug logging in the terminal and DevTools console.
+
 ## [1.0.7] - 2026-06-28
 
 ### Fixed

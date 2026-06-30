@@ -14,11 +14,24 @@ interface MediaState {
   title: string;
   isShuffled: boolean;
   repeatMode: 'none' | 'all' | 'one';
+  isFullscreen: boolean;
 }
 
 const WS_URL = 'ws://127.0.0.1:9876';
 
+// This controls window belongs to one app window, passed as ?win=<label>. The
+// single shared WebSocket server broadcasts every window's status, so we filter to
+// our own (by the player-id prefix) and tag every command we send with our label.
+function readWindowLabel(): string {
+  try {
+    return new URLSearchParams(window.location.search).get('win') || 'main';
+  } catch {
+    return 'main';
+  }
+}
+
 export function MediaControls() {
+  const winLabelRef = useRef<string>(readWindowLabel());
   const [state, setState] = useState<MediaState>({
     playerId: '',
     isPlaying: false,
@@ -29,6 +42,7 @@ export function MediaControls() {
     title: '',
     isShuffled: false,
     repeatMode: 'none',
+    isFullscreen: false,
   });
   const [isConnected, setIsConnected] = useState(false);
   const [isCollapsed, setIsCollapsed] = useState(false);
@@ -61,6 +75,9 @@ export function MediaControls() {
         ws.onmessage = (event) => {
           try {
             const data = JSON.parse(event.data);
+            // ONE shared controls webview follows the last-clicked pane across all
+            // windows, so we show whatever the server broadcasts (the globally-active
+            // player) — no per-window filtering.
             if (mounted) {
               setState(prev => ({
                 ...prev,
@@ -73,6 +90,7 @@ export function MediaControls() {
                 title: data.title || prev.title,
                 isShuffled: data.isShuffled ?? prev.isShuffled,
                 repeatMode: data.repeatMode || prev.repeatMode,
+                isFullscreen: data.isFullscreen ?? prev.isFullscreen,
               }));
             }
           } catch (err) {
@@ -113,10 +131,17 @@ export function MediaControls() {
     };
   }, []);
 
-  // Send command via WebSocket
+  // Send command via WebSocket. Always tag it with our window label so the server
+  // routes window-scoped actions (move/resize/shuffle/exit-fullscreen/…) back to
+  // the correct app window and its controls.
   const sendCommand = useCallback((cmd: string, params: Record<string, unknown> = {}) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ cmd, playerId: state.playerId || undefined, ...params }));
+      wsRef.current.send(JSON.stringify({
+        cmd,
+        playerId: state.playerId || undefined,
+        window: winLabelRef.current,
+        ...params,
+      }));
     }
   }, [state.playerId]);
 
@@ -165,6 +190,7 @@ export function MediaControls() {
   const togglePlaylist = () => sendCommand('togglePlaylist');
   const previousVideo = () => sendCommand('previousVideo');
   const nextVideo = () => sendCommand('nextVideo');
+  const exitFullscreen = () => sendCommand('exitFullscreen');
 
   const handleProgressClick = (e: React.MouseEvent<HTMLDivElement>) => {
     if (!progressRef.current || state.duration <= 0) return;
@@ -230,7 +256,7 @@ export function MediaControls() {
     const deltaY = e.screenY - dragStart.y;
     // Send move command via WebSocket
     if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ cmd: 'moveWindow', deltaX, deltaY }));
+      wsRef.current.send(JSON.stringify({ cmd: 'moveWindow', deltaX, deltaY, window: winLabelRef.current }));
     }
     setDragStart({ x: e.screenX, y: e.screenY });
   }, [isDragging, dragStart]);
@@ -290,7 +316,7 @@ export function MediaControls() {
         style={{ cursor: isDragging ? 'grabbing' : 'grab' }}
         onMouseDown={handleMouseDown}
       >
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-1 min-w-0">
           {/* Collapse/Expand toggle */}
           <button
             // Toggle on mousedown and stop it reaching the header's drag handler
@@ -299,21 +325,22 @@ export function MediaControls() {
             // and click a bit"). pointerdown/mousedown here is reliable in the
             // embedded WebKitGTK controls window.
             onMouseDown={(e) => { e.stopPropagation(); e.preventDefault(); setIsCollapsed(v => !v); }}
-            className="p-0.5 text-gray-400 hover:text-white transition-colors"
+            className="p-0.5 text-gray-400 hover:text-white transition-colors flex-shrink-0"
             title={isCollapsed ? "Expand" : "Collapse"}
           >
             <svg className={`w-3.5 h-3.5 transition-transform ${isCollapsed ? 'rotate-180' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
             </svg>
           </button>
-          <span className="text-[10px] text-gray-400 font-medium truncate max-w-[120px]">
+          {/* Title fills the width up to the timestamp, then truncates. */}
+          <span className="text-[10px] text-gray-400 font-medium truncate min-w-0 flex-1">
             {state.title || 'Media Controls'}
           </span>
           {!isConnected && (
-            <span className="text-[9px] text-yellow-500">(reconnecting...)</span>
+            <span className="text-[9px] text-yellow-500 flex-shrink-0">(reconnecting...)</span>
           )}
         </div>
-        <div className="text-[10px] text-gray-400 font-mono whitespace-nowrap">
+        <div className="text-[10px] text-gray-400 font-mono whitespace-nowrap flex-shrink-0 pl-2">
           {formatTime(state.currentTime)} / {formatTime(state.duration)}
         </div>
       </div>
@@ -460,6 +487,21 @@ export function MediaControls() {
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 10h16M4 14h16M4 18h16" />
                 </svg>
               </button>
+
+              {/* Exit fullscreen — only shown while the app is in media fullscreen,
+                  where the DOM exit affordance is hidden behind the video surface. */}
+              {state.isFullscreen && (
+                <button
+                  onClick={exitFullscreen}
+                  className="p-1.5 text-gray-500 hover:text-white transition-colors"
+                  title="Exit fullscreen (Esc)"
+                >
+                  {/* compress / exit-fullscreen icon */}
+                  <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 9L4 4m0 0v4m0-4h4m7 5l5-5m0 0v4m0-4h-4m-3 11l5 5m0 0v-4m0 4h-4M9 15l-5 5m0 0v-4m0 4h4" />
+                  </svg>
+                </button>
+              )}
             </div>
           </div>
         </div>

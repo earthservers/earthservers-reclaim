@@ -6,6 +6,7 @@ import { ProfileManager } from './components/ProfileManager';
 import { IncognitoToggle, IncognitoBanner } from './components/IncognitoToggle';
 import { DownloadsButton } from './components/DownloadsButton';
 import { PrivacyButton } from './components/PrivacyButton';
+import { SecurityMonitor } from './components/SecurityMonitor';
 import { SecurityButton } from './components/SecurityButton';
 import { HistoryViewer } from './components/HistoryViewer';
 import { ThemeCustomizer } from './components/ThemeCustomizer';
@@ -54,7 +55,6 @@ function PointerButton({
       e.preventDefault();
       e.stopPropagation();
       e.stopImmediatePropagation();
-      console.log(`${title} pointerdown triggered`);
       // Use requestAnimationFrame to ensure action runs after event processing
       requestAnimationFrame(() => action());
     };
@@ -63,7 +63,6 @@ function PointerButton({
     const handleTouchStart = (e: TouchEvent) => {
       e.preventDefault();
       e.stopPropagation();
-      console.log(`${title} touchstart triggered`);
       requestAnimationFrame(() => action());
     };
 
@@ -145,6 +144,27 @@ function loadAiSettings(): AiSettings {
 
 function App() {
   const [activeService, setActiveService] = useState<'search' | 'memory' | 'media' | 'scraper' | 'ai'>('search');
+  // The browser engine is single-window (hard-wired to the "main" window), so any
+  // OTHER window is media-only: hide the Search (browser) service there, default it
+  // to Media, and never let it touch the global browser surface. `isMainWindow` is
+  // null until the backend resolves the authoritative window label — browser ops
+  // stay gated on `=== true` so a secondary window (or the brief pre-resolve moment)
+  // can't hide/disrupt the main window's page.
+  const [isMainWindow, setIsMainWindow] = useState<boolean | null>(null);
+  useEffect(() => {
+    if (!isTauri()) { setIsMainWindow(true); return; }
+    invoke<string>('media_window_label')
+      .then((label) => {
+        const main = !label || label === 'main';
+        setIsMainWindow(main);
+        if (!main) setActiveService('media');
+      })
+      .catch(() => setIsMainWindow(true));
+  }, []);
+  const isSecondaryWindow = isMainWindow === false;
+  const serviceItems = isSecondaryWindow
+    ? mainServiceItems.filter((i) => i.id !== 'search')
+    : mainServiceItems;
   const [activeProfile, setActiveProfile] = useState<Profile | null>(null);
   const [isIncognito, setIsIncognito] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
@@ -205,7 +225,10 @@ function App() {
   const [fillPrompt, setFillPrompt] = useState<{ origin: string; username: string; locked: boolean } | null>(null);
 
   // Handle opening a URL - creates a new tab with that URL
-  const handleOpenUrl = async (url: string) => {
+  // `fromAddressBar` = the user TYPED a URL (address bar) → navigate the current tab
+  // (classic browser behavior). A link/domain CLICK omits it and respects the
+  // "When opening links" toggle (New Tab opens a new tab; Overwrite reuses the tab).
+  const handleOpenUrl = async (url: string, opts?: { fromAddressBar?: boolean }) => {
     // Handle internal earth:// URLs - just create EarthSearch tab
     if (url.startsWith('earth://')) {
       try {
@@ -226,6 +249,21 @@ function App() {
 
     // Ensure URL has protocol for real URLs
     const fullUrl = url.startsWith('http') ? url : `https://${url}`;
+
+    // Navigate the CURRENT tab only for typed URLs (address bar) or Overwrite mode;
+    // link/domain clicks in New Tab / All New mode fall through to a new tab.
+    const navigateCurrent = !!activeTab?.id && (opts?.fromAddressBar || tabBehavior === 'overwrite-search');
+    if (navigateCurrent && activeTab?.id) {
+      try {
+        await invoke('navigate', { tabId: activeTab.id, url: fullUrl });
+        setActiveTab({ ...activeTab, url: fullUrl, title: new URL(fullUrl).hostname });
+        setTabRefreshTrigger(prev => prev + 1);
+        setActiveService('search');
+        return;
+      } catch (err) {
+        console.error('Failed to navigate current tab, falling back to new tab:', err);
+      }
+    }
 
     try {
       // Create a new tab with this URL
@@ -265,16 +303,13 @@ function App() {
     // F11 fullscreen toggle and F12 dev tools handler
     // Use capture phase to catch events before WebKitGTK can intercept them
     const handleKeyDown = (e: KeyboardEvent) => {
-      console.log('Key pressed:', e.key, e.code);
       if (e.key === 'F11' || e.code === 'F11') {
         e.preventDefault();
         e.stopPropagation();
-        console.log('F11 pressed - toggling fullscreen');
         toggleFullscreen();
       } else if (e.key === 'F12' || e.code === 'F12') {
         e.preventDefault();
         e.stopPropagation();
-        console.log('F12 pressed - toggling devtools');
         toggleDevTools();
       }
     };
@@ -474,7 +509,10 @@ function App() {
   // page DURING a load is owned by the backend (browser_surface) which keeps the
   // page hidden until it has painted, so a load's blank first paint never shows.
   useEffect(() => {
-    if (!isTauri()) return;
+    // Only the MAIN window owns the (single, global) browser surface. Secondary
+    // windows must never call browser_surface_show/hide or they'd toggle the main
+    // window's page.
+    if (!isTauri() || isMainWindow !== true) return;
     const url = activeTab?.url ?? '';
     // `.earth` tabs render in Servo's own window — never show the embedded
     // WebKitGTK surface for them, even though the URL is http(s).
@@ -485,7 +523,7 @@ function App() {
       engine !== 'servo' &&
       (url.startsWith('http://') || url.startsWith('https://'));
     invoke(isBrowsing ? 'browser_surface_show' : 'browser_surface_hide').catch(() => {});
-  }, [activeService, activeTab?.url, activeTab?.id, mediaFullscreen, engineByTab]);
+  }, [activeService, activeTab?.url, activeTab?.id, mediaFullscreen, engineByTab, isMainWindow]);
 
   // Leaving the Media service: stop all media players and HIDE the floating
   // controls, so nothing keeps playing in the background and the controls don't
@@ -567,8 +605,9 @@ function App() {
   }, [isIncognito, activeProfile?.id, aiSettings.curator]);
 
   // Autofill: when a page with a login form asks, look up saved credentials and
-  // fill them. `vault_find_login` returns null unless the password vault is
-  // unlocked, so a locked vault simply never fills.
+  // fill them. The fill is bound to the REAL page origin in the backend and the
+  // secret is injected directly into the page (never returned to JS); a locked
+  // vault simply never fills.
   useEffect(() => {
     if (!isTauri()) return;
     let unlisten: (() => void) | undefined;
@@ -641,7 +680,11 @@ function App() {
   // the search page while the right tab looks selected. Runs when the profile
   // resolves (the TabBar→App notify was unreliable across the async profile load).
   useEffect(() => {
-    if (!isTauri() || !activeProfile?.id) return;
+    // Only the main window restores the browser tab / switches to Search. Secondary
+    // windows are media-only (Search is hidden there) and default to Media — restoring
+    // the shared profile's active tab would wrongly flip them to Search. Gated on
+    // `=== true` so it also waits out the brief pre-resolve moment (null), then re-runs.
+    if (!isTauri() || !activeProfile?.id || isMainWindow !== true) return;
     invoke<Tab[]>('get_all_tabs', { profileId: activeProfile.id })
       .then(tabs => {
         const active = tabs.find(t => t.is_active) ?? tabs[0];
@@ -651,7 +694,7 @@ function App() {
         }
       })
       .catch(() => {});
-  }, [activeProfile?.id]);
+  }, [activeProfile?.id, isMainWindow]);
 
   // NoScript (Phase 1): the web-process extension reports each distinct request
   // origin it sees on a page. For now we just log them to confirm the extension
@@ -659,8 +702,7 @@ function App() {
   useEffect(() => {
     if (!isTauri()) return;
     let unlisten: (() => void) | undefined;
-    listen<string>('noscript-origin', ({ payload }) => {
-      console.log('[noscript] origin seen on page:', payload);
+    listen<string>('noscript-origin', () => {
     }).then(u => { unlisten = u; });
     return () => unlisten?.();
   }, []);
@@ -731,7 +773,10 @@ function App() {
                   <div className="flex items-center gap-2">
                     <button
                       onClick={async () => {
-                        try { await invoke('vault_autofill', { profileId: activeProfile?.id ?? 1, origin: fillPrompt.origin }); } catch { /* ignore */ }
+                        // The backend ignores any caller-supplied origin and fills
+                        // for the page actually on screen (origin read from the live
+                        // webview); `originHint` is advisory only.
+                        try { await invoke('vault_autofill', { profileId: activeProfile?.id ?? 1, originHint: fillPrompt.origin }); } catch { /* ignore */ }
                         setFillPrompt(null);
                       }}
                       className="flex-1 px-3 py-2 rounded-lg text-sm bg-[var(--primary-color)] text-white hover:opacity-90 transition-opacity"
@@ -847,7 +892,6 @@ function App() {
                   target.closest('a') === null &&
                   target.closest('select') === null) {
                 e.preventDefault();
-                console.log('Starting window drag');
                 startDragging();
               }
             }}
@@ -880,7 +924,7 @@ function App() {
                 {!navbarCollapsed && (
                 <div className="flex items-center gap-1 sm:gap-1.5 lg:gap-2">
                   {/* Main service items */}
-                  {mainServiceItems.map((item) => (
+                  {serviceItems.map((item) => (
                     <PointerButton
                       key={item.id}
                       action={() => setActiveService(item.id)}
@@ -1098,6 +1142,13 @@ function App() {
                     <SecurityButton profileId={activeProfile?.id ?? 1} />
                   </div>
 
+                  <div
+                    className={`transition-all duration-300 ${navbarCollapsed ? 'opacity-0 w-0 overflow-hidden pointer-events-none' : 'opacity-100'}`}
+                    style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
+                  >
+                    <SecurityMonitor activeEngine={activeTab ? engineByTab[activeTab.id] : undefined} />
+                  </div>
+
                   {/* Incognito Toggle */}
                   <div
                     className={`transition-all duration-300 ${navbarCollapsed ? 'opacity-0 w-0 overflow-hidden pointer-events-none' : 'opacity-100'}`}
@@ -1213,7 +1264,7 @@ function App() {
               url={activeTab.url}
               tabId={activeTab.id}
               profileId={activeProfile?.id ?? 1}
-              onNavigate={handleOpenUrl}
+              onNavigate={(url) => handleOpenUrl(url, { fromAddressBar: true })}
             />
           )}
           </div>{/* End Browser Chrome Container */}
@@ -1335,7 +1386,7 @@ function App() {
             isOpen={showBookmarkManager}
             initialFolderId={managerFolderId}
             onClose={() => setShowBookmarkManager(false)}
-            onNavigate={(url) => console.log('Navigate to:', url)}
+            onNavigate={() => {}}
           />
 
           {/* Password Manager Modal */}
@@ -1489,7 +1540,7 @@ function Home({ activeService, profileId, onOpenUrl, activeTab, onMediaFullscree
           tabId={activeTab.id}
           profileId={profileId || 1}
           onNavigate={(newUrl) => onOpenUrl?.(newUrl)}
-          onTitleChange={(title) => console.log('Title:', title)}
+          onTitleChange={() => {}}
           onEngine={onEngine}
           chromeHeight={chromeHeight}
           hideNavBar={true}

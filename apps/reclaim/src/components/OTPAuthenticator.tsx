@@ -6,12 +6,14 @@ import { invoke } from '../lib/tauri';
 import { RightDockPanel } from '../lib/rightDock';
 import { VaultAutofill } from './VaultAutofill';
 
+// Redact-by-default: the list holds METADATA ONLY — the base32 seed never crosses
+// into JS. Current codes are generated in the Rust backend (`vault_otp_codes`) so
+// the seed stays in the process that legitimately holds it.
 export interface OTPEntry {
   id: number;
   profile_id: number;
   name: string;
   issuer: string;
-  secret: string; // Base32 encoded secret
   algorithm: 'SHA1' | 'SHA256' | 'SHA512';
   digits: number;
   period: number;
@@ -24,64 +26,13 @@ interface OTPAuthenticatorProps {
   onClose: () => void;
 }
 
-// RFC 4648 base32 decode (TOTP secrets are base32). Ignores padding/whitespace
-// and any non-alphabet characters.
-function base32Decode(input: string) {
-  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
-  const clean = input.replace(/=+$/, '').replace(/\s+/g, '').toUpperCase();
-  let bits = 0;
-  let value = 0;
-  const out: number[] = [];
-  for (const ch of clean) {
-    const idx = alphabet.indexOf(ch);
-    if (idx === -1) continue;
-    value = (value << 5) | idx;
-    bits += 5;
-    if (bits >= 8) {
-      bits -= 8;
-      out.push((value >>> bits) & 0xff);
-    }
-  }
-  return new Uint8Array(out);
-}
-
-// Proper RFC 6238 TOTP: HMAC-SHA1/256/512 over the time counter, with dynamic
-// truncation. Async because it uses the Web Crypto SubtleCrypto HMAC. Interops
-// with Google/Microsoft Authenticator and friends.
-async function generateTOTP(
-  secret: string,
-  algorithm: string = 'SHA1',
-  digits: number = 6,
-  period: number = 30,
-): Promise<string> {
-  const key = base32Decode(secret);
-  if (key.length === 0) return '•'.repeat(digits);
-
-  const counter = Math.floor(Date.now() / 1000 / period);
-  // 8-byte big-endian counter.
-  const buf = new ArrayBuffer(8);
-  const view = new DataView(buf);
-  view.setUint32(0, Math.floor(counter / 2 ** 32));
-  view.setUint32(4, counter >>> 0);
-
-  const hashName = { SHA1: 'SHA-1', SHA256: 'SHA-256', SHA512: 'SHA-512' }[algorithm] || 'SHA-1';
-  const cryptoKey = await crypto.subtle.importKey(
-    'raw',
-    key,
-    { name: 'HMAC', hash: hashName },
-    false,
-    ['sign'],
-  );
-  const hmac = new Uint8Array(await crypto.subtle.sign('HMAC', cryptoKey, buf));
-
-  // Dynamic truncation (RFC 4226 §5.3).
-  const offset = hmac[hmac.length - 1] & 0x0f;
-  const binCode =
-    ((hmac[offset] & 0x7f) << 24) |
-    (hmac[offset + 1] << 16) |
-    (hmac[offset + 2] << 8) |
-    hmac[offset + 3];
-  return (binCode % 10 ** digits).toString().padStart(digits, '0');
+// TOTP generation moved to the Rust backend (`vault_otp_codes`, RFC 6238) so the
+// base32 seed never reaches page-readable JS. The frontend only displays the
+// computed code + countdown it polls from the backend.
+interface OtpCode {
+  id: number;
+  code: string;
+  remaining: number;
 }
 
 export function OTPAuthenticator({ profileId, isOpen, onClose }: OTPAuthenticatorProps) {
@@ -95,9 +46,10 @@ export function OTPAuthenticator({ profileId, isOpen, onClose }: OTPAuthenticato
   const [searchQuery, setSearchQuery] = useState('');
   const [currentTime, setCurrentTime] = useState(Date.now());
   const [copiedId, setCopiedId] = useState<number | null>(null);
-  // Current TOTP code per entry id. Recomputed (async HMAC) as the time window
-  // advances, so render stays synchronous.
+  // Current TOTP code + seconds-remaining per entry id, polled from the backend
+  // (the seed never reaches JS). Render stays synchronous off these maps.
   const [codes, setCodes] = useState<Record<number, string>>({});
+  const [remaining, setRemaining] = useState<Record<number, number>>({});
 
   // Update time every second for TOTP countdown
   useEffect(() => {
@@ -107,25 +59,31 @@ export function OTPAuthenticator({ profileId, isOpen, onClose }: OTPAuthenticato
     return () => clearInterval(interval);
   }, []);
 
-  // Recompute codes whenever the entries or the 1s tick change. HMAC over a
-  // handful of entries is cheap; the codes only actually change on period
-  // boundaries.
+  // Poll the backend for current codes on each 1s tick. The seed stays in Rust;
+  // only the code string + seconds-remaining come back. Cheap (a few HMACs over a
+  // local IPC call) and the codes only actually change on period boundaries.
   const tick = Math.floor(currentTime / 1000);
   useEffect(() => {
+    if (!isUnlocked || entries.length === 0) { setCodes({}); return; }
     let cancelled = false;
     (async () => {
-      const next: Record<number, string> = {};
-      for (const e of entries) {
-        try {
-          next[e.id] = await generateTOTP(e.secret, e.algorithm, e.digits, e.period);
-        } catch {
-          next[e.id] = '•'.repeat(e.digits);
+      try {
+        const rows = await invoke<OtpCode[]>('vault_otp_codes', { profileId });
+        if (cancelled) return;
+        const next: Record<number, string> = {};
+        const rem: Record<number, number> = {};
+        for (const r of rows) {
+          next[r.id] = r.code || '•'.repeat(6);
+          rem[r.id] = r.remaining;
         }
+        setCodes(next);
+        setRemaining(rem);
+      } catch {
+        if (!cancelled) setCodes({});
       }
-      if (!cancelled) setCodes(next);
     })();
     return () => { cancelled = true; };
-  }, [entries, tick]);
+  }, [entries, tick, isUnlocked, profileId]);
 
   useEffect(() => {
     if (isOpen) {
@@ -308,7 +266,9 @@ export function OTPAuthenticator({ profileId, isOpen, onClose }: OTPAuthenticato
               <div className="space-y-3">
                 {filteredEntries.map(entry => {
                   const code = codes[entry.id] ?? '•'.repeat(entry.digits);
-                  const timeRemaining = getTimeRemaining(entry.period);
+                  // Prefer the backend's authoritative seconds-remaining; fall back
+                  // to the local clock between polls.
+                  const timeRemaining = remaining[entry.id] ?? getTimeRemaining(entry.period);
                   const isLow = timeRemaining <= 5;
 
                   return (
@@ -433,18 +393,20 @@ function OTPEntryModal({
 }) {
   const [name, setName] = useState(entry?.name || '');
   const [issuer, setIssuer] = useState(entry?.issuer || '');
-  const [secret, setSecret] = useState(entry?.secret || '');
+  // The seed is never sent to the UI. New entry: required. Editing: blank means
+  // "keep the existing seed" (the backend preserves it).
+  const [secret, setSecret] = useState('');
   const [algorithm, setAlgorithm] = useState<'SHA1' | 'SHA256' | 'SHA512'>(entry?.algorithm || 'SHA1');
   const [digits, setDigits] = useState(entry?.digits || 6);
   const [period, setPeriod] = useState(entry?.period || 30);
 
   const handleSave = async () => {
-    if (!name.trim() || !issuer.trim() || !secret.trim()) {
+    if (!name.trim() || !issuer.trim() || (!entry && !secret.trim())) {
       alert('Please fill in all required fields');
       return;
     }
 
-    // Clean up the secret (remove spaces and dashes)
+    // Clean up the secret (remove spaces and dashes); blank on edit = keep current.
     const cleanSecret = secret.replace(/[\s-]/g, '').toUpperCase();
 
     try {
@@ -513,16 +475,18 @@ function OTPEntryModal({
           </div>
 
           <div>
-            <label className="block text-sm text-gray-400 mb-1">Secret Key *</label>
+            <label className="block text-sm text-gray-400 mb-1">Secret Key {entry ? '' : '*'}</label>
             <input
               type="text"
               value={secret}
               onChange={(e) => setSecret(e.target.value)}
               className="w-full px-3 py-2 bg-gray-800 border border-gray-600 rounded focus:outline-none focus:border-[var(--primary-color)] font-mono"
-              placeholder="JBSWY3DPEHPK3PXP"
+              placeholder={entry ? 'Leave blank to keep current secret' : 'JBSWY3DPEHPK3PXP'}
             />
             <p className="text-xs text-gray-500 mt-1">
-              Enter the secret key provided by the service (usually shown as a code or under manual setup)
+              {entry
+                ? 'The stored secret is never shown. Leave blank to keep it, or paste a new one to replace it.'
+                : 'Enter the secret key provided by the service (usually shown as a code or under manual setup)'}
             </p>
           </div>
 

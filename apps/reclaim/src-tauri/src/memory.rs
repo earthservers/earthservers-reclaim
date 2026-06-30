@@ -387,6 +387,54 @@ impl MemoryManager {
         Ok(new_value == 1)
     }
 
+    /// Toggle the favorite flag for a page identified by its URL, creating a minimal
+    /// EarthMemory row if the page hasn't been cached yet — so a page can be favorited
+    /// straight from the address bar before the auto-curator has indexed it. The full
+    /// content/summary is filled in later by the curator (triggered alongside this).
+    /// Returns the new favorite state.
+    pub fn toggle_favorite_by_url(&self, url: &str, title: &str, profile_id: i64) -> Result<bool> {
+        let conn = Connection::open(&self.db_path)?;
+
+        let existing: Option<(i64, i64)> = conn.query_row(
+            "SELECT id, is_favorite FROM indexed_pages WHERE url = ?1 AND profile_id = ?2",
+            params![url, profile_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).ok();
+
+        match existing {
+            Some((id, current)) => {
+                let new_value = if current == 1 { 0 } else { 1 };
+                conn.execute(
+                    "UPDATE indexed_pages SET is_favorite = ?1 WHERE id = ?2 AND profile_id = ?3",
+                    params![new_value, id, profile_id],
+                )?;
+                Ok(new_value == 1)
+            }
+            None => {
+                // Not cached yet → insert a favorited placeholder row (content/summary
+                // arrive when the curator runs).
+                let now = chrono_now();
+                conn.execute(
+                    "INSERT INTO indexed_pages (url, title, content, summary, indexed_at, last_visited, visit_count, is_favorite, tags, profile_id)
+                     VALUES (?1, ?2, NULL, NULL, ?3, ?3, 0, 1, NULL, ?4)",
+                    params![url, title, now, profile_id],
+                )?;
+                Ok(true)
+            }
+        }
+    }
+
+    /// Whether the page at `url` is currently favorited (for the address-bar star).
+    pub fn is_favorited_by_url(&self, url: &str, profile_id: i64) -> Result<bool> {
+        let conn = Connection::open(&self.db_path)?;
+        let fav: Option<i64> = conn.query_row(
+            "SELECT is_favorite FROM indexed_pages WHERE url = ?1 AND profile_id = ?2",
+            params![url, profile_id],
+            |row| row.get(0),
+        ).ok();
+        Ok(fav == Some(1))
+    }
+
     /// Update page tags
     pub fn update_tags(&self, page_id: i64, profile_id: i64, tags: &str) -> Result<()> {
         let conn = Connection::open(&self.db_path)?;

@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)] // Phase 5: this crate needs no unsafe; enforce it.
 //! Earth Servo - Servo browser integration for Earth Reclaim
 //!
 //! This crate provides process-based Servo integration.

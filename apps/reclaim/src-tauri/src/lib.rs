@@ -29,6 +29,7 @@ mod assistant;
 mod research;
 mod ai_lock;
 mod assets_server;
+mod security;
 
 use std::sync::Mutex;
 use tauri::{
@@ -269,8 +270,74 @@ fn incognito_is_forced(profile_id: i64) -> bool {
 /// Mirror the media player's shuffle + repeat state (owned by the frontend) into
 /// the controls server, so the floating media controls reflect and stay in sync.
 #[tauri::command(rename_all = "camelCase")]
-fn set_media_playback_flags(is_shuffled: bool, repeat_mode: String) {
-    controls_server::set_playback_flags(is_shuffled, repeat_mode);
+fn set_media_playback_flags(window: String, is_shuffled: bool, repeat_mode: String) {
+    controls_server::set_playback_flags(window, is_shuffled, repeat_mode);
+}
+
+/// Mirror a window's active media title (owned by the frontend) into the controls
+/// server so its floating controls can label the currently-playing video.
+#[tauri::command(rename_all = "camelCase")]
+fn set_media_active_title(window: String, title: String) {
+    controls_server::set_active_title(window, title);
+}
+
+/// Mirror a window's media fullscreen state into the controls server so its floating
+/// controls can show an exit-fullscreen button (the DOM one is occluded by video).
+#[tauri::command(rename_all = "camelCase")]
+fn set_media_fullscreen(window: String, is_fullscreen: bool) {
+    controls_server::set_fullscreen(window, is_fullscreen);
+}
+
+/// The window label that currently OWNS the shared floating controls (the window of
+/// the last-active player). Empty if no player is active. The frontend uses this so a
+/// window only hides the (single, shared) controls when it's the one driving them — an
+/// idle/empty second window must not hide controls another window is using.
+#[tauri::command(rename_all = "camelCase")]
+fn controls_active_window() -> String {
+    controls_server::window_label_of(&controls_server::get_last_active_player())
+}
+
+/// The authoritative label of the calling window. The frontend uses this to
+/// namespace its player IDs / controls per window — `getCurrentWindow().label` in
+/// JS isn't reliable across "New Window" instances, so the backend (which always
+/// knows the real label) is the source of truth.
+#[tauri::command(rename_all = "camelCase")]
+fn media_window_label(window: tauri::Window) -> String {
+    window.label().to_string()
+}
+
+// Window controls done in the backend: the calling window is injected reliably here,
+// whereas JS `getCurrentWindow()` is unreliable for code-created windows (it can
+// target the wrong window), which left secondary windows unable to drag/close/resize.
+#[tauri::command(rename_all = "camelCase")]
+fn window_minimize(window: tauri::Window) -> Result<(), String> {
+    window.minimize().map_err(|e| e.to_string())
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn window_toggle_maximize(window: tauri::Window) -> Result<(), String> {
+    if window.is_maximized().unwrap_or(false) {
+        window.unmaximize().map_err(|e| e.to_string())
+    } else {
+        window.maximize().map_err(|e| e.to_string())
+    }
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn window_close(window: tauri::Window) -> Result<(), String> {
+    window.close().map_err(|e| e.to_string())
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn window_start_dragging(window: tauri::Window) -> Result<(), String> {
+    window.start_dragging().map_err(|e| e.to_string())
+}
+
+/// Drop a window's per-window controls state (so the status broadcast stops polling
+/// a dead player and the maps don't leak). Called when a window unloads.
+#[tauri::command(rename_all = "camelCase")]
+fn forget_media_window(window: String) {
+    controls_server::forget_window(&window);
 }
 
 // ==================== Identity Commands (Hardware Fingerprinting) ====================
@@ -1931,6 +1998,129 @@ async fn search_scraped_content(
 
 // ==================== Window Management Commands ====================
 
+/// Wire OS file drag-drop on a window to the Media panes by eval-ing a DOM
+/// `CustomEvent` straight into THAT window's webview.
+///
+/// Why not the Tauri event bus: the JS-listener registry is keyed by the listening
+/// webview's label, and a broadcast `app.emit` only reached the main window — a
+/// second window's `listen(...)` never received it (registry/identity mismatch under
+/// the `unstable` multiwebview model). And the JS-side identity APIs
+/// (getCurrentWebviewWindow()/onDragDropEvent) report label "main" for code-created
+/// windows, so the frontend can't bind to the right webview either. Eval sidesteps
+/// all of it: we hold the exact `WebviewWindow` handle, so the DOM event lands in the
+/// correct window with zero routing. EarthMultiMedia listens via
+/// `window.addEventListener('__earth_media_drop' | '__earth_media_drag_over' |
+/// '__earth_media_drag_leave', ...)`. Same backend-authoritative philosophy as the
+/// window controls (window_minimize, etc.).
+///
+/// NOTE: hooks `on_webview_event`, NOT `on_window_event`. With the `unstable` feature
+/// (see Cargo.toml) a WebviewWindow's content is a `WindowChild` webview, so wry
+/// dispatches drag-drop as a `WebviewEvent::DragDrop`, never a `WindowEvent::DragDrop`
+/// — an `on_window_event` handler compiles but silently never fires.
+/// Must be called once per window after it's built (and for "main" in setup()).
+fn wire_media_drag_drop(window: &tauri::WebviewWindow) {
+    let wv = window.clone();
+    window.on_webview_event(move |event| {
+        let tauri::WebviewEvent::DragDrop(drag) = event else { return };
+        match drag {
+            tauri::DragDropEvent::Enter { position, .. }
+            | tauri::DragDropEvent::Over { position } => {
+                let detail = serde_json::json!({ "x": position.x, "y": position.y });
+                let _ = wv.eval(format!(
+                    "window.dispatchEvent(new CustomEvent('__earth_media_drag_over',{{detail:{detail}}}))"
+                ));
+            }
+            tauri::DragDropEvent::Drop { paths, position } => {
+                let paths: Vec<String> = paths.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+                let detail = serde_json::json!({ "paths": paths, "x": position.x, "y": position.y });
+                let _ = wv.eval(format!(
+                    "window.dispatchEvent(new CustomEvent('__earth_media_drop',{{detail:{detail}}}))"
+                ));
+            }
+            tauri::DragDropEvent::Leave => {
+                let _ = wv.eval(
+                    "window.dispatchEvent(new CustomEvent('__earth_media_drag_leave'))".to_string()
+                );
+            }
+            _ => {}
+        }
+    });
+}
+
+/// Deliver a floating-controls "frontend-state" action (shuffle/repeat/playlist/skip/
+/// exit-fullscreen) to the window that owns the last-clicked pane. These live in React
+/// state, so they must reach the right window's webview. We eval a DOM CustomEvent
+/// straight into that webview rather than `app.emit` — a broadcast Tauri event never
+/// reaches a 2nd window's `listen(...)` (the JS-listener registry is keyed by the
+/// listening webview's label), the same reason drag-drop moved to eval.
+fn dispatch_media_control_action(app: &tauri::AppHandle, window_label: &str, action: &str) {
+    if let Some(wv) = app.get_webview_window(window_label) {
+        let detail = serde_json::json!({ "action": action });
+        let _ = wv.eval(format!(
+            "window.dispatchEvent(new CustomEvent('__earth_media_control_action',{{detail:{detail}}}))"
+        ));
+    }
+}
+
+/// Tear down all media owned by a window BEFORE its GTK window is destroyed.
+///
+/// Each pane's GStreamer pipeline binds an `xvimagesink` to a native X11 video surface
+/// layered over the webview. If the window is destroyed while a pipeline is still
+/// running, X11 destroys the surface out from under the sink, which then renders into a
+/// freed GdkWindow → "GdkWindow unexpectedly destroyed" / "RenderBadPicture" → the whole
+/// app crashes. So we stop+drop the pipelines first (releasing the sink's hold), then
+/// destroy the surfaces, then clear controls bookkeeping — all before the close proceeds.
+async fn teardown_media_for_window(app: &tauri::AppHandle, label: &str) {
+    let players = media_player::players_for_window(label);
+    for player_id in &players {
+        // 1) Stop the pipeline and BLOCK until it's actually NULL — the sink only
+        //    releases its X11 window during that teardown, so we must wait before
+        //    destroying the surface (set_state(Null) alone is async and races it).
+        media_player::stop_and_wait(player_id);
+        // 2) Now that the sink has let go, destroy the pane's X11 video surface.
+        let _ = video_surface::destroy_video_surface(player_id.clone()).await;
+        // 3) Drop the player entirely.
+        media_player::remove_player(player_id);
+    }
+    // 4) Drop this window's controls bookkeeping. The floating controls webview is a
+    //    shared singleton (NOT owned by this window), so we never destroy it here — but
+    //    if it was tracking this window's now-dead player, repoint it to nothing so the
+    //    status broadcast stops polling a removed player.
+    let prefix = format!("{}::", label);
+    if controls_server::get_last_active_player().starts_with(&prefix) {
+        controls_server::set_active_player_id(String::new());
+    }
+    controls_server::forget_window(label);
+    let _ = app; // reserved for future per-window controls retargeting
+}
+
+/// Run media teardown when a window is closed, BEFORE it's destroyed. Covers every
+/// close path (in-app titlebar X → `window_close` → `window.close()`, WM close, tray):
+/// they all fire `CloseRequested`. We hold the close, tear media down on the async
+/// runtime, then close for real. A one-shot guard lets the second close-request through.
+fn wire_window_close_cleanup(window: &tauri::WebviewWindow) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let app = window.app_handle().clone();
+    let label = window.label().to_string();
+    let cleaning = std::sync::Arc::new(AtomicBool::new(false));
+    window.on_window_event(move |event| {
+        let tauri::WindowEvent::CloseRequested { api, .. } = event else { return };
+        // Second pass (our own re-close after teardown) → let it through.
+        if cleaning.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        api.prevent_close();
+        let app = app.clone();
+        let label = label.clone();
+        tauri::async_runtime::spawn(async move {
+            teardown_media_for_window(&app, &label).await;
+            if let Some(w) = app.get_webview_window(&label) {
+                let _ = w.close();
+            }
+        });
+    });
+}
+
 /// Create a new window with a specific tab (for tab drag-out functionality)
 #[tauri::command(rename_all = "camelCase")]
 async fn create_detached_window(
@@ -1965,9 +2155,11 @@ async fn create_detached_window(
         builder
     };
 
-    builder
+    let window = builder
         .build()
         .map_err(|e| e.to_string())?;
+    wire_media_drag_drop(&window);
+    wire_window_close_cleanup(&window);
 
     Ok(window_id)
 }
@@ -2179,11 +2371,50 @@ fn locate_noscript_so(_resource_dir: Option<&std::path::Path>) -> Option<std::pa
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+/// Preload GrapheneOS hardened_malloc for the whole process tree, if available
+/// and not disabled. MUST be called as the very first thing in `main`, before any
+/// allocation-heavy init, because it may re-exec the process. No-op when the
+/// library isn't built/bundled (a plain build/run is unaffected). [HARDENING]
+pub fn preload_hardened_malloc() {
+    security::allocator::maybe_preload();
+}
+
 pub fn run() {
     // Note: GPU environment variables are set in main.rs BEFORE this function
     // to ensure they're set before any GTK/WebKit initialization
 
     tauri::Builder::default()
+        // MUST be the first plugin. The desktop tray / launcher starts the app binary
+        // a SECOND time to "open a new window"; without this, that's a whole separate
+        // process (two `main` windows, two controls bars, both fighting over the
+        // controls server + GPU video path → the crash + cross-control). Instead, hand
+        // off to the already-running instance, open an in-process window there, and let
+        // the second process exit. One process, multiple real windows.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            use tauri::{WebviewUrl, WebviewWindowBuilder, Manager};
+            // Reveal the existing main window in case it was hidden to the tray.
+            if let Some(main) = app.get_webview_window("main") {
+                let _ = main.show();
+                let _ = main.set_focus();
+            }
+            let window_id = format!("reclaim-{}", std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0));
+            if let Ok(win) = WebviewWindowBuilder::new(app, &window_id, WebviewUrl::App("index.html".into()))
+                .title("Reclaim")
+                .inner_size(1280.0, 720.0)
+                .min_inner_size(800.0, 600.0)
+                .resizable(true)
+                .maximized(true)
+                .decorations(false)
+                .transparent(false)
+                .build()
+            {
+                wire_media_drag_drop(&win);
+                wire_window_close_cleanup(&win);
+            }
+        }))
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
@@ -2232,6 +2463,14 @@ pub fn run() {
             }
             if let Err(e) = media_downloads::init(&db_path_str) {
                 log::error!("Failed to initialize media_downloads table: {}", e);
+            }
+            // Security subsystem: append-only vault audit log + live event sink for
+            // the Security panel. Deterministic; no LLM involved.
+            security::init(app.handle().clone(), &db_path_str);
+            // Runtime monitor: posture + startup integrity self-check (hashes the
+            // binary/resources against the bundled manifest, off the UI thread).
+            if let Ok(resource_dir) = app.path().resource_dir() {
+                security::monitor::init(resource_dir);
             }
 
             // Seed default domains and bookmarks for the active profile
@@ -2386,35 +2625,48 @@ pub fn run() {
                                 ControlCommand::GetStatus => {
                                     // Status is automatically sent on connect
                                 }
-                                ControlCommand::MoveWindow { delta_x, delta_y } => {
-                                    // Move the X11 webview controls window
-                                    if let Err(e) = video_surface::move_x11_webview_controls_by_delta(delta_x, delta_y) {
+                                ControlCommand::MoveWindow { delta_x, delta_y, window } => {
+                                    // Move the sending window's X11 controls window.
+                                    let label = window.unwrap_or_else(|| "main".to_string());
+                                    if let Err(e) = video_surface::move_x11_webview_controls_by_delta(&label, delta_x, delta_y) {
                                         log::warn!("Failed to move controls window: {}", e);
                                     }
                                 }
-                                ControlCommand::ResizeWindow { width, height } => {
-                                    // Resize the controls window to fit collapsed/expanded content.
-                                    if let Err(e) = video_surface::resize_x11_webview_controls(width, height).await {
+                                ControlCommand::ResizeWindow { width, height, window } => {
+                                    // Resize the sending window's controls (collapse/expand).
+                                    let label = window.unwrap_or_else(|| "main".to_string());
+                                    if let Err(e) = video_surface::resize_x11_webview_controls(&label, width, height).await {
                                         log::warn!("Failed to resize controls window: {}", e);
                                     }
                                 }
-                                ControlCommand::ToggleShuffle { player_id: _ } => {
-                                    // Shuffle/repeat live in the frontend; forward to the
-                                    // main window, which toggles state and pushes it back
-                                    // (via set_media_playback_flags) for the broadcast.
-                                    let _ = cmd_app.emit("media-control-action", serde_json::json!({ "action": "toggle-shuffle" }));
+                                // Shuffle/repeat/playlist/skip/exit live in the frontend. The single
+                                // shared controls drive the LAST-CLICKED pane, so route the action to
+                                // THAT pane's window (derived from the globally-active player) by
+                                // eval-ing a DOM event straight into its webview — a broadcast Tauri
+                                // event never reaches a 2nd window's listener.
+                                ControlCommand::ToggleShuffle { .. } => {
+                                    let label = controls_server::window_label_of(&controls_server::get_last_active_player());
+                                    dispatch_media_control_action(&cmd_app, &label, "toggle-shuffle");
                                 }
-                                ControlCommand::ToggleRepeat { player_id: _ } => {
-                                    let _ = cmd_app.emit("media-control-action", serde_json::json!({ "action": "cycle-repeat" }));
+                                ControlCommand::ToggleRepeat { .. } => {
+                                    let label = controls_server::window_label_of(&controls_server::get_last_active_player());
+                                    dispatch_media_control_action(&cmd_app, &label, "cycle-repeat");
                                 }
-                                ControlCommand::TogglePlaylist => {
-                                    let _ = cmd_app.emit("media-control-action", serde_json::json!({ "action": "toggle-playlist" }));
+                                ControlCommand::TogglePlaylist { .. } => {
+                                    let label = controls_server::window_label_of(&controls_server::get_last_active_player());
+                                    dispatch_media_control_action(&cmd_app, &label, "toggle-playlist");
                                 }
-                                ControlCommand::PreviousVideo => {
-                                    let _ = cmd_app.emit("media-control-action", serde_json::json!({ "action": "prev-video" }));
+                                ControlCommand::PreviousVideo { .. } => {
+                                    let label = controls_server::window_label_of(&controls_server::get_last_active_player());
+                                    dispatch_media_control_action(&cmd_app, &label, "prev-video");
                                 }
-                                ControlCommand::NextVideo => {
-                                    let _ = cmd_app.emit("media-control-action", serde_json::json!({ "action": "next-video" }));
+                                ControlCommand::NextVideo { .. } => {
+                                    let label = controls_server::window_label_of(&controls_server::get_last_active_player());
+                                    dispatch_media_control_action(&cmd_app, &label, "next-video");
+                                }
+                                ControlCommand::ExitFullscreen { .. } => {
+                                    let label = controls_server::window_label_of(&controls_server::get_last_active_player());
+                                    dispatch_media_control_action(&cmd_app, &label, "exit-fullscreen");
                                 }
                             }
                         });
@@ -2428,23 +2680,35 @@ pub fn run() {
                         use controls_server::{broadcast_player_status, PlayerStatus};
 
                         loop {
-                            // The focused pane is set from the frontend; read it
-                            // each tick so the controls follow the active pane.
-                            let active_player_id = controls_server::get_active_player_id();
-                            // Get status from the active player
-                            if let Ok(status) = media_player::player_get_status_internal(&active_player_id).await {
-                                let (is_shuffled, repeat_mode) = controls_server::get_playback_flags();
-                                broadcast_player_status(PlayerStatus {
-                                    player_id: active_player_id.clone(),
-                                    is_playing: matches!(status.state, earth_media::PlaybackState::Playing),
-                                    current_time: status.position_ms,
-                                    duration: status.duration_ms,
-                                    volume: status.volume,
-                                    is_muted: status.muted,
-                                    title: status.info.title.clone().unwrap_or_default(),
-                                    is_shuffled,
-                                    repeat_mode,
-                                });
+                            // ONE shared controls webview that follows the last-clicked pane
+                            // across all windows — broadcast just that globally-active player.
+                            // Per-window flags/title/fullscreen are looked up by its window label.
+                            let active_player_id = controls_server::get_last_active_player();
+                            if !active_player_id.is_empty() {
+                                let label = controls_server::window_label_of(&active_player_id);
+                                if let Ok(status) = media_player::player_get_status_internal(&active_player_id).await {
+                                    let (is_shuffled, repeat_mode) = controls_server::get_playback_flags(&label);
+                                    // Prefer the frontend-supplied title (it knows the queue
+                                    // item name); fall back to the GStreamer tag title.
+                                    let active_title = controls_server::get_active_title(&label);
+                                    let title = if !active_title.is_empty() {
+                                        active_title
+                                    } else {
+                                        status.info.title.clone().unwrap_or_default()
+                                    };
+                                    broadcast_player_status(PlayerStatus {
+                                        player_id: active_player_id.clone(),
+                                        is_playing: matches!(status.state, earth_media::PlaybackState::Playing),
+                                        current_time: status.position_ms,
+                                        duration: status.duration_ms,
+                                        volume: status.volume,
+                                        is_muted: status.muted,
+                                        title,
+                                        is_shuffled,
+                                        repeat_mode,
+                                        is_fullscreen: controls_server::get_fullscreen(&label),
+                                    });
+                                }
                             }
 
                             tokio::time::sleep(Duration::from_millis(250)).await;
@@ -2464,6 +2728,14 @@ pub fn run() {
 
             // NOTE: Don't auto-open devtools - it interferes with the GTK VBox layout
             // DevTools can be opened manually with F12
+
+            // Wire OS file drag-drop for the main window's Media panes. Code-created
+            // windows wire themselves at build time; "main" is created from
+            // tauri.conf.json, so it's wired here. See wire_media_drag_drop.
+            if let Some(main) = app.get_webview_window("main") {
+                wire_media_drag_drop(&main);
+                wire_window_close_cleanup(&main);
+            }
 
             // Set up system tray with right-click menu
             let quit_item = MenuItem::with_id(app, "quit", "Quit Reclaim", true, None::<&str>)?;
@@ -2492,7 +2764,7 @@ pub fn run() {
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap()
                                 .as_millis());
-                            let _ = WebviewWindowBuilder::new(
+                            if let Ok(win) = WebviewWindowBuilder::new(
                                 app,
                                 &window_id,
                                 WebviewUrl::App("index.html".into()),
@@ -2500,9 +2772,15 @@ pub fn run() {
                             .title("Reclaim")
                             .inner_size(1280.0, 720.0)
                             .min_inner_size(800.0, 600.0)
+                            .resizable(true)
+                            .maximized(true)
                             .decorations(false)
                             .transparent(false)
-                            .build();
+                            .build()
+                            {
+                                wire_media_drag_drop(&win);
+                                wire_window_close_cleanup(&win);
+                            }
                         }
                         "show" => {
                             if let Some(window) = app.get_webview_window("main") {
@@ -2554,6 +2832,15 @@ pub fn run() {
             get_incognito_profiles,
             incognito_is_forced,
             set_media_playback_flags,
+            set_media_active_title,
+            set_media_fullscreen,
+            media_window_label,
+            controls_active_window,
+            window_minimize,
+            window_toggle_maximize,
+            window_close,
+            window_start_dragging,
+            forget_media_window,
             // Identity commands (hardware fingerprinting)
             get_hardware_info,
             get_device_fingerprint,
@@ -2727,6 +3014,7 @@ pub fn run() {
             vault::change_password_manager_master,
             vault::change_otp_master,
             vault::get_password_entries,
+            vault::vault_reveal,
             vault::add_password_entry,
             vault::update_password_entry,
             vault::delete_password_entry,
@@ -2735,15 +3023,25 @@ pub fn run() {
             vault::set_otp_master,
             vault::lock_otp,
             vault::get_otp_entries,
+            vault::vault_otp_codes,
             vault::add_otp_entry,
             vault::update_otp_entry,
             vault::delete_otp_entry,
-            vault::vault_find_login,
             vault::vault_login_hint,
             vault::vault_autofill,
             vault::vault_autosave_is_new,
             vault::vault_autosave_confirm,
             vault::vault_autosave_dismiss,
+            // Security subsystem — deterministic audit/monitor data for the panel
+            security::security_audit_recent,
+            security::monitor::security_posture,
+            security::monitor::security_events,
+            security::monitor::security_run_integrity,
+            // AI curator (advisory overlay; downstream of deterministic detection)
+            security::curator::security_curator_available,
+            security::curator::security_curator_digest,
+            security::curator::security_curator_explain,
+            security::curator::security_curator_query,
             // Router — single navigation front door (resolution + render axes)
             router::navigate,
             router::router_seed_cache,
@@ -2863,6 +3161,7 @@ pub fn run() {
             video_surface::show_video_surface,
             video_surface::hide_video_surface,
             video_surface::destroy_video_surface,
+            video_surface::set_video_surfaces_cursor_hidden,
             video_surface::get_video_surface_xid,
             // Controls overlay for embedded playback (GTK version)
             video_surface::create_controls_overlay,
@@ -2880,7 +3179,6 @@ pub fn run() {
             video_surface::create_x11_webview_controls,
             video_surface::update_x11_webview_controls,
             video_surface::show_x11_webview_controls,
-            video_surface::resize_x11_webview_controls,
             video_surface::hide_x11_webview_controls,
             video_surface::destroy_x11_webview_controls,
             // Legacy commands

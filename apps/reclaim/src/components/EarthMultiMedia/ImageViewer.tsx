@@ -13,6 +13,10 @@ interface ImageViewerProps {
   onPrev?: () => void;  // Navigate to previous image
   className?: string;
   showControls?: boolean;
+  /// Show the built-in title/dimensions overlay (top-left). Off when the parent
+  /// already labels the image (pane indicator / fullscreen header) to avoid a
+  /// duplicated title stacked in the corner.
+  showTitle?: boolean;
 }
 
 interface ImageState {
@@ -39,6 +43,7 @@ export function ImageViewer({
   onPrev,
   className = '',
   showControls = true,
+  showTitle = true,
 }: ImageViewerProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const imageRef = useRef<HTMLImageElement>(null);
@@ -470,7 +475,7 @@ export function ImageViewer({
       )}
 
       {/* Image Info - auto-hides with controls */}
-      {showControls && title && !state.isLoading && !state.error && (
+      {showControls && showTitle && title && !state.isLoading && !state.error && (
         <div className={`absolute top-4 left-4 bg-black/60 backdrop-blur-sm rounded-lg px-3 py-2 transition-opacity duration-300 ${showOverlay ? 'opacity-100' : 'opacity-0 pointer-events-none'}`}>
           <p className="text-white text-sm font-medium truncate max-w-[200px]">{title}</p>
           <p className="text-gray-400 text-xs">

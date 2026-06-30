@@ -198,7 +198,6 @@ export function GStreamerVideoPlayer({
         try {
           await invoke('show_video_surface', { playerId });
           // Surface exists! Update its position and mark as ready
-          console.log('[GStreamer] Reusing existing video surface for player:', playerId);
           await invoke('update_video_surface', { playerId, bounds });
           // RE-ATTACH the window handle. The surface outlives the player (close /
           // remove-from-queue does player_remove but only HIDES the surface), so a
@@ -235,10 +234,8 @@ export function GStreamerVideoPlayer({
           return;
         } catch {
           // Surface doesn't exist yet, create a new one
-          console.log('[GStreamer] No existing surface, creating new one for player:', playerId);
         }
 
-        console.log('[GStreamer] Creating video surface for player:', playerId, 'at:', bounds);
 
         // Create X11 child window for video rendering
         const xid = await invoke<number>('create_video_surface', {
@@ -246,7 +243,6 @@ export function GStreamerVideoPlayer({
           bounds,
         });
 
-        console.log('[GStreamer] create_video_surface returned XID:', xid ? `0x${xid.toString(16)}` : 'null');
 
         if (xid && xid > 0) {
           // Set the window handle on the player for VideoOverlay rendering BEFORE
@@ -255,10 +251,8 @@ export function GStreamerVideoPlayer({
           // could start before the handle was attached and GStreamer would render
           // into its OWN top-level window (the "pane detaches into a window" bug,
           // most visible when several panes mount at once).
-          console.log('[GStreamer] Setting window handle on player...');
           await invoke('player_set_window_handle', { playerId, handle: xid });
           surfaceCreatedRef.current = true;
-          console.log('[GStreamer] Video surface created and handle set successfully');
           setState(s => ({ ...s, embeddedMode: true, embeddedError: null }));
         } else {
           // Transient bad XID — retry before giving up (giving up pops the video
@@ -364,7 +358,6 @@ export function GStreamerVideoPlayer({
       const surfaceWasCreated = surfaceCreatedRef.current;
 
       if (isTauri()) {
-        console.log('[GStreamer] Cleanup starting for', currentPlayerId, 'surface:', surfaceWasCreated);
 
         // Only hide the surface - keep player running for background playback
         // The parent EarthMultiMedia will show the surface again when returning to Media tab
@@ -375,7 +368,6 @@ export function GStreamerVideoPlayer({
         // Don't reset surfaceCreatedRef - we want to remember the surface exists
         // Don't stop the player - keep playing in background
         // Don't destroy the surface - we want to show it again later
-        console.log('[GStreamer] Surface hidden (keeping playback):', currentPlayerId);
       }
     };
   }, [playerId]);
@@ -415,7 +407,6 @@ export function GStreamerVideoPlayer({
     // If embeddedMode is true or embeddedError is set, we can proceed
     // If neither, the surface setup is still in progress
     if (!state.embeddedMode && !state.embeddedError && surfaceCreatedRef.current === false) {
-      console.log('[GStreamer] Waiting for video surface setup before loading media...');
       return; // Will be re-triggered when embeddedMode changes
     }
 
@@ -442,7 +433,6 @@ export function GStreamerVideoPlayer({
         }
 
         if (status && status.info?.uri === source && (status.state === 'Playing' || status.state === 'Paused')) {
-          console.log('[GStreamer] Player already has this source loaded, resuming:', source);
           loadedSourceRef.current = source;
           // Update state from existing player status
           setState(s => ({
@@ -458,16 +448,13 @@ export function GStreamerVideoPlayer({
         }
 
         loadedSourceRef.current = source;
-        console.log('[GStreamer] Loading media:', source, 'playerId:', playerId, 'embeddedMode:', state.embeddedMode);
 
         if (isYouTubeUrl(source)) {
           // Use YouTube extraction (this also plays)
           await invoke('player_play_youtube', { playerId, url: source });
-          console.log('[GStreamer] YouTube video loaded and playing');
         } else {
           // Regular media load
           await invoke('player_load', { playerId, uri: source });
-          console.log('[GStreamer] Media loaded, autoPlay:', autoPlay);
 
           // Small delay to let pipeline initialize before playing
           await new Promise(resolve => setTimeout(resolve, 100));
@@ -483,10 +470,8 @@ export function GStreamerVideoPlayer({
           // restored position; otherwise play (the default for opening media).
           if (autoPlay === false) {
             await invoke('player_pause', { playerId });
-            console.log('[GStreamer] Restored paused at', startMs, 'ms');
           } else {
             await invoke('player_play', { playerId });
-            console.log('[GStreamer] Play command sent');
           }
         }
 
@@ -578,7 +563,6 @@ export function GStreamerVideoPlayer({
           Math.abs(currentTime - lastPositionRef.current) < 50;
         const ended = status.eos === true || frozenAtEnd;
         if (ended && !eosFiredRef.current) {
-          console.log('[GStreamer] End of stream detected', { playerId, eos: status.eos, frozenAtEnd, currentTime, duration });
           onEnded?.();
         }
         eosFiredRef.current = ended;
