@@ -1474,8 +1474,12 @@ function App() {
 
           {/* About Modal */}
           {showAbout && (
-            <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-              <div className="bg-gray-900 border border-white/10 rounded-2xl shadow-2xl w-full max-w-lg p-8">
+            <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50" onClick={() => setShowAbout(false)}>
+              <div
+                style={{ top: Math.max(chromeHeight, 56) }}
+                className="fixed right-0 bottom-0 bg-gray-900 border-l border-t border-white/10 rounded-tl-2xl shadow-2xl w-full max-w-md p-8 overflow-y-auto"
+                onClick={e => e.stopPropagation()}
+              >
                 <div className="flex justify-between items-start mb-6">
                   <h2 className="text-3xl font-bold">
                     <span className="text-theme-primary">Re</span>
@@ -1510,11 +1514,23 @@ function App() {
                       </li>
                       <li className="flex items-center gap-2">
                         <span className="text-theme-secondary">&#9679;</span>
-                        <span><strong>EarthMemory</strong> - Personal knowledge graph</span>
+                        <span><strong>Journal</strong> - Personal knowledge graph</span>
+                      </li>
+                      <li className="flex items-start gap-2">
+                        <span className="text-theme-primary mt-1">&#9679;</span>
+                        <span><strong>Sage</strong> - Local AI that summarizes what you read into your Journal and answers your questions from it &amp; the web, fully offline</span>
                       </li>
                       <li className="flex items-center gap-2">
                         <span className="text-theme-accent">&#9679;</span>
-                        <span><strong>EarthMultiMedia</strong> - Privacy-focused media player</span>
+                        <span><strong>Media</strong> - Privacy-focused media player</span>
+                      </li>
+                      <li className="flex items-start gap-2">
+                        <span className="text-theme-primary mt-1">&#9679;</span>
+                        <span><strong>Password Manager</strong> - Encrypted local vault with one-click autofill</span>
+                      </li>
+                      <li className="flex items-center gap-2">
+                        <span className="text-theme-secondary">&#9679;</span>
+                        <span><strong>Authenticator</strong> - Built-in 2FA / TOTP codes</span>
                       </li>
                     </ul>
                   </div>
