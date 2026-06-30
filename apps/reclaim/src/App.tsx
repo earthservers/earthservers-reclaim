@@ -609,13 +609,31 @@ function App() {
   // won't re-curate, but reaching more (e.g. comments) refines it. Backend no-ops
   // if Ollama isn't running.
   const curatedKeysRef = useRef<Set<string>>(new Set());
+  const autoCachedRef = useRef<Set<string>>(new Set());
   useEffect(() => {
     if (!isTauri()) return;
     let unlisten: (() => void) | undefined;
     listen<{ url: string; title: string; text: string; isFinal: boolean }>('browser-viewed-content', ({ payload }) => {
       const { url, title, text } = payload;
-      if (!aiSettings.curator || !/^https?:\/\//.test(url || '') || isIncognito) return;
+      // Common gate: real web page, not incognito.
+      if (!/^https?:\/\//.test(url || '') || isIncognito) return;
       if (!text || text.length < 200) return;
+
+      // Auto-cache (the cheap bottom rung): put the browsed text into the grep-able
+      // index at the cache tier — TTL'd, auto-pruned, NO curation cost. Independent
+      // of the curator toggle. Backend skips login pages and dedups by URL.
+      if (!autoCachedRef.current.has(url)) {
+        autoCachedRef.current.add(url);
+        invoke('auto_cache_page', {
+          url,
+          title: title || url,
+          text,
+          profileId: activeProfile?.id ?? 1,
+        }).catch(() => {});
+      }
+
+      // Curation (the expensive rung): only when the curator is enabled.
+      if (!aiSettings.curator) return;
       const key = `${url}::${Math.floor(text.length / 2000)}`;
       if (curatedKeysRef.current.has(key)) return;
       curatedKeysRef.current.add(key);
