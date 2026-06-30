@@ -19,21 +19,20 @@ rustflags = [
 # NOTE on PIE/ASLR: rustc already produces position-independent executables on
 # Linux by default, so full ASLR is in effect for the binary. No flag needed.
 
-# C/C++ dependencies (bundled SQLite via rusqlite, anything else built by `cc`).
-# `cc`/most -sys build scripts honor CFLAGS/CXXFLAGS. force = false so a user's own
-# CFLAGS wins; CI has a clean env, so the hardening applies there.
-#  -O2                       : also makes _FORTIFY_SOURCE effective (and silences
-#                              its "requires optimization" warning) in debug builds.
-#  -D_FORTIFY_SOURCE=3       : strongest libc fortification of buffer ops.
-#  -fstack-protector-strong  : stack canaries on functions with buffers.
-#  -fstack-clash-protection  : probe the stack so a guard-page jump can't be skipped.
-#  -fcf-protection=full      : Intel CET (shadow stack + IBT) for the C code; your
-#                              Zen CPU supports CET shadow stack. Harmless on CPUs
-#                              without it (the instructions are NOPs).
-[env]
-CFLAGS = { value = "-O2 -D_FORTIFY_SOURCE=3 -fstack-protector-strong -fstack-clash-protection -fcf-protection=full", force = false }
-CXXFLAGS = { value = "-O2 -D_FORTIFY_SOURCE=3 -fstack-protector-strong -fstack-clash-protection -fcf-protection=full", force = false }
-
+# C/C++ dependency hardening (FORTIFY_SOURCE / stack-protector / CET) is NOT forced
+# globally here on purpose. Injecting CFLAGS into every `cc`/-sys build script is
+# fragile: vendored-crypto crates like `ring` compile with `-pedantic-errors` and
+# already manage their own hardening, so a global `-D_FORTIFY_SOURCE` collides with
+# the distro gcc's own definition and fails the build ("_FORTIFY_SOURCE redefined").
+#
+# The binary hardening we actually verify (full RELRO, PIE/ASLR, NX — see the CI
+# `hardening-flags` job) comes from the rustflags above and is unaffected. If you
+# want to additionally harden the C deps in a controlled environment, set CFLAGS
+# yourself with an undefine guard so it can't collide, e.g.:
+#
+#   CFLAGS="-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2 -fstack-protector-strong \
+#           -fstack-clash-protection -fcf-protection=full" cargo build --release
+#
 # ----------------------------------------------------------------------------
 # OPT-IN (nightly toolchain) — Rust-side stack protector + CET. These flags are
 # nightly-only, so they are NOT in the default rustflags above (CI uses stable).
