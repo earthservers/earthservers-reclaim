@@ -2483,6 +2483,9 @@ pub fn run() {
             if let Err(e) = search_index_manager.init() {
                 log::error!("Failed to initialize search index tables: {}", e);
             }
+            // Auto-GC for the search index: sweep expired ephemeral/cache rows on
+            // startup and hourly (never touches pinned/archived).
+            search_index::gc::start(db_path_str.clone());
             // Security subsystem: append-only vault audit log + live event sink for
             // the Security panel. Deterministic; no LLM involved.
             security::init(app.handle().clone(), &db_path_str);
@@ -2902,6 +2905,14 @@ pub fn run() {
             // Local search index (query-driven FTS5 + vector fusion)
             search_index::orchestrator::local_search,
             search_index::orchestrator::log_result_click,
+            search_index::lifecycle::pin_result,
+            search_index::lifecycle::archive_result,
+            search_index::lifecycle::forget_result,
+            search_index::lifecycle::forget_query,
+            search_index::lifecycle::set_favorite,
+            search_index::lifecycle::favorite_state,
+            search_index::lifecycle::auto_cache_page,
+            search_index::lifecycle::review_pinned,
             // Memory commands (EarthMemory)
             get_indexed_pages,
             index_page,

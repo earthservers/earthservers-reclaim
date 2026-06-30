@@ -242,7 +242,7 @@ pub async fn local_search(
                         };
                         match store::upsert_scraped(
                             &conn, profile_id, &doc.url, &doc.title, &doc.body, &c.snippet,
-                            query_id, &source_engine, c.searxng_pos, &hash, tier.as_str(), now, expires_at,
+                            Some(query_id), &source_engine, c.searxng_pos, &hash, tier.as_str(), now, expires_at,
                         ) {
                             Ok(id) => id,
                             Err(e) => {

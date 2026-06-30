@@ -98,7 +98,7 @@ pub fn upsert_scraped(
     title: &str,
     body: &str,
     snippet: &str,
-    query_id: i64,
+    query_id: Option<i64>,
     source_engine: &str,
     searxng_pos: Option<usize>,
     content_hash: &str,
@@ -114,7 +114,8 @@ pub fn upsert_scraped(
          ON CONFLICT(url, profile_id) DO UPDATE SET
             title = excluded.title,
             body = excluded.body,
-            query_id = excluded.query_id,
+            -- browse (NULL query) keeps the existing query attribution
+            query_id = COALESCE(excluded.query_id, search_pages.query_id),
             source_engine = excluded.source_engine,
             content_hash = excluded.content_hash,
             fetched_at = excluded.fetched_at,
@@ -245,4 +246,165 @@ pub fn bump_usage(conn: &Connection, page_id: i64, now: i64) -> rusqlite::Result
         params![page_id, now],
     )?;
     Ok(())
+}
+
+// ---- Phase 6 lifecycle DB ops ----
+
+/// url/title/body for a page (body may be NULL for archived rows).
+pub fn page_content(
+    conn: &Connection,
+    page_id: i64,
+) -> rusqlite::Result<Option<(String, String, Option<String>)>> {
+    conn.query_row(
+        "SELECT url, title, body FROM search_pages WHERE id = ?1",
+        params![page_id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )
+    .optional()
+}
+
+/// Promote a page to the pinned tier (permanent, GC-protected).
+pub fn pin(conn: &Connection, page_id: i64, now: i64) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE search_pages
+            SET retention = 'pinned', expires_at = NULL, pinned_at = COALESCE(pinned_at, ?2)
+          WHERE id = ?1",
+        params![page_id, now],
+    )?;
+    Ok(())
+}
+
+/// Demote a page to the cache tier with a fresh TTL (used on unfavorite — never a
+/// hard delete; let the decay model handle eventual archival).
+pub fn demote_to_cache(conn: &Connection, page_id: i64, expires_at: i64) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE search_pages
+            SET retention = 'cache', expires_at = ?2, pinned_at = NULL
+          WHERE id = ?1",
+        params![page_id, expires_at],
+    )?;
+    Ok(())
+}
+
+/// Archive: drop body (and its FTS terms via the update trigger) + embeddings,
+/// keep url/title and the knowledge-graph entry. Reclaims ~all disk.
+pub fn archive(conn: &Connection, page_id: i64) -> rusqlite::Result<()> {
+    // Delete embedding explicitly (don't rely solely on the FK cascade).
+    conn.execute("DELETE FROM page_embeddings WHERE page_id = ?1", params![page_id])?;
+    // Setting body = NULL fires the update trigger, emptying FTS for this row.
+    conn.execute(
+        "UPDATE search_pages
+            SET retention = 'archived', body = NULL, expires_at = NULL
+          WHERE id = ?1",
+        params![page_id],
+    )?;
+    Ok(())
+}
+
+/// Hard delete a page now (FTS via delete trigger, embedding via cascade).
+pub fn forget(conn: &Connection, page_id: i64) -> rusqlite::Result<()> {
+    conn.execute("DELETE FROM page_embeddings WHERE page_id = ?1", params![page_id])?;
+    conn.execute("DELETE FROM search_pages WHERE id = ?1", params![page_id])?;
+    Ok(())
+}
+
+/// Forget a whole search: drop its query row and any of its pages that the user
+/// never committed to (pinned/archived pages survive — a promise the curator must
+/// not break).
+pub fn forget_query(conn: &Connection, query_id: i64) -> rusqlite::Result<usize> {
+    conn.execute(
+        "DELETE FROM page_embeddings WHERE page_id IN
+           (SELECT id FROM search_pages WHERE query_id = ?1 AND retention NOT IN ('pinned','archived'))",
+        params![query_id],
+    )?;
+    let n = conn.execute(
+        "DELETE FROM search_pages WHERE query_id = ?1 AND retention NOT IN ('pinned','archived')",
+        params![query_id],
+    )?;
+    conn.execute("DELETE FROM search_queries WHERE id = ?1", params![query_id])?;
+    Ok(n)
+}
+
+/// Flag a pinned page whose upstream is confirmed gone (404/410). PROTECT, don't
+/// prune — the local copy may be the only one left.
+pub fn mark_upstream_gone(conn: &Connection, page_id: i64) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE search_pages SET upstream_gone = 1 WHERE id = ?1",
+        params![page_id],
+    )?;
+    Ok(())
+}
+
+/// A pinned page with the signals review_pinned scores on.
+#[derive(Debug, Clone)]
+pub struct PinnedRow {
+    pub id: i64,
+    pub url: String,
+    pub title: String,
+    pub last_opened_at: Option<i64>,
+    pub open_count: i64,
+    pub pinned_at: Option<i64>,
+    pub upstream_gone: bool,
+    pub content_hash: Option<String>,
+}
+
+/// All pinned pages for a profile (input to the curator's review).
+pub fn pinned_pages(conn: &Connection, profile_id: i64) -> rusqlite::Result<Vec<PinnedRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, url, title, last_opened_at, open_count, pinned_at, upstream_gone, content_hash
+           FROM search_pages WHERE retention = 'pinned' AND profile_id = ?1",
+    )?;
+    let rows = stmt.query_map(params![profile_id], |r| {
+        Ok(PinnedRow {
+            id: r.get(0)?,
+            url: r.get(1)?,
+            title: r.get(2)?,
+            last_opened_at: r.get(3)?,
+            open_count: r.get(4)?,
+            pinned_at: r.get(5)?,
+            upstream_gone: r.get::<_, i64>(6)? != 0,
+            content_hash: r.get(7)?,
+        })
+    })?;
+    rows.collect()
+}
+
+/// Total bytes of indexed body text (disk soft-cap backstop signal).
+pub fn index_body_bytes(conn: &Connection) -> rusqlite::Result<i64> {
+    conn.query_row(
+        "SELECT COALESCE(SUM(LENGTH(body)), 0) FROM search_pages",
+        [],
+        |r| r.get(0),
+    )
+}
+
+/// Whether the knowledge graph already has a non-empty curated summary for a URL.
+pub fn has_curated_summary(conn: &Connection, url: &str, profile_id: i64) -> rusqlite::Result<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM indexed_pages
+          WHERE url = ?1 AND profile_id = ?2 AND summary IS NOT NULL AND TRIM(summary) <> ''",
+        params![url, profile_id],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+/// GC sweep: delete expired ephemeral/cache rows (never pinned/archived). Returns
+/// the number of pages removed. Embeddings dropped explicitly + via cascade; FTS
+/// self-cleans via the delete trigger.
+pub fn gc_sweep(conn: &Connection, now: i64) -> rusqlite::Result<usize> {
+    conn.execute(
+        "DELETE FROM page_embeddings WHERE page_id IN (
+            SELECT id FROM search_pages
+             WHERE retention IN ('ephemeral','cache')
+               AND expires_at IS NOT NULL AND expires_at < ?1)",
+        params![now],
+    )?;
+    let n = conn.execute(
+        "DELETE FROM search_pages
+          WHERE retention IN ('ephemeral','cache')
+            AND expires_at IS NOT NULL AND expires_at < ?1",
+        params![now],
+    )?;
+    Ok(n)
 }

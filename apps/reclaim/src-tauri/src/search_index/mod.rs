@@ -21,9 +21,9 @@ pub mod embed;
 pub mod store;
 pub mod rank;
 pub mod orchestrator;
-// Added incrementally as later phases land:
-//   pub mod gc;           // Phase 6
-//   pub mod curate;       // Phase 7
+pub mod gc;
+pub mod curate;
+pub mod lifecycle;
 
 use rusqlite::Connection;
 
