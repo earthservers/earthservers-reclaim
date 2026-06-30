@@ -38,9 +38,17 @@ Everything below runs **on your machine**. The only outbound traffic is the page
 - **Password‑protected bookmarks** — bookmarks are encrypted at rest, with an optional Argon2id password gate for a private set.
 - **NoScript** — JavaScript is blocked by default and trusted **per site** (persistent or session‑only); a web‑process extension blocks untrusted third‑party requests.
 - **Privacy protection** — third‑party cookie blocking, tracking prevention (ITP), user‑agent spoofing, and incognito (ephemeral, nothing on disk).
-- **Your own search engine** — build a private index from the sites *you* curate and **scrape**, plus community trust/bias ratings on domains (EarthSearch). Search your own corpus, not an ad network.
+- **Your own search engine** — build a private index from the sites *you* curate and **scrape**, plus community trust/bias ratings on domains. Search your own corpus, not an ad network.
 
-### 🎬 Media (EarthMultiMedia)
+### 🔍 Local Search — "Google, but completely local"
+- **Query‑driven local index** — type a query and get fast results that are **scraped, indexed, and grep‑able on your device**. It fuses local SearXNG meta‑search, the web scraper, and the AI curator behind one index (**FTS5 full‑text ⊕ vector embeddings**) with a fusion ranker. The index only ever contains things *you actually searched* — strong privacy by construction.
+- **Two‑speed results** — SearXNG‑speed snippets paint instantly, then scraped + indexed results stream in, then the list re‑orders to a **fused ranking** (BM25 ⊕ vector cosine ⊕ SearXNG position ⊕ a private click‑log, via Reciprocal Rank Fusion). The first search for a topic is slow; every search after is instant.
+- **Retention ladder** — browse → auto‑cache (TTL'd, no curation cost) → **favorite/pin** (permanent, curated) → archived (summary kept, body dropped) → forgotten. Auto‑GC only ever touches the cheap tiers; pins are protected. Login/credential pages are never cached or indexed.
+- **Favorites = pins, one source of truth** — a pin control (distinct from the bookmark star) in the address bar, History, and results, all reading the same tier. A **review‑pinned** panel where the curator *proposes* prune candidates (disuse, age, semantic redundancy) and *you* dispose — pins are never silently removed.
+- **Comments & discussions** — filter to comments/discussions and pull posts + comments from **Reddit** and **forums** (Discourse / Stack Exchange / generic) by default, plus **YouTube** and **TikTok** via yt‑dlp. (Instagram/Facebook are best‑effort and **off by default** — public, logged‑out only; an optional, default‑off "use my own session" toggle carries a blunt Terms‑of‑Service warning. No credential automation.)
+- **Crawler fan‑in** — pages from your Web Scraper crawl jobs join the same results (read‑only, capped per domain, badged "from crawl").
+
+### 🎬 Media
 - **Multi‑pane viewing** — single, split (horizontal/vertical), or quad; each pane is an independent native player.
 - **Workspace tabs** — browser‑style media tabs, each with its own queue, panes, and layout.
 - **Queue** — drag‑to‑reorder, **shuffle**, repeat, and consecutive autoplay (next item plays in the pane that just finished).
@@ -54,9 +62,9 @@ Everything below runs **on your machine**. The only outbound traffic is the page
 - **Live status** — jobs run on creation (or via ▶ Run), streaming `pending → running → completed` with a live page count.
 - **Opt‑in “Add to AI memory”** — per job, also summarize each scraped page into your knowledge graph so the assistant can use it.
 
-### 🧠 Local AI (Ollama)
-- **Knowledge Curator** — summarizes **what you actually read** (an in‑page viewed‑content bridge captures only text you scrolled into view — comments included only if you reach them), not a blind re‑fetch. Skips homepages/feeds, de‑duplicates, writes a rich summary + a small excerpt. Transparent, unbiased, skips incognito.
-- **AI Assistant** — a private, streaming, multi‑session chat (ChatGPT‑style) grounded in your saved pages, media notes, and past conversations. Model auto‑selected by your GPU tier, or pick any installed model.
+### 🧠 Sage — Local AI (Ollama)
+- **Knowledge Curator** — summarizes **what you actually read** (an in‑page viewed‑content bridge captures only text you scrolled into view — comments included only if you reach them), not a blind re‑fetch, into your **Journal** (knowledge graph). Skips homepages/feeds, de‑duplicates, writes a rich summary + a small excerpt. Transparent, unbiased, skips incognito. Its on/off state is remembered **per profile**.
+- **AI Assistant** — a private, streaming, multi‑session chat (ChatGPT‑style) grounded in your Journal, media notes, and past conversations. Model auto‑selected by your GPU tier, or pick any installed model.
 - **🔬 Web Research mode** — agentic **search + read**: the assistant uses local tool‑calling to `web_search` and `fetch_url`, shows each step (🔎 searching / 📄 reading), then streams a grounded answer that **cites the URLs it actually read**. Searches route through a local **SearXNG** instance when available (fully private), or **DuckDuckGo** as a fallback. All reasoning stays on‑device.
 - **Password‑protected tab** — lock the whole Local AI / History tab behind its own unique Argon2id password (separate from the vault, media, and bookmark passwords).
 
