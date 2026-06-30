@@ -318,7 +318,7 @@ export function DomainManager({ profileId, onOpenUrl }: DomainManagerProps) {
             value={urlInput}
             onChange={(e) => setUrlInput(e.target.value)}
             onKeyDown={(e) => e.key === 'Enter' && goToUrl()}
-            placeholder="Enter a URL to visit (e.g. example.com)"
+            placeholder="EarthSearch or enter a URL to visit"
             className="w-full bg-black/30 border border-white/10 rounded-lg px-4 py-2.5 pl-10 text-white placeholder-gray-500 focus:outline-none focus:border-theme-primary transition-colors"
           />
           <svg className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">

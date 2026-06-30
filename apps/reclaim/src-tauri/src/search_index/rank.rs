@@ -66,6 +66,17 @@ fn norm_url(u: &str) -> String {
 /// for recall. Returns None for empty/operator-only input so the FTS ranker is
 /// simply skipped rather than erroring.
 pub fn sanitize_fts_query(q: &str) -> Option<String> {
+    fts_expr(q, " OR ")
+}
+
+/// Strict variant requiring ALL terms (AND). Used for the GLOBAL crawler index,
+/// where an OR match pulls in any page containing a single common word (e.g. a
+/// crawled site with "phone" somewhere matching "best grapheneos phone").
+pub fn sanitize_fts_query_strict(q: &str) -> Option<String> {
+    fts_expr(q, " ") // FTS5 treats a space between terms as AND
+}
+
+fn fts_expr(q: &str, join: &str) -> Option<String> {
     let cleaned: String = q
         .chars()
         .map(|c| if c.is_alphanumeric() { c } else { ' ' })
@@ -79,7 +90,7 @@ pub fn sanitize_fts_query(q: &str) -> Option<String> {
             .iter()
             .map(|t| format!("\"{}\"", t))
             .collect::<Vec<_>>()
-            .join(" OR "),
+            .join(join),
     )
 }
 
@@ -127,7 +138,10 @@ pub async fn rank(
         // ---- read-time fan-in of the crawler index (its own id space + FTS) ----
         let mut crawler_cands: Vec<super::crawler::CrawlerCand> = Vec::new();
         let mut crawler_fts_rank: HashMap<i64, usize> = HashMap::new();
-        if let (true, Some(e)) = (want_articles, &expr) {
+        // Crawler is a GLOBAL index — require ALL query terms (AND) so unrelated
+        // crawled pages sharing one common word don't pollute the results.
+        let crawler_expr = sanitize_fts_query_strict(query_text);
+        if let (true, Some(e)) = (want_articles, &crawler_expr) {
             let sp_urls: std::collections::HashSet<String> =
                 candidates.iter().map(|c| norm_url(&c.url)).collect();
             let ids = super::crawler::fts_rowids(&conn, e, CRAWLER_TOP_N).unwrap_or_default();
@@ -276,6 +290,14 @@ mod tests {
         assert_eq!(sanitize_fts_query("()*\"^"), None);
         // a quote in the input can't break out (each token is re-quoted)
         assert_eq!(sanitize_fts_query("a\"b"), Some("\"a\" OR \"b\"".into()));
+    }
+
+    #[test]
+    fn strict_sanitizer_requires_all_terms() {
+        // AND (space-joined) so a single shared word can't match an unrelated page.
+        assert_eq!(sanitize_fts_query_strict("best grapheneos phone"), Some("\"best\" \"grapheneos\" \"phone\"".into()));
+        assert_eq!(sanitize_fts_query_strict("rust"), Some("\"rust\"".into()));
+        assert_eq!(sanitize_fts_query_strict("  "), None);
     }
 
     #[test]
