@@ -6,6 +6,17 @@
   [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
   [![Rust](https://img.shields.io/badge/rust-%23000000.svg?style=flat&logo=rust&logoColor=white)](https://www.rust-lang.org/)
   [![Tauri](https://img.shields.io/badge/tauri-%2324C8DB.svg?style=flat&logo=tauri&logoColor=%23FFFFFF)](https://tauri.app/)
+
+  <br>
+
+  <img src="docs/Main.png" alt="Reclaim — privacy-first desktop browser" width="90%">
+
+  <table>
+    <tr>
+      <td width="50%"><img src="docs/Search.png" alt="Local search index"></td>
+      <td width="50%"><img src="docs/Nobara.png" alt="Reclaim running on Linux"></td>
+    </tr>
+  </table>
 </div>
 
 ---
