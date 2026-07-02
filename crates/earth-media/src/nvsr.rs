@@ -138,6 +138,41 @@ fn model_dir() -> PathBuf {
         .unwrap_or_else(|_| sdk_dir().join("models"))
 }
 
+/// Best-effort preload of libVideoFX's private dependencies (TensorRT / CUDA
+/// runtime pieces the feature installer drops NEXT TO it). dlopen-by-absolute-
+/// path does NOT search that directory for dependencies, and a desktop-launched
+/// app has no LD_LIBRARY_PATH pointing there — but ld.so resolves a dependency
+/// by SONAME if a matching library is ALREADY loaded, so loading them first
+/// (and leaking them resident) makes libVideoFX link without any env setup.
+fn preload_sdk_deps(dir: &std::path::Path) {
+    const PREFIXES: &[&str] = &[
+        "libcudart", "libcublasLt", "libcublas", "libcudnn",
+        "libnvonnxparser", "libnvinfer_plugin", "libnvinfer",
+    ];
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let mut files: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            name.contains(".so") && PREFIXES.iter().any(|pre| name.starts_with(pre))
+        })
+        .collect();
+    // Load in the PREFIXES order (rough dependency order), stable within a prefix.
+    files.sort_by_key(|p| {
+        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+        let rank = PREFIXES.iter().position(|pre| name.starts_with(pre)).unwrap_or(usize::MAX);
+        (rank, name)
+    });
+    for path in files {
+        // Safety: loading NVIDIA's own redistributables. Failures are fine —
+        // some are alternate versions; libVideoFX's own load reports the truth.
+        match unsafe { Library::new(&path) } {
+            Ok(lib) => std::mem::forget(lib), // keep resident for SONAME resolution
+            Err(e) => log::debug!("[earth-media] VFX dep {} skipped: {}", path.display(), e),
+        }
+    }
+}
+
 fn runtime() -> Option<&'static Runtime> {
     static RT: OnceLock<Option<Runtime>> = OnceLock::new();
     RT.get_or_init(|| {
@@ -152,6 +187,7 @@ fn runtime() -> Option<&'static Runtime> {
             );
             return None;
         }
+        preload_sdk_deps(&dir);
         // Safety: loading NVIDIA's own redistributable libraries by absolute path.
         let (nvcv, vfx) = unsafe {
             let nvcv = Library::new(&nvcv_path)
