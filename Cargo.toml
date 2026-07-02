@@ -56,3 +56,11 @@ interprocess = "2.2"
 
 # Lazy static for global state
 lazy_static = "1.5"
+
+# Media/AI hot paths run at full optimization even in dev builds — unoptimized
+# per-pixel conversion loops made AI/FSR enhancement lag in `pnpm desktop`.
+[profile.dev.package.earth-media]
+opt-level = 3
+
+[profile.dev.package.ort]
+opt-level = 3

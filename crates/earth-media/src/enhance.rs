@@ -376,6 +376,11 @@ struct CtlState {
     mode: EnhanceMode,
     /// Last input caps seen at the GL stage (post-NvSR): width, height, PAR.
     last_in: Option<(i32, i32, Option<gst::Fraction>)>,
+    /// What apply() last wrote to the GL stage: (fsr_shaders, out_w, out_h, par).
+    /// apply() is a strict no-op when this wouldn't change — re-setting even
+    /// IDENTICAL capsfilter caps mid-play churns renegotiation, and that took
+    /// down live pipelines (qtdemux "not-negotiated") on no-op mode switches.
+    applied: Option<(bool, i32, i32, Option<gst::Fraction>)>,
 }
 
 /// Live controls for the resident enhance bin. Held by the player; the caps
@@ -435,7 +440,8 @@ impl EnhanceCtl {
     }
 
     /// (Re)apply shaders, caps and uniforms for the current mode + last-seen
-    /// input size. Called on mode changes and from the caps probe.
+    /// input size. Called on mode changes and from the caps probe. Strictly a
+    /// no-op when nothing would change (see CtlState::applied).
     fn apply(&self) {
         let (mode, last_in) = match self.state.lock() {
             Ok(s) => (s.mode, s.last_in),
@@ -443,13 +449,44 @@ impl EnhanceCtl {
         };
         let Some((w, h, par)) = last_in else { return };
 
-        // FSR scales; other modes hold the GL stage at 1:1 (NvAi already scaled
-        // upstream — this stage sees the post-NvSR size via its caps probe).
-        let (ow, oh) = if mode == EnhanceMode::Fsr {
-            output_size(w, h).unwrap_or((w, h))
-        } else {
-            (w, h)
+        // What the GL stage should do. FSR scales here. NvAi normally scales
+        // UPSTREAM (this stage sees the post-NvSR size via its caps probe) — but
+        // the AI element only engages for <=720p sources (fp32 real-time
+        // budget); for bigger inputs it stays 1:1 and the GL stage steps in
+        // with FSR so "AI mode" degrades to FSR instead of crawling.
+        let gl_fsr = match mode {
+            EnhanceMode::Fsr => true,
+            EnhanceMode::Off => false,
+            EnhanceMode::NvAi => {
+                let ai_scaled = self
+                    .nvsr
+                    .as_ref()
+                    .and_then(|n| n.static_pad("sink"))
+                    .and_then(|p| p.current_caps())
+                    .and_then(|c| c.structure(0).map(|s| s.to_owned()))
+                    .and_then(|s| {
+                        let iw = s.get::<i32>("width").ok()?;
+                        let ih = s.get::<i32>("height").ok()?;
+                        Some(crate::nvsr::nv_factor(iw, ih) == 2)
+                    })
+                    .unwrap_or(false);
+                !ai_scaled
+            }
         };
+        let (ow, oh) = if gl_fsr { output_size(w, h).unwrap_or((w, h)) } else { (w, h) };
+
+        // No-op guard: don't touch live elements unless something changes.
+        {
+            let mut st = match self.state.lock() {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            let next = (gl_fsr, ow, oh, par);
+            if st.applied == Some(next) {
+                return;
+            }
+            st.applied = Some(next);
+        }
 
         let mut out = gst::Caps::builder("video/x-raw")
             .features(["memory:GLMemory"])
@@ -465,7 +502,7 @@ impl EnhanceCtl {
         self.caps_scale.set_property("caps", &out);
         self.caps_out.set_property("caps", &out);
 
-        if mode == EnhanceMode::Fsr {
+        if gl_fsr {
             self.easu.set_property("fragment", EASU_FRAGMENT);
             self.easu.set_property(
                 "uniforms",
@@ -501,6 +538,12 @@ impl EnhanceCtl {
 pub fn build_enhance_bin(initial: EnhanceMode) -> Result<(gst::Element, Arc<EnhanceCtl>), MediaError> {
     let bin = gst::Bin::builder().name("earth-enhance").build();
 
+    // System-memory-only gate at the bin entry: NVDEC otherwise proposes
+    // video/x-raw(memory:CUDAMemory) during MID-PLAY renegotiation (mode
+    // toggles), which videoconvert can't accept — the chain ends up
+    // not-negotiated and qtdemux stops streaming (the reported freeze).
+    let caps_entry = make("capsfilter")?;
+    caps_entry.set_property("caps", gst::Caps::new_empty_simple("video/x-raw"));
     // Leading/trailing videoconvert: passthrough when caps already fit, and
     // they make negotiation succeed for decoder formats glupload can't take.
     let convert_pre = make("videoconvert")?;
@@ -528,7 +571,7 @@ pub fn build_enhance_bin(initial: EnhanceMode) -> Result<(gst::Element, Arc<Enha
     // Optional Tier-2 AI stage (only when the Maxine runtime is present).
     let nvsr = crate::nvsr::make_element();
 
-    let mut chain: Vec<&gst::Element> = vec![&convert_pre];
+    let mut chain: Vec<&gst::Element> = vec![&caps_entry, &convert_pre];
     if let Some(n) = &nvsr {
         chain.push(n);
     }
@@ -542,7 +585,7 @@ pub fn build_enhance_bin(initial: EnhanceMode) -> Result<(gst::Element, Arc<Enha
     gst::Element::link_many(chain.iter().copied())
         .map_err(|e| MediaError::PlayerError(format!("enhance: bin link failed: {}", e)))?;
 
-    let sink_target = convert_pre
+    let sink_target = caps_entry
         .static_pad("sink")
         .ok_or_else(|| MediaError::PlayerError("enhance: no sink pad".into()))?;
     let src_target = convert_post
@@ -567,7 +610,7 @@ pub fn build_enhance_bin(initial: EnhanceMode) -> Result<(gst::Element, Arc<Enha
         caps_scale,
         caps_out,
         nvsr: nvsr.clone(),
-        state: Mutex::new(CtlState { mode: EnhanceMode::Off, last_in: None }),
+        state: Mutex::new(CtlState { mode: EnhanceMode::Off, last_in: None, applied: None }),
     });
 
     // Track the GL stage's input size from the caps flowing into glupload —
@@ -706,5 +749,135 @@ mod tests {
         assert_eq!(back, Some(true), "Off must renegotiate back to 1:1 live");
 
         pipeline.set_state(gst::State::Null).unwrap();
+    }
+
+    /// Full mode cycle INCLUDING the AI stage (needs GL + an AI backend
+    /// installed): Off -> Fsr -> NvAi -> Off, live, with a bus watch — any
+    /// ERROR message (e.g. not-negotiated) fails the test. Reproduces the
+    /// mid-play freeze reported when engaging AI.
+    #[test]
+    #[ignore = "needs display + GL + AI backend installed"]
+    fn enhance_bin_full_cycle_with_ai() {
+        gst::init().unwrap();
+        assert!(crate::nvsr::ai_available(), "no AI backend installed");
+        let pipeline = gst::Pipeline::new();
+        let src = gst::ElementFactory::make("videotestsrc")
+            .property("is-live", true)
+            .build()
+            .unwrap();
+        let incaps = gst::ElementFactory::make("capsfilter").build().unwrap();
+        incaps.set_property(
+            "caps",
+            gst::Caps::builder("video/x-raw")
+                .field("width", 320i32)
+                .field("height", 240i32)
+                .field("framerate", gst::Fraction::new(30, 1))
+                .build(),
+        );
+        let (enhance, ctl) = build_enhance_bin(EnhanceMode::Off).unwrap();
+        let convert = gst::ElementFactory::make("videoconvert").build().unwrap();
+        let sink = gst::ElementFactory::make("fakesink")
+            .property("sync", false)
+            .build()
+            .unwrap();
+        pipeline.add_many([&src, &incaps, &enhance, &convert, &sink]).unwrap();
+        gst::Element::link_many([&src, &incaps, &enhance, &convert, &sink]).unwrap();
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let (res, _, _) = pipeline.state(gst::ClockTime::from_seconds(10));
+        assert!(res.is_ok(), "failed to start");
+
+        let bus = pipeline.bus().unwrap();
+        let no_errors = |bus: &gst::Bus, phase: &str| {
+            while let Some(msg) = bus.pop_filtered(&[gst::MessageType::Error]) {
+                let gst::MessageView::Error(e) = msg.view() else { continue };
+                panic!("pipeline ERROR during {}: {} ({:?})", phase, e.error(), e.debug());
+            }
+        };
+        let out_pad = enhance.static_pad("src").unwrap();
+        let caps_w = |pad: &gst::Pad| -> Option<i32> {
+            pad.current_caps()?.structure(0)?.get("width").ok()
+        };
+        let settle = |target: i32, phase: &str, bus: &gst::Bus| {
+            for _ in 0..80 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                no_errors(bus, phase);
+                if caps_w(&out_pad) == Some(target) {
+                    return;
+                }
+            }
+            panic!("{}: output caps never reached width={} (got {:?})", phase, target, caps_w(&out_pad));
+        };
+
+        ctl.set_mode(EnhanceMode::Fsr).unwrap();
+        settle(640, "fsr", &bus);
+        ctl.set_mode(EnhanceMode::NvAi).unwrap();
+        settle(640, "nvai", &bus);
+        ctl.set_mode(EnhanceMode::Off).unwrap();
+        settle(320, "off", &bus);
+
+        let (_, state, _) = pipeline.state(gst::ClockTime::ZERO);
+        assert_eq!(state, gst::State::Playing, "pipeline must stay PLAYING across all toggles");
+        pipeline.set_state(gst::State::Null).unwrap();
+    }
+
+    /// REAL-topology repro of the reported freeze: an H.264 mp4 through the
+    /// actual MediaPlayer (playbin + qtdemux + NVDEC + xvimagesink + resident
+    /// enhance bin), toggling Off -> Fsr -> NvAi mid-play. Set
+    /// EARTH_ENHANCE_TEST_MEDIA to the clip path. A pipeline error (e.g.
+    /// not-negotiated) or a non-Playing state fails the test.
+    #[test]
+    #[ignore = "needs display + GL + AI backend + EARTH_ENHANCE_TEST_MEDIA"]
+    fn enhance_full_cycle_in_real_player() {
+        let media = std::env::var("EARTH_ENHANCE_TEST_MEDIA").expect("set EARTH_ENHANCE_TEST_MEDIA");
+        let player = crate::MediaPlayer::new().unwrap();
+        player.load(&media).unwrap();
+        player.play().unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(1));
+
+        let assert_healthy = |phase: &str| {
+            for _ in 0..30 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                if let crate::PlaybackState::Error(e) = player.get_state() {
+                    panic!("player ERROR during {}: {}", phase, e);
+                }
+            }
+            let pos_a = player.get_position().unwrap_or(0);
+            std::thread::sleep(std::time::Duration::from_millis(700));
+            if let crate::PlaybackState::Error(e) = player.get_state() {
+                panic!("player ERROR during {}: {}", phase, e);
+            }
+            let pos_b = player.get_position().unwrap_or(0);
+            assert!(pos_b > pos_a, "{}: playback position frozen ({} -> {})", phase, pos_a, pos_b);
+        };
+
+        assert_healthy("off");
+        player.set_enhance(EnhanceMode::Fsr).unwrap();
+        assert_healthy("fsr");
+        // Isolate the NvAi engage sub-steps when EARTH_TEST_STEP is set:
+        //   preflight  = only build the ONNX session
+        //   engage     = only flip the earthnvsr property
+        //   (unset)    = full set_enhance(NvAi)
+        match std::env::var("EARTH_TEST_STEP").as_deref() {
+            Ok("preflight") => {
+                crate::nvsr::ai_preflight().unwrap();
+                assert_healthy("preflight-only");
+                return;
+            }
+            Ok("engage") => {
+                if let Some(ctl) = player.enhance_ctl.as_ref() {
+                    if let Some(nvsr) = ctl.nvsr.as_ref() {
+                        nvsr.set_property("engaged", true);
+                    }
+                }
+                assert_healthy("engage-only");
+                return;
+            }
+            _ => {}
+        }
+        player.set_enhance(EnhanceMode::NvAi).unwrap();
+        assert_healthy("nvai");
+        player.set_enhance(EnhanceMode::Off).unwrap();
+        assert_healthy("off-again");
+        player.stop_and_wait().unwrap();
     }
 }

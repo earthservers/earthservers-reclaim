@@ -370,10 +370,18 @@ impl Drop for SuperRes {
 // The `earthnvsr` element — a VideoFilter that is passthrough until engaged.
 // ---------------------------------------------------------------------------
 
-/// Whether nvai would scale this input (2x within the 4K cap). Inputs already
-/// above the cap negotiate 1:1 and the transform plain-copies (with a warning).
-fn nv_factor(w: i32, h: i32) -> i32 {
-    if w > 0 && h > 0 && (2 * w) as u32 <= MAX_W && (2 * h) as u32 <= MAX_H {
+/// Whether nvai would scale this input. AI 2x is gated to <=720p sources —
+/// that's both what SR is FOR and what runs in (near) real time at fp32; above
+/// that the element negotiates 1:1 (cheap row copy) and the GL stage falls
+/// back to FSR (see EnhanceCtl::apply), so 'AI mode' never crawls or stalls.
+pub(crate) fn nv_factor(w: i32, h: i32) -> i32 {
+    if w > 0
+        && h > 0
+        && w <= 1280
+        && h <= 720
+        && (2 * w) as u32 <= MAX_W
+        && (2 * h) as u32 <= MAX_H
+    {
         2
     } else {
         1
@@ -429,12 +437,32 @@ mod imp {
             if pspec.name() == "engaged" {
                 let engaged = value.get::<bool>().unwrap_or(false);
                 self.engaged.store(engaged, Ordering::Relaxed);
+                // Renegotiation here is DANGEROUS: BaseTransform passthrough
+                // flips and even no-op reconfigures propagate through the
+                // decoder into decodebin's internals, which cannot renegotiate
+                // a compressed stream mid-flight -> "streaming stopped,
+                // not-negotiated" from qtdemux (the reported freeze). So:
+                // never toggle passthrough (the element always runs
+                // transform_frame — a cheap row copy at 1:1), and request
+                // renegotiation ONLY when the output size would actually
+                // change (engaging on a <=720p source, where the 2x announce
+                // is absorbed by the GL stage downstream — its filters un-fix
+                // sizes — and never reaches upstream of this element).
                 let obj = self.obj();
-                // Passthrough while disengaged = zero-copy; engaging forces a
-                // renegotiation so transform_caps can announce the 2x output.
-                obj.set_passthrough(!engaged);
-                if let Some(pad) = obj.static_pad("src") {
-                    pad.mark_reconfigure();
+                let would_scale = obj
+                    .static_pad("sink")
+                    .and_then(|p| p.current_caps())
+                    .and_then(|c| c.structure(0).map(|s| s.to_owned()))
+                    .and_then(|s| {
+                        let w = s.get::<i32>("width").ok()?;
+                        let h = s.get::<i32>("height").ok()?;
+                        Some(nv_factor(w, h) == 2)
+                    })
+                    .unwrap_or(false);
+                if would_scale {
+                    if let Some(pad) = obj.static_pad("src") {
+                        pad.mark_reconfigure();
+                    }
                 }
             }
         }
@@ -667,6 +695,11 @@ pub fn make_element() -> Option<gst::Element> {
     }
     let e = gst::ElementFactory::make("earthnvsr").build().ok()?;
     e.set_property("engaged", false);
+    // QoS is essential here: AI frames can exceed the frame budget, and with
+    // QoS off BaseTransform BLOCKS on every late frame — the pipeline stalls
+    // into a perceived freeze. With QoS on, late frames drop upstream of the
+    // expensive transform and playback stays fluid (fewer, enhanced frames).
+    e.set_property("qos", true);
     Some(e)
 }
 
@@ -687,9 +720,12 @@ mod tests {
 
     #[test]
     fn nv_factor_respects_cap() {
+        assert_eq!(nv_factor(640, 360), 2);
         assert_eq!(nv_factor(1280, 720), 2);
-        assert_eq!(nv_factor(1920, 1080), 2);
-        assert_eq!(nv_factor(2560, 1440), 1); // 2x would exceed 4K
+        // >720p sources: AI passes through (GL stage falls back to FSR) —
+        // fp32 inference above 720p can't hold a real-time frame budget.
+        assert_eq!(nv_factor(1920, 1080), 1);
+        assert_eq!(nv_factor(2560, 1440), 1);
         assert_eq!(nv_factor(0, 0), 1);
     }
 
