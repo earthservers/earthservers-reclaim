@@ -2938,6 +2938,13 @@ pub fn run() {
             search_index::lifecycle::favorite_state,
             search_index::lifecycle::auto_cache_page,
             search_index::lifecycle::review_pinned,
+            // Saved searches & search history (right-dock panel)
+            search_index::saved::list_search_history,
+            search_index::saved::delete_search_history,
+            search_index::saved::clear_search_history,
+            search_index::saved::save_search,
+            search_index::saved::list_saved_searches,
+            search_index::saved::delete_saved_search,
             // Per-profile Local-AI settings (curator/assistant on-off persistence)
             ai_settings::get_ai_settings,
             ai_settings::set_ai_settings,

@@ -75,6 +75,19 @@ CREATE TABLE IF NOT EXISTS search_queries (
   profile_id  INTEGER
 );
 
+-- Explicitly saved searches (query + its config) for the history/saved panel.
+-- One per (profile, text): re-saving replaces the config instead of duplicating.
+CREATE TABLE IF NOT EXISTS saved_searches (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  profile_id  INTEGER,
+  query_text  TEXT NOT NULL,
+  retention   TEXT NOT NULL DEFAULT 'cache',
+  kinds_mode  TEXT NOT NULL DEFAULT 'all',   -- 'all'|'discussions'|'comments'
+  sources     TEXT,                          -- JSON array of source ids; NULL = defaults
+  created_at  INTEGER NOT NULL,
+  UNIQUE(profile_id, query_text)
+);
+
 -- Full-text "grep" layer. External-content FTS5 over search_pages.
 CREATE VIRTUAL TABLE IF NOT EXISTS search_pages_fts USING fts5(
   title,
