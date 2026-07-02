@@ -473,9 +473,10 @@ impl EnhanceCtl {
                 !ai_scaled
             }
         };
-        let (ow, oh) = if gl_fsr { output_size(w, h).unwrap_or((w, h)) } else { (w, h) };
+        let (ow, oh) = if gl_fsr { output_size(w, h).unwrap_or((w, h)) } else { (0, 0) };
 
         // No-op guard: don't touch live elements unless something changes.
+        // (ow, oh) = (0, 0) encodes "unconstrained".
         {
             let mut st = match self.state.lock() {
                 Ok(s) => s,
@@ -488,17 +489,30 @@ impl EnhanceCtl {
             st.applied = Some(next);
         }
 
-        let mut out = gst::Caps::builder("video/x-raw")
-            .features(["memory:GLMemory"])
-            .field("format", "RGBA")
-            .field("width", ow)
-            .field("height", oh);
-        // Uniform scale keeps the pixel aspect; carry it through explicitly so
-        // fixation can't quietly square anamorphic content.
-        if let Some(par) = par {
-            out = out.field("pixel-aspect-ratio", par);
-        }
-        let out = out.build();
+        // Pin the mid-bin caps ONLY when the GL stage itself scales (FSR) —
+        // that pin is what forces EASU's 2x. In Off/NvAi the filters must stay
+        // UNCONSTRAINED: pinning them to sizes computed from stale pre-NvSR
+        // dimensions made negotiation lock onto the old size when the AI stage
+        // scaled (glshader can downscale, so the stale pin "won"), leaving the
+        // AI output stuck at 1x.
+        let out = if gl_fsr {
+            let mut out = gst::Caps::builder("video/x-raw")
+                .features(["memory:GLMemory"])
+                .field("format", "RGBA")
+                .field("width", ow)
+                .field("height", oh);
+            // Uniform scale keeps the pixel aspect; carry it through explicitly
+            // so fixation can't quietly square anamorphic content.
+            if let Some(par) = par {
+                out = out.field("pixel-aspect-ratio", par);
+            }
+            out.build()
+        } else {
+            gst::Caps::builder("video/x-raw")
+                .features(["memory:GLMemory"])
+                .field("format", "RGBA")
+                .build()
+        };
         self.caps_scale.set_property("caps", &out);
         self.caps_out.set_property("caps", &out);
 
