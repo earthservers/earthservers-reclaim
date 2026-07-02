@@ -5,6 +5,19 @@ All notable changes to Earth Reclaim are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.1] - 2026-06-30
+
+### Fixed
+
+- **New windows rendered as a blank "The URL can't be shown" box in packaged
+  builds.** A secondary WebKitGTK webview can't load `tauri://` app routes in a
+  packaged build (the asset protocol isn't on its web context) — the v1.1.0
+  incognito-matching attempt didn't address this. New windows (single-instance /
+  tray "New Window" / detached tabs / media-controls) now load the embedded
+  frontend over the app's localhost asset server (`http://127.0.0.1:9877`), the
+  same mechanism the media controls already use; dev is unchanged (Vite). A new
+  capability grants those loopback-served windows the same IPC as the main window.
+
 ## [1.1.0] - 2026-06-30
 
 ### Added
