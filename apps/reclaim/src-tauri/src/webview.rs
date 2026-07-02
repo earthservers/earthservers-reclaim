@@ -267,11 +267,12 @@ pub async fn detach_browser_to_window(
 
     let window_label = format!("detached-{}", tab_id);
 
-    // Create URL
+    // Real web pages load as-is; app routes go through the localhost asset server
+    // in packaged builds (see crate::app_content_url) so they actually render.
     let webview_url = if url.starts_with("http://") || url.starts_with("https://") {
         WebviewUrl::External(url.parse().map_err(|e: url::ParseError| e.to_string())?)
     } else {
-        WebviewUrl::App(url.into())
+        crate::app_content_url(&url)
     };
 
     // Create a new detached window

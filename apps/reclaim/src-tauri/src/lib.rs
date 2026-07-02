@@ -2124,6 +2124,29 @@ fn wire_window_close_cleanup(window: &tauri::WebviewWindow) {
     });
 }
 
+/// The URL a NEW app window should load for a given client route.
+///
+/// In PACKAGED builds, secondary WebKitGTK webviews can't load `tauri://` app
+/// routes — the asset protocol isn't registered on their web context, so they
+/// render WebKit's "The URL can't be shown" error. The app already works around
+/// this for the media controls by serving the embedded frontend over the localhost
+/// asset server (see `assets_server`, port 9877); we do the same for full app
+/// windows. In DEV there's no embedded frontend, so we use the normal `App` URL,
+/// which Tauri serves from the Vite dev server.
+pub(crate) fn app_content_url(route: &str) -> WebviewUrl {
+    let route = route.trim_start_matches('/');
+    if cfg!(debug_assertions) {
+        WebviewUrl::App(if route.is_empty() { "index.html".into() } else { route.into() })
+    } else {
+        let url = format!("http://127.0.0.1:{}/{}", assets_server::ASSETS_PORT, route);
+        match url.parse() {
+            Ok(u) => WebviewUrl::External(u),
+            // Fallback should never trigger (the URL is well-formed).
+            Err(_) => WebviewUrl::App("index.html".into()),
+        }
+    }
+}
+
 /// Create a new window with a specific tab (for tab drag-out functionality)
 #[tauri::command(rename_all = "camelCase")]
 async fn create_detached_window(
@@ -2136,24 +2159,19 @@ async fn create_detached_window(
 ) -> Result<String, String> {
     let window_id = format!("reclaim-{}", tab_id);
 
-    // Build the window with the tab data passed via URL fragment
+    // Build the window with the tab data passed via URL fragment. Loaded through
+    // the localhost asset server in packaged builds (see app_content_url) so the
+    // app actually renders instead of WebKit's "The URL can't be shown".
     let window_url = format!("{}#tab={}", url, tab_id);
 
-    let builder = WebviewWindowBuilder::new(
-        &app,
-        &window_id,
-        WebviewUrl::App(window_url.parse().map_err(|e: std::convert::Infallible| e.to_string())?),
-    )
-    .title(&title)
-    .inner_size(1280.0, 720.0)
-    .min_inner_size(800.0, 600.0)
-    .decorations(false)
-    .resizable(true)
-    .transparent(false)
-    // Match main's incognito context (tauri.conf.json) so the asset protocol
-    // resolves in packaged builds; otherwise WebKitGTK shows "The URL can't be
-    // shown" for this detached window.
-    .incognito(true);
+    let builder = WebviewWindowBuilder::new(&app, &window_id, app_content_url(&window_url))
+        .title(&title)
+        .inner_size(1280.0, 720.0)
+        .min_inner_size(800.0, 600.0)
+        .decorations(false)
+        .resizable(true)
+        .transparent(false)
+        .incognito(true);
 
     // Set position if provided (for drag-out to specific location)
     let builder = if let (Some(x), Some(y)) = (x, y) {
@@ -2408,7 +2426,7 @@ pub fn run() {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis())
                 .unwrap_or(0));
-            if let Ok(win) = WebviewWindowBuilder::new(app, &window_id, WebviewUrl::App("index.html".into()))
+            if let Ok(win) = WebviewWindowBuilder::new(app, &window_id, app_content_url("index.html"))
                 .title("Reclaim")
                 .inner_size(1280.0, 720.0)
                 .min_inner_size(800.0, 600.0)
@@ -2416,13 +2434,6 @@ pub fn run() {
                 .maximized(true)
                 .decorations(false)
                 .transparent(false)
-                // MUST match the `main` window's `incognito: true` (tauri.conf.json).
-                // The app's asset protocol (tauri://localhost) is registered on the
-                // ephemeral web context that the incognito main window uses; a NON-
-                // incognito secondary window gets a different context with no handler
-                // → WebKitGTK shows "The URL can't be shown" (blank/white window) in
-                // packaged builds. Keeping every app window incognito is also the
-                // app's by-design posture.
                 .incognito(true)
                 .build()
             {
@@ -2801,7 +2812,7 @@ pub fn run() {
                             if let Ok(win) = WebviewWindowBuilder::new(
                                 app,
                                 &window_id,
-                                WebviewUrl::App("index.html".into()),
+                                app_content_url("index.html"),
                             )
                             .title("Reclaim")
                             .inner_size(1280.0, 720.0)

@@ -1028,7 +1028,7 @@ pub async fn create_floating_controls_window(
     let controls_window = WebviewWindowBuilder::new(
         &app,
         "media-controls",
-        WebviewUrl::App("/media-controls".into())
+        crate::app_content_url("/media-controls"),
     )
     .title("Media Controls")
     .inner_size(bounds.width as f64, bounds.height as f64)
