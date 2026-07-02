@@ -109,8 +109,18 @@ function AssistantWorkspace({ profileId, journal }: { profileId: number | null; 
   // Persist on every change.
   useEffect(() => { saveSessions(profileId, sessions); }, [profileId, sessions]);
 
-  // Keep the transcript pinned to the latest message.
+  // Keep the transcript pinned to the latest message — but ONLY while the user
+  // is already at the bottom. Pinning on every streamed chunk yanked the view
+  // back down whenever you tried to scroll up mid-answer; scrolling back to the
+  // bottom re-engages the pinning.
+  const stickToBottom = useRef(true);
+  const onTranscriptScroll = () => {
+    const el = scrollRef.current;
+    if (!el) return;
+    stickToBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+  };
   useEffect(() => {
+    if (!stickToBottom.current) return;
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
   }, [active?.messages, busy]);
 
@@ -157,6 +167,9 @@ function AssistantWorkspace({ profileId, journal }: { profileId: number | null; 
     } : s));
     setInput('');
     setBusy(true);
+    // Sending re-engages pinning so your own message (and the incoming answer)
+    // scroll into view even if you'd scrolled up earlier.
+    stickToBottom.current = true;
 
     // Stream tokens into the trailing (empty) assistant message of this session.
     // In research mode, `research-step` lines (🔎 searching / 📄 reading) are
@@ -314,7 +327,7 @@ function AssistantWorkspace({ profileId, journal }: { profileId: number | null; 
         )}
 
         {/* Transcript */}
-        <div ref={scrollRef} className="flex-1 min-h-0 overflow-y-auto px-4 py-4 space-y-3">
+        <div ref={scrollRef} onScroll={onTranscriptScroll} className="flex-1 min-h-0 overflow-y-auto px-4 py-4 space-y-3">
           {(!active || active.messages.length === 0) && (
             <div className="h-full flex flex-col items-center justify-center text-center text-[var(--text-muted-color)]">
               <svg className="w-10 h-10 mb-3 opacity-60" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.86 9.86 0 01-4-.83L3 20l1.17-3.5A7.94 7.94 0 013 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" /></svg>
