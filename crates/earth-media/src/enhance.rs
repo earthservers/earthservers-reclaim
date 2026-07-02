@@ -1,35 +1,48 @@
-//! Video "Enhance" — in-pipeline super resolution (Tier 1: FSR 1.0 shaders).
+//! Video "Enhance" — in-pipeline super resolution.
 //!
-//! Builds a GL filter bin for playbin's `video-filter` slot:
+//! Tier 1: FSR 1.0 (EASU 2x upscale + RCAS sharpen) as GLSL shaders.
+//! Tier 2: NVIDIA Maxine SuperRes (`nvsr` module) as an optional AI stage.
 //!
-//!   glupload ! glcolorconvert ! glshader(EASU) ! caps(2x) ! glshader(RCAS)
-//!            ! caps(2x) ! glcolorconvert ! gldownload
+//! A single RESIDENT bin sits in playbin's `video-filter` slot for the whole
+//! life of the player:
 //!
-//! EASU (edge-adaptive spatial upsampling) does the actual scaling — `glshader`
-//! renders the input texture onto an output-sized quad, so forcing larger caps
-//! AFTER it is what makes it a scaler (verified: negotiation allows it). RCAS
-//! sharpens at the output resolution. Output goes back to SYSTEM memory
-//! (`gldownload`) so the proven `xvimagesink` presentation path is untouched —
-//! we deliberately never GL-render to the reparented X11 surface (glimagesink
-//! hard-crashes on NVIDIA there; see `build_video_sink`).
+//!   videoconvert ! [earthnvsr] ! glupload ! glcolorconvert ! glshader(A)
+//!     ! caps ! glshader(B) ! caps ! glcolorconvert ! gldownload ! videoconvert
 //!
-//! Sizing is dynamic: a caps probe on the bin's sink pad reads each stream's
-//! real dimensions and sets the mid-pipeline capsfilters + shader uniforms, so
-//! it tracks per-clip resolutions (and mid-stream renegotiation) with no load-
-//! order dependency. Scale is 2x, capped at 4K; near-native inputs pass through
-//! at 1:1 (RCAS still sharpens).
+//! Mode switching happens INSIDE the bin, live — no pipeline restart (swapping
+//! `video-filter` itself requires a NULL round-trip, which blanked playback):
+//!   * off  — NvSR passthrough + passthrough shaders at 1:1 (visually identical
+//!            to the source; the GL round-trip stays resident).
+//!   * fsr  — shaders swapped to EASU/RCAS via glshader's `update-shader`, the
+//!            mid-bin capsfilters forced to 2x (renegotiates in-place).
+//!   * nvai — the `earthnvsr` element engages (AI 2x on CUDA), GL stage at 1:1.
 //!
-//! Kill switch: EARTH_VIDEO_SR=off refuses to enable enhancement at runtime.
+//! `glshader` renders the input texture onto an output-sized quad, so forcing
+//! larger caps after it is what makes it a scaler (verified empirically). The
+//! GL stage's sizes come from a caps probe on `glupload`'s sink pad — that pad
+//! sees the POST-NvSR resolution, so the GL stage never needs to know whether
+//! the AI stage scaled.
+//!
+//! Output returns to SYSTEM memory (`gldownload`) so the proven `xvimagesink`
+//! presentation path is untouched — we never GL-render to the reparented X11
+//! surface (glimagesink hard-crashes on NVIDIA there; see `build_video_sink`).
+//! Because a broken GL stack would otherwise take ALL playback down with the
+//! resident bin, `gl_available()` proves GL works with a one-shot throwaway
+//! pipeline before the bin is ever installed; failure means "enhance
+//! unavailable", never broken playback.
+//!
+//! Kill switch: EARTH_VIDEO_SR=off (no GL elements are created at all).
 
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use crate::MediaError;
 
 /// Upscale factor and output ceiling. 2x covers the 360p–1080p content SR is
-/// for; the 4K cap bounds GPU cost (frames above ~1920p pass through).
+/// for; the 4K cap bounds GPU cost (larger frames pass through at 1:1).
 const SCALE: f64 = 2.0;
 const MAX_W: i32 = 3840;
 const MAX_H: i32 = 2160;
@@ -41,10 +54,12 @@ const RCAS_SHARPNESS: f32 = 0.870_55; // exp2(-0.2)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum EnhanceMode {
-    /// No enhancement — the default HQ Lanczos scaler path.
+    /// No enhancement (bin stays resident but passes frames through 1:1).
     Off,
-    /// FSR 1.0 (EASU 2x upscale + RCAS sharpen) on the GPU.
+    /// FSR 1.0 (EASU 2x upscale + RCAS sharpen) on the GPU via GL shaders.
     Fsr,
+    /// NVIDIA Maxine SuperRes AI upscaling (RTX GPUs, needs the VFX SDK runtime).
+    NvAi,
 }
 
 impl EnhanceMode {
@@ -52,6 +67,7 @@ impl EnhanceMode {
         match s.trim().to_ascii_lowercase().as_str() {
             "off" => Some(Self::Off),
             "fsr" => Some(Self::Fsr),
+            "nvai" => Some(Self::NvAi),
             _ => None,
         }
     }
@@ -60,6 +76,7 @@ impl EnhanceMode {
         match self {
             Self::Off => "off",
             Self::Fsr => "fsr",
+            Self::NvAi => "nvai",
         }
     }
 }
@@ -72,12 +89,18 @@ static DEFAULT_ENHANCE: AtomicU8 = AtomicU8::new(0);
 pub fn default_enhance() -> EnhanceMode {
     match DEFAULT_ENHANCE.load(Ordering::Relaxed) {
         1 => EnhanceMode::Fsr,
+        2 => EnhanceMode::NvAi,
         _ => EnhanceMode::Off,
     }
 }
 
 pub fn set_default_enhance(mode: EnhanceMode) {
-    DEFAULT_ENHANCE.store(matches!(mode, EnhanceMode::Fsr) as u8, Ordering::Relaxed);
+    let v = match mode {
+        EnhanceMode::Off => 0,
+        EnhanceMode::Fsr => 1,
+        EnhanceMode::NvAi => 2,
+    };
+    DEFAULT_ENHANCE.store(v, Ordering::Relaxed);
 }
 
 /// EARTH_VIDEO_SR=off disables enhancement entirely (isolation/debug hatch,
@@ -86,9 +109,68 @@ pub fn sr_env_disabled() -> bool {
     std::env::var("EARTH_VIDEO_SR").map(|v| v == "off" || v == "0").unwrap_or(false)
 }
 
-// FSR 1.0 EASU, 12-tap non-gather port (GLES2-compatible GLSL, GStreamer
-// glshader conventions: `v_texcoord` + `tex`). Input/output sizes arrive as
-// uniforms from the caps probe. Verified to compile+run on NVIDIA desktop GL.
+/// One-shot GL viability probe: run a single frame through
+/// videotestsrc ! glupload ! glshader(passthrough) ! gldownload ! fakesink.
+/// The resident enhance bin is only installed when this succeeds, so a machine
+/// with a broken GL stack keeps plain, working playback (enhance unavailable).
+pub fn gl_available() -> bool {
+    static PROBE: OnceLock<bool> = OnceLock::new();
+    *PROBE.get_or_init(|| {
+        if sr_env_disabled() {
+            return false;
+        }
+        let ok = (|| -> Option<bool> {
+            let pipeline = gst::Pipeline::new();
+            let src = gst::ElementFactory::make("videotestsrc")
+                .property("num-buffers", 1i32)
+                .build()
+                .ok()?;
+            let upload = gst::ElementFactory::make("glupload").build().ok()?;
+            let convert = gst::ElementFactory::make("glcolorconvert").build().ok()?;
+            let shader = gst::ElementFactory::make("glshader").build().ok()?;
+            shader.set_property("fragment", PASSTHROUGH_FRAGMENT);
+            let download = gst::ElementFactory::make("gldownload").build().ok()?;
+            let sink = gst::ElementFactory::make("fakesink").build().ok()?;
+            pipeline
+                .add_many([&src, &upload, &convert, &shader, &download, &sink])
+                .ok()?;
+            gst::Element::link_many([&src, &upload, &convert, &shader, &download, &sink]).ok()?;
+            pipeline.set_state(gst::State::Playing).ok()?;
+            let bus = pipeline.bus()?;
+            let msg = bus.timed_pop_filtered(
+                gst::ClockTime::from_seconds(5),
+                &[gst::MessageType::Eos, gst::MessageType::Error],
+            );
+            let ok = matches!(msg.map(|m| m.type_()), Some(gst::MessageType::Eos));
+            let _ = pipeline.set_state(gst::State::Null);
+            Some(ok)
+        })()
+        .unwrap_or(false);
+        if ok {
+            log::info!("[earth-media] enhance: GL probe OK — resident enhance bin enabled");
+        } else {
+            log::warn!("[earth-media] enhance: GL probe FAILED — enhance unavailable");
+        }
+        ok
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Shaders (GLES2-compatible GLSL, GStreamer glshader conventions: `v_texcoord`
+// + `tex`). Sizes arrive as uniforms from the caps probe. Verified to
+// compile+run on NVIDIA desktop GL.
+// ---------------------------------------------------------------------------
+
+const PASSTHROUGH_FRAGMENT: &str = r#"
+#ifdef GL_ES
+precision mediump float;
+#endif
+varying vec2 v_texcoord;
+uniform sampler2D tex;
+void main() { gl_FragColor = texture2D(tex, v_texcoord); }
+"#;
+
+// FSR 1.0 EASU, 12-tap non-gather port.
 const EASU_FRAGMENT: &str = r#"
 #ifdef GL_ES
 precision highp float;
@@ -256,6 +338,10 @@ void main() {
 }
 "#;
 
+// ---------------------------------------------------------------------------
+// Resident bin + live controls
+// ---------------------------------------------------------------------------
+
 /// Output size for a given input: uniform 2x, capped at 4K, even dimensions.
 /// Inputs already at/above the ceiling get 1:1 (EASU passes through; RCAS still
 /// sharpens). Returns None for degenerate inputs.
@@ -286,23 +372,144 @@ fn shader_uniforms(pairs: &[(&str, f32)]) -> gst::Structure {
     s.build()
 }
 
-/// Build the FSR filter bin for playbin's `video-filter`. Fails cleanly (Err)
-/// if any GL element is missing — the caller falls back to the default filter
-/// so playback never breaks.
-pub fn build_fsr_bin() -> Result<gst::Element, MediaError> {
-    let bin = gst::Bin::builder().name("earth-enhance-fsr").build();
+struct CtlState {
+    mode: EnhanceMode,
+    /// Last input caps seen at the GL stage (post-NvSR): width, height, PAR.
+    last_in: Option<(i32, i32, Option<gst::Fraction>)>,
+}
 
+/// Live controls for the resident enhance bin. Held by the player; the caps
+/// probe only holds a Weak so the bin/probe/ctl reference cycle breaks when
+/// the player is dropped.
+pub struct EnhanceCtl {
+    easu: gst::Element,
+    rcas: gst::Element,
+    caps_scale: gst::Element,
+    caps_out: gst::Element,
+    /// The Maxine AI stage, present only when the SDK runtime was found.
+    nvsr: Option<gst::Element>,
+    state: Mutex<CtlState>,
+}
+
+impl EnhanceCtl {
+    /// Whether NVIDIA AI SR is usable in this bin.
+    pub fn nvai_available(&self) -> bool {
+        self.nvsr.is_some()
+    }
+
+    /// Switch mode LIVE — no pipeline restart. Shader programs swap via
+    /// glshader's `update-shader` (recompiled for the next frame) and the mid-
+    /// bin capsfilters renegotiate in place.
+    pub fn set_mode(&self, mode: EnhanceMode) -> Result<(), MediaError> {
+        if mode == EnhanceMode::NvAi && self.nvsr.is_none() {
+            return Err(MediaError::PlayerError(
+                "NVIDIA AI SR is not available (VFX SDK runtime not installed)".to_string(),
+            ));
+        }
+        {
+            let mut st = self
+                .state
+                .lock()
+                .map_err(|e| MediaError::PlayerError(format!("enhance state poisoned: {}", e)))?;
+            if st.mode == mode {
+                return Ok(());
+            }
+            st.mode = mode;
+        }
+        if let Some(nvsr) = &self.nvsr {
+            nvsr.set_property("engaged", mode == EnhanceMode::NvAi);
+        }
+        self.apply();
+        log::info!("[earth-media] enhance mode -> '{}' (live)", mode.as_str());
+        Ok(())
+    }
+
+    pub fn mode(&self) -> EnhanceMode {
+        self.state.lock().map(|s| s.mode).unwrap_or(EnhanceMode::Off)
+    }
+
+    /// (Re)apply shaders, caps and uniforms for the current mode + last-seen
+    /// input size. Called on mode changes and from the caps probe.
+    fn apply(&self) {
+        let (mode, last_in) = match self.state.lock() {
+            Ok(s) => (s.mode, s.last_in),
+            Err(_) => return,
+        };
+        let Some((w, h, par)) = last_in else { return };
+
+        // FSR scales; other modes hold the GL stage at 1:1 (NvAi already scaled
+        // upstream — this stage sees the post-NvSR size via its caps probe).
+        let (ow, oh) = if mode == EnhanceMode::Fsr {
+            output_size(w, h).unwrap_or((w, h))
+        } else {
+            (w, h)
+        };
+
+        let mut out = gst::Caps::builder("video/x-raw")
+            .features(["memory:GLMemory"])
+            .field("format", "RGBA")
+            .field("width", ow)
+            .field("height", oh);
+        // Uniform scale keeps the pixel aspect; carry it through explicitly so
+        // fixation can't quietly square anamorphic content.
+        if let Some(par) = par {
+            out = out.field("pixel-aspect-ratio", par);
+        }
+        let out = out.build();
+        self.caps_scale.set_property("caps", &out);
+        self.caps_out.set_property("caps", &out);
+
+        if mode == EnhanceMode::Fsr {
+            self.easu.set_property("fragment", EASU_FRAGMENT);
+            self.easu.set_property(
+                "uniforms",
+                shader_uniforms(&[
+                    ("u_src_w", w as f32),
+                    ("u_src_h", h as f32),
+                    ("u_dst_w", ow as f32),
+                    ("u_dst_h", oh as f32),
+                ]),
+            );
+            self.rcas.set_property("fragment", RCAS_FRAGMENT);
+            self.rcas.set_property(
+                "uniforms",
+                shader_uniforms(&[
+                    ("u_dst_w", ow as f32),
+                    ("u_dst_h", oh as f32),
+                    ("u_sharpness", RCAS_SHARPNESS),
+                ]),
+            );
+            log::info!("[earth-media] enhance: FSR {}x{} -> {}x{}", w, h, ow, oh);
+        } else {
+            self.easu.set_property("fragment", PASSTHROUGH_FRAGMENT);
+            self.rcas.set_property("fragment", PASSTHROUGH_FRAGMENT);
+        }
+        // Recompile both programs on the next frame.
+        self.easu.set_property("update-shader", true);
+        self.rcas.set_property("update-shader", true);
+    }
+}
+
+/// Build the resident enhance bin. Returns the bin (for playbin's
+/// `video-filter`) plus its live controls. The caller decides the initial mode.
+pub fn build_enhance_bin(initial: EnhanceMode) -> Result<(gst::Element, Arc<EnhanceCtl>), MediaError> {
+    let bin = gst::Bin::builder().name("earth-enhance").build();
+
+    // Leading/trailing videoconvert: passthrough when caps already fit, and
+    // they make negotiation succeed for decoder formats glupload can't take.
+    let convert_pre = make("videoconvert")?;
     let upload = make("glupload")?;
     let convert_in = make("glcolorconvert")?;
     let easu = make("glshader")?;
     let caps_scale = make("capsfilter")?;
     let rcas = make("glshader")?;
     let caps_out = make("capsfilter")?;
-    let convert_out = make("glcolorconvert")?;
+    let convert_gl_out = make("glcolorconvert")?;
     let download = make("gldownload")?;
+    let convert_post = make("videoconvert")?;
 
-    easu.set_property("fragment", EASU_FRAGMENT);
-    rcas.set_property("fragment", RCAS_FRAGMENT);
+    easu.set_property("fragment", PASSTHROUGH_FRAGMENT);
+    rcas.set_property("fragment", PASSTHROUGH_FRAGMENT);
 
     // Unrestricted until the caps probe learns the stream's real size.
     let any_gl = gst::Caps::builder("video/x-raw")
@@ -312,21 +519,29 @@ pub fn build_fsr_bin() -> Result<gst::Element, MediaError> {
     caps_scale.set_property("caps", &any_gl);
     caps_out.set_property("caps", &any_gl);
 
-    bin.add_many([
-        &upload, &convert_in, &easu, &caps_scale, &rcas, &caps_out, &convert_out, &download,
-    ])
-    .map_err(|e| MediaError::PlayerError(format!("enhance: bin add failed: {}", e)))?;
-    gst::Element::link_many([
-        &upload, &convert_in, &easu, &caps_scale, &rcas, &caps_out, &convert_out, &download,
-    ])
-    .map_err(|e| MediaError::PlayerError(format!("enhance: bin link failed: {}", e)))?;
+    // Optional Tier-2 AI stage (only when the Maxine runtime is present).
+    let nvsr = crate::nvsr::make_element();
 
-    let sink_target = upload
+    let mut chain: Vec<&gst::Element> = vec![&convert_pre];
+    if let Some(n) = &nvsr {
+        chain.push(n);
+    }
+    chain.extend([
+        &upload, &convert_in, &easu, &caps_scale, &rcas, &caps_out, &convert_gl_out, &download,
+        &convert_post,
+    ]);
+
+    bin.add_many(chain.iter().copied())
+        .map_err(|e| MediaError::PlayerError(format!("enhance: bin add failed: {}", e)))?;
+    gst::Element::link_many(chain.iter().copied())
+        .map_err(|e| MediaError::PlayerError(format!("enhance: bin link failed: {}", e)))?;
+
+    let sink_target = convert_pre
         .static_pad("sink")
-        .ok_or_else(|| MediaError::PlayerError("enhance: glupload has no sink pad".into()))?;
-    let src_target = download
+        .ok_or_else(|| MediaError::PlayerError("enhance: no sink pad".into()))?;
+    let src_target = convert_post
         .static_pad("src")
-        .ok_or_else(|| MediaError::PlayerError("enhance: gldownload has no src pad".into()))?;
+        .ok_or_else(|| MediaError::PlayerError("enhance: no src pad".into()))?;
     let sink_pad = gst::GhostPad::builder_with_target(&sink_target)
         .map_err(|e| MediaError::PlayerError(format!("enhance: ghost sink failed: {}", e)))?
         .name("sink")
@@ -340,14 +555,25 @@ pub fn build_fsr_bin() -> Result<gst::Element, MediaError> {
     bin.add_pad(&src_pad)
         .map_err(|e| MediaError::PlayerError(format!("enhance: add src pad failed: {}", e)))?;
 
-    // Size everything from the stream's REAL dimensions as they pass by: set the
-    // scale capsfilters and the shader uniforms per caps event. This tracks
-    // per-clip resolution and mid-stream renegotiation with no load-order coupling.
-    let easu_w = easu.clone();
-    let rcas_w = rcas.clone();
-    let caps_scale_w = caps_scale.clone();
-    let caps_out_w = caps_out.clone();
-    sink_pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_pad, info| {
+    let ctl = Arc::new(EnhanceCtl {
+        easu,
+        rcas,
+        caps_scale,
+        caps_out,
+        nvsr: nvsr.clone(),
+        state: Mutex::new(CtlState { mode: EnhanceMode::Off, last_in: None }),
+    });
+
+    // Track the GL stage's input size from the caps flowing into glupload —
+    // that pad sees the POST-NvSR resolution, so FSR sizing and the AI stage
+    // compose without knowing about each other. Weak ref breaks the
+    // pad→probe→ctl→element cycle when the player drops.
+    let weak: Weak<EnhanceCtl> = Arc::downgrade(&ctl);
+    let upload_sink = upload
+        .static_pad("sink")
+        .ok_or_else(|| MediaError::PlayerError("enhance: glupload has no sink pad".into()))?;
+    upload_sink.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_pad, info| {
+        let Some(ctl) = weak.upgrade() else { return gst::PadProbeReturn::Ok };
         let Some(ev) = info.event() else { return gst::PadProbeReturn::Ok };
         let gst::EventView::Caps(caps_ev) = ev.view() else { return gst::PadProbeReturn::Ok };
         let caps = caps_ev.caps();
@@ -355,44 +581,23 @@ pub fn build_fsr_bin() -> Result<gst::Element, MediaError> {
         let (Ok(w), Ok(h)) = (s.get::<i32>("width"), s.get::<i32>("height")) else {
             return gst::PadProbeReturn::Ok;
         };
-        let Some((ow, oh)) = output_size(w, h) else { return gst::PadProbeReturn::Ok };
-
-        let mut out = gst::Caps::builder("video/x-raw")
-            .features(["memory:GLMemory"])
-            .field("format", "RGBA")
-            .field("width", ow)
-            .field("height", oh);
-        // Uniform scale keeps the pixel aspect; carry it through explicitly so
-        // fixation can't quietly square anamorphic content.
-        if let Ok(par) = s.get::<gst::Fraction>("pixel-aspect-ratio") {
-            out = out.field("pixel-aspect-ratio", par);
+        let par = s.get::<gst::Fraction>("pixel-aspect-ratio").ok();
+        if let Ok(mut st) = ctl.state.lock() {
+            st.last_in = Some((w, h, par));
         }
-        let out = out.build();
-        caps_scale_w.set_property("caps", &out);
-        caps_out_w.set_property("caps", &out);
-
-        easu_w.set_property(
-            "uniforms",
-            shader_uniforms(&[
-                ("u_src_w", w as f32),
-                ("u_src_h", h as f32),
-                ("u_dst_w", ow as f32),
-                ("u_dst_h", oh as f32),
-            ]),
-        );
-        rcas_w.set_property(
-            "uniforms",
-            shader_uniforms(&[
-                ("u_dst_w", ow as f32),
-                ("u_dst_h", oh as f32),
-                ("u_sharpness", RCAS_SHARPNESS),
-            ]),
-        );
-        log::info!("[earth-media] enhance: FSR {}x{} -> {}x{}", w, h, ow, oh);
+        ctl.apply();
         gst::PadProbeReturn::Ok
     });
 
-    Ok(bin.upcast())
+    // Initial mode (errors here mean "requested backend unavailable"; the bin
+    // itself is fine, so fall back to Off rather than failing the build).
+    if initial != EnhanceMode::Off {
+        if let Err(e) = ctl.set_mode(initial) {
+            log::warn!("[earth-media] enhance: initial mode '{}' unavailable: {}", initial.as_str(), e);
+        }
+    }
+
+    Ok((bin.upcast(), ctl))
 }
 
 #[cfg(test)]
@@ -414,19 +619,21 @@ mod tests {
     fn enhance_mode_parses() {
         assert_eq!(EnhanceMode::parse("fsr"), Some(EnhanceMode::Fsr));
         assert_eq!(EnhanceMode::parse("OFF"), Some(EnhanceMode::Off));
+        assert_eq!(EnhanceMode::parse("nvai"), Some(EnhanceMode::NvAi));
         assert_eq!(EnhanceMode::parse("dlss"), None);
     }
 
-    /// Full negotiation test: videotestsrc 320x240 through the FSR bin must
-    /// preroll and come out 640x480. Needs a GL-capable display, so it's
-    /// ignored by default — run locally with `cargo test -- --ignored`.
+    /// Full live-toggle test: preroll OFF at 1:1, switch to FSR mid-stream and
+    /// verify the output caps double WITHOUT the pipeline leaving PLAYING.
+    /// Needs a GL-capable display — run locally with `cargo test -- --ignored`.
     #[test]
     #[ignore = "needs a display + GL context"]
-    fn fsr_bin_prerolls_and_doubles_resolution() {
+    fn enhance_bin_toggles_live_without_restart() {
         gst::init().unwrap();
         let pipeline = gst::Pipeline::new();
         let src = gst::ElementFactory::make("videotestsrc")
-            .property("num-buffers", 5i32)
+            .property("num-buffers", 300i32)
+            .property("is-live", true)
             .build()
             .unwrap();
         let incaps = gst::ElementFactory::make("capsfilter").build().unwrap();
@@ -435,27 +642,62 @@ mod tests {
             gst::Caps::builder("video/x-raw")
                 .field("width", 320i32)
                 .field("height", 240i32)
+                .field("framerate", gst::Fraction::new(30, 1))
                 .build(),
         );
-        let fsr = build_fsr_bin().unwrap();
+        let (enhance, ctl) = build_enhance_bin(EnhanceMode::Off).unwrap();
         let convert = gst::ElementFactory::make("videoconvert").build().unwrap();
-        let sink = gst::ElementFactory::make("fakesink").build().unwrap();
-        pipeline.add_many([&src, &incaps, &fsr, &convert, &sink]).unwrap();
-        gst::Element::link_many([&src, &incaps, &fsr, &convert, &sink]).unwrap();
+        let sink = gst::ElementFactory::make("fakesink")
+            .property("sync", false)
+            .build()
+            .unwrap();
+        pipeline.add_many([&src, &incaps, &enhance, &convert, &sink]).unwrap();
+        gst::Element::link_many([&src, &incaps, &enhance, &convert, &sink]).unwrap();
 
-        pipeline.set_state(gst::State::Paused).unwrap();
-        let (res, state, _) = pipeline.state(gst::ClockTime::from_seconds(10));
-        assert!(res.is_ok(), "FSR pipeline failed to preroll");
-        assert_eq!(state, gst::State::Paused);
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let (res, _, _) = pipeline.state(gst::ClockTime::from_seconds(10));
+        assert!(res.is_ok(), "enhance pipeline failed to start (Off/passthrough)");
 
-        let out_caps = fsr
-            .static_pad("src")
-            .unwrap()
-            .current_caps()
-            .expect("no negotiated caps on FSR src pad");
-        let s = out_caps.structure(0).unwrap();
-        assert_eq!(s.get::<i32>("width").unwrap(), 640);
-        assert_eq!(s.get::<i32>("height").unwrap(), 480);
+        let out_pad = enhance.static_pad("src").unwrap();
+        let caps_size = |pad: &gst::Pad| -> Option<(i32, i32)> {
+            let c = pad.current_caps()?;
+            let s = c.structure(0)?;
+            Some((s.get("width").ok()?, s.get("height").ok()?))
+        };
+        // Wait for initial negotiation at 1:1.
+        for _ in 0..50 {
+            if caps_size(&out_pad).is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert_eq!(caps_size(&out_pad), Some((320, 240)), "Off mode must be 1:1");
+
+        // LIVE switch to FSR — no state change on the pipeline.
+        ctl.set_mode(EnhanceMode::Fsr).unwrap();
+        let mut scaled = None;
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if caps_size(&out_pad) == Some((640, 480)) {
+                scaled = Some(true);
+                break;
+            }
+        }
+        let (_, state, _) = pipeline.state(gst::ClockTime::ZERO);
+        assert_eq!(state, gst::State::Playing, "pipeline must stay PLAYING across the toggle");
+        assert_eq!(scaled, Some(true), "FSR must renegotiate to 2x live");
+
+        // And back off again, still live.
+        ctl.set_mode(EnhanceMode::Off).unwrap();
+        let mut back = None;
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if caps_size(&out_pad) == Some((320, 240)) {
+                back = Some(true);
+                break;
+            }
+        }
+        assert_eq!(back, Some(true), "Off must renegotiate back to 1:1 live");
 
         pipeline.set_state(gst::State::Null).unwrap();
     }

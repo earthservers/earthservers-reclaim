@@ -16,6 +16,11 @@ log = { workspace = true }
 gstreamer = { workspace = true }
 gstreamer-video = { workspace = true }
 gstreamer-pbutils = { workspace = true }
+gstreamer-base = { workspace = true }
+
+# Runtime (dlopen) loading of the optional NVIDIA Maxine VFX SDK — never a
+# link-time dependency, so builds/servers without the SDK are unaffected.
+libloading = "0.8"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # GTK for video widget embedding (optional, for future use)

@@ -5,6 +5,7 @@
 //! Includes YouTube support via yt-dlp.
 
 mod enhance;
+mod nvsr;
 mod youtube;
 
 pub use enhance::EnhanceMode;
@@ -157,8 +158,10 @@ pub struct PlayerStatus {
     /// True once playback has reached end-of-stream. The frontend edge-detects this
     /// (false -> true) to advance the queue, since playbin reports Playing at EOS.
     pub eos: bool,
-    /// Active video enhancement ("off" | "fsr") — see `enhance` module.
+    /// Active video enhancement ("off" | "fsr" | "nvai") — see `enhance` module.
     pub enhance: String,
+    /// Enhancement modes this player can run (drives the UI's mode cycle).
+    pub enhance_modes: Vec<String>,
 }
 
 /// Hardware-accelerated media player using GStreamer playbin directly
@@ -170,9 +173,11 @@ pub struct MediaPlayer {
     pipeline: gst::Element,
     /// Video sink element for VideoOverlay
     video_sink: Option<gst::Element>,
-    /// Active video enhancement (FSR upscaling) — drives which `video-filter`
-    /// is installed on playbin. See the `enhance` module.
-    enhance: Arc<Mutex<EnhanceMode>>,
+    /// Live controls of the RESIDENT enhance bin (installed once at creation as
+    /// playbin's `video-filter`; mode switches happen inside it, live, with no
+    /// pipeline restart). None = GL unavailable/env-disabled → default scaler,
+    /// enhancement unavailable. See the `enhance` module.
+    enhance_ctl: Option<Arc<enhance::EnhanceCtl>>,
     /// The video decoder element that actually instantiated (hardware vs software),
     /// observed live via `deep-element-added`. Proves NVDEC is really in use.
     active_decoder: Arc<Mutex<Option<String>>>,
@@ -268,15 +273,27 @@ impl MediaPlayer {
         pipeline.set_property_from_str("flags", flags_str);
         log::info!("Set playbin flags to '{}' (video + audio + soft-volume)", flags_str);
 
-        // Video filter (playbin `video-filter` slot): either the HQ Lanczos
-        // scaler (default) or the FSR enhance bin. New players inherit the
-        // session's last enhance choice so extra panes match the toggle.
-        let enhance_mode = if enhance::sr_env_disabled() {
-            EnhanceMode::Off
-        } else {
-            enhance::default_enhance()
-        };
-        Self::install_video_filter(&pipeline, stored_sink.as_ref(), enhance_mode);
+        // Video filter (playbin `video-filter` slot). When GL provably works
+        // (one-shot probe) the RESIDENT enhance bin goes in — mode switches then
+        // happen live inside it, with no pipeline restart. Otherwise the plain
+        // HQ Lanczos scaler goes in and enhancement is reported unavailable.
+        // New players inherit the session's last enhance choice.
+        let mut enhance_ctl: Option<Arc<enhance::EnhanceCtl>> = None;
+        if enhance::gl_available() {
+            match enhance::build_enhance_bin(enhance::default_enhance()) {
+                Ok((bin, ctl)) => {
+                    pipeline.set_property("video-filter", &bin);
+                    log::info!("[earth-media] video-filter=resident enhance bin");
+                    enhance_ctl = Some(ctl);
+                }
+                Err(e) => {
+                    log::warn!("[earth-media] enhance bin unavailable ({}); default scaler", e);
+                }
+            }
+        }
+        if enhance_ctl.is_none() {
+            Self::install_default_filter(&pipeline, stored_sink.as_ref());
+        }
 
         let info = Arc::new(Mutex::new(MediaInfo::default()));
         let muted = Arc::new(Mutex::new(false));
@@ -395,7 +412,7 @@ impl MediaPlayer {
         Ok(Self {
             pipeline,
             video_sink: stored_sink,
-            enhance: Arc::new(Mutex::new(enhance_mode)),
+            enhance_ctl,
             active_decoder,
             window_handle,
             info,
@@ -406,9 +423,9 @@ impl MediaPlayer {
         })
     }
 
-    /// Install the video filter matching `mode` on playbin's `video-filter` slot.
+    /// Install the default video filter (no enhancement available/enabled).
     ///
-    /// Off = high-quality scaling (additive; never touches decode/sink selection):
+    /// High-quality scaling (additive; never touches decode/sink selection):
     /// route any in-pipeline scaling through Lanczos resampling instead of the
     /// default bilinear. The scaler is chosen to MATCH the sink's memory path so
     /// we never add a needless GPU<->CPU transfer:
@@ -417,33 +434,11 @@ impl MediaPlayer {
     ///     present from SYSTEM memory, so frames are already on the CPU path
     ///     (even with NVDEC, which decodes on the GPU and then downloads for the
     ///     sink) — a CUDA scaler here would only force an extra round-trip.
-    ///
-    /// Fsr = the GL enhance bin (EASU 2x upscale + RCAS sharpen, then back to
-    /// system memory — the sink itself stays untouched). If the bin can't be
-    /// built (missing GL plugins), falls back to the default scaler so playback
-    /// never breaks.
-    fn install_video_filter(
-        pipeline: &gst::Element,
-        sink: Option<&gst::Element>,
-        mode: EnhanceMode,
-    ) {
+    fn install_default_filter(pipeline: &gst::Element, sink: Option<&gst::Element>) {
         let sink_name = sink
             .and_then(|s| s.factory())
             .map(|f| f.name().to_string())
             .unwrap_or_default();
-
-        if mode == EnhanceMode::Fsr {
-            match enhance::build_fsr_bin() {
-                Ok(bin) => {
-                    pipeline.set_property("video-filter", &bin);
-                    log::info!("[earth-media] video-filter=FSR enhance bin (sink={})", sink_name);
-                    return;
-                }
-                Err(e) => {
-                    log::warn!("[earth-media] FSR unavailable ({}); using default scaler", e);
-                }
-            }
-        }
 
         let scaler: Option<gst::Element> = if sink_name.contains("gl") {
             // GL presentation path: GPU-side colour-convert + scale (no download).
@@ -745,66 +740,38 @@ impl MediaPlayer {
             active_decoder: self.get_active_decoder(),
             eos: self.eos.lock().map(|e| *e).unwrap_or(false),
             enhance: self.get_enhance().as_str().to_string(),
+            enhance_modes: self.enhance_modes().iter().map(|s| s.to_string()).collect(),
         }
     }
 
     /// Current video enhancement mode.
     pub fn get_enhance(&self) -> EnhanceMode {
-        self.enhance.lock().map(|e| *e).unwrap_or(EnhanceMode::Off)
+        self.enhance_ctl
+            .as_ref()
+            .map(|c| c.mode())
+            .unwrap_or(EnhanceMode::Off)
     }
 
-    /// Switch video enhancement (FSR upscaling) on/off.
-    ///
-    /// playbin's `video-filter` can only be swapped safely at NULL, so a live
-    /// pipeline is restarted around the swap: remember position + play state,
-    /// tear down to NULL, install the new filter, then preroll, seek back and
-    /// resume. A short glitch is expected; playback never ends up broken — if
-    /// the FSR bin can't be built we fall back to the default scaler (logged).
+    /// Enhancement modes this player can actually run.
+    pub fn enhance_modes(&self) -> Vec<&'static str> {
+        match &self.enhance_ctl {
+            Some(ctl) if ctl.nvai_available() => vec!["off", "fsr", "nvai"],
+            Some(_) => vec!["off", "fsr"],
+            None => vec!["off"],
+        }
+    }
+
+    /// Switch video enhancement LIVE — the resident bin swaps shaders and
+    /// renegotiates caps in place; the pipeline never leaves its state (no
+    /// restart, no blank, position untouched).
     pub fn set_enhance(&self, mode: EnhanceMode) -> Result<(), MediaError> {
-        if mode != EnhanceMode::Off && enhance::sr_env_disabled() {
-            return Err(MediaError::PlayerError(
-                "video enhancement is disabled by EARTH_VIDEO_SR".to_string(),
-            ));
+        match &self.enhance_ctl {
+            Some(ctl) => ctl.set_mode(mode),
+            None if mode == EnhanceMode::Off => Ok(()),
+            None => Err(MediaError::PlayerError(
+                "video enhancement unavailable (GL probe failed or EARTH_VIDEO_SR=off)".to_string(),
+            )),
         }
-        {
-            let mut cur = self.enhance.lock().map_err(|e| {
-                MediaError::PlayerError(format!("enhance state poisoned: {}", e))
-            })?;
-            if *cur == mode {
-                return Ok(());
-            }
-            *cur = mode;
-        }
-
-        // Capture playback context before tearing down.
-        let position = self.get_position();
-        let state = self.get_state();
-        let has_media = self
-            .pipeline
-            .property::<Option<String>>("uri")
-            .map(|u| !u.is_empty())
-            .unwrap_or(false);
-
-        // Swap the filter at NULL (wait for teardown to actually finish).
-        let _ = self.pipeline.set_state(gst::State::Null);
-        let _ = self.pipeline.state(gst::ClockTime::from_seconds(2));
-        Self::install_video_filter(&self.pipeline, self.video_sink.as_ref(), mode);
-
-        // Restore playback where it was.
-        if has_media && matches!(state, PlaybackState::Playing | PlaybackState::Paused) {
-            self.pipeline
-                .set_state(gst::State::Paused)
-                .map_err(|e| MediaError::PlaybackError(format!("enhance restart failed: {:?}", e)))?;
-            let _ = self.pipeline.state(gst::ClockTime::from_seconds(5)); // preroll
-            if let Some(pos) = position {
-                let _ = self.seek(pos);
-            }
-            if state == PlaybackState::Playing {
-                self.play()?;
-            }
-        }
-        log::info!("[earth-media] enhance set to '{}'", mode.as_str());
-        Ok(())
     }
 
     /// Skip forward by seconds

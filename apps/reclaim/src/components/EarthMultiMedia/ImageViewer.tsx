@@ -3,6 +3,7 @@
 
 import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { convertFileSrc } from '@tauri-apps/api/core';
+import { fsrUpscaleToCanvas } from '../../lib/fsrCanvas';
 
 interface ImageViewerProps {
   source: string;
@@ -17,6 +18,9 @@ interface ImageViewerProps {
   /// already labels the image (pane indicator / fullscreen header) to avoid a
   /// duplicated title stacked in the corner.
   showTitle?: boolean;
+  /// Super-resolve the photo (FSR shaders on a WebGL canvas — the photo twin of
+  /// the video pipeline's Enhance). Falls back to the plain image on failure.
+  enhance?: boolean;
 }
 
 interface ImageState {
@@ -44,9 +48,15 @@ export function ImageViewer({
   className = '',
   showControls = true,
   showTitle = true,
+  enhance = false,
 }: ImageViewerProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const imageRef = useRef<HTMLImageElement>(null);
+  // FSR-enhanced render of the current photo. 0x0 = not available/off → the
+  // plain <img> shows. The canvas mirrors the img's transform, with its scale
+  // compensated so toggling never changes the on-screen size.
+  const enhanceCanvasRef = useRef<HTMLCanvasElement>(null);
+  const [enhancedSize, setEnhancedSize] = useState<{ w: number; h: number } | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
   const [showOverlay, setShowOverlay] = useState(true);
@@ -335,8 +345,26 @@ export function ImageViewer({
   // Load new source
   useEffect(() => {
     setState(s => ({ ...s, isLoading: true, error: null }));
+    setEnhancedSize(null);
     resetTransform();
   }, [source, resetTransform]);
+
+  // Super-resolve the loaded photo when Enhance is on. One-shot per
+  // (photo, toggle); any failure just keeps the plain image.
+  useEffect(() => {
+    if (!enhance) {
+      setEnhancedSize(null);
+      return;
+    }
+    const img = imageRef.current;
+    const canvas = enhanceCanvasRef.current;
+    if (state.isLoading || state.error || !img || !canvas || !state.naturalWidth) return;
+    if (fsrUpscaleToCanvas(img, canvas)) {
+      setEnhancedSize({ w: canvas.width, h: canvas.height });
+    } else {
+      setEnhancedSize(null);
+    }
+  }, [enhance, state.isLoading, state.error, state.naturalWidth, source]);
 
   return (
     <div
@@ -386,12 +414,33 @@ export function ImageViewer({
           // centering applied in handleImageLoad's single setState). Otherwise the
           // new photo paints once at natural size, top-left, before the fit lands —
           // the "spawn full size then snap to fit" flash on each slideshow change.
-          opacity: state.isLoading ? 0 : 1,
+          // Also hidden while the FSR-enhanced canvas is showing in its place.
+          opacity: state.isLoading || (enhance && enhancedSize) ? 0 : 1,
           transition: 'opacity 120ms ease-out', // only opacity; transform never animates
         }}
         onLoad={handleImageLoad}
         onError={handleImageError}
         draggable={false}
+      />
+
+      {/* FSR-enhanced render — replaces the <img> visually when Enhance is on.
+          Same transform pipeline; the scale is divided by the upscale factor so
+          the on-screen size is identical, just with 2x the pixels behind it. */}
+      <canvas
+        ref={enhanceCanvasRef}
+        style={{
+          transform: `translate(${state.translateX}px, ${state.translateY}px) scale(${
+            enhancedSize ? state.scale * (state.naturalWidth / enhancedSize.w) : state.scale
+          }) rotate(${state.rotation}deg)`,
+          transformOrigin: 'center center',
+          position: 'absolute',
+          left: '50%',
+          top: '50%',
+          marginLeft: `-${(enhancedSize?.w ?? 0) / 2}px`,
+          marginTop: `-${(enhancedSize?.h ?? 0) / 2}px`,
+          opacity: !state.isLoading && enhance && enhancedSize ? 1 : 0,
+          pointerEvents: 'none',
+        }}
       />
 
       {/* Controls */}

@@ -440,14 +440,14 @@ export function MediaControls() {
             <div className="flex items-center">
               <button
                 onClick={toggleRepeat}
-                className={`p-1.5 rounded transition-colors relative ${state.repeatMode !== 'none' ? 'text-purple-500' : 'text-gray-500 hover:text-white'}`}
+                className={`p-1.5 rounded transition-colors relative ${state.repeatMode !== 'none' ? 'text-green-400' : 'text-gray-500 hover:text-white'}`}
                 title={`Repeat: ${state.repeatMode}`}
               >
                 <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
                 </svg>
                 {state.repeatMode === 'one' && (
-                  <span className="absolute -top-0.5 -right-0.5 text-[7px] font-bold bg-purple-500 text-white rounded-full w-2.5 h-2.5 flex items-center justify-center">1</span>
+                  <span className="absolute -top-0.5 -right-0.5 text-[7px] font-bold bg-green-500 text-black rounded-full w-2.5 h-2.5 flex items-center justify-center">1</span>
                 )}
               </button>
 

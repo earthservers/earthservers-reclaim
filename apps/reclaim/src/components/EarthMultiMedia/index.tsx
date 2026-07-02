@@ -201,9 +201,14 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
   const [playlistNamePrompt, setPlaylistNamePrompt] = useState<{ title: string; onConfirm: (name: string) => void } | null>(null);
   const [playlistNameInput, setPlaylistNameInput] = useState('');
   const [isFullscreen, setIsFullscreen] = useState(false);
-  // Video "Enhance" (FSR super-resolution upscaling) — session-scoped; the
+  // "Enhance" super-resolution mode. Videos: applied live inside the GStreamer
+  // pipeline (off | fsr | nvai). Photos: the same FSR shaders run in a WebGL
+  // canvas in ImageViewer whenever the mode isn't off. Session-scoped; the
   // backend keeps it as the default for panes created later.
-  const [enhanceOn, setEnhanceOn] = useState(false);
+  const [enhanceMode, setEnhanceMode] = useState<'off' | 'fsr' | 'nvai'>('off');
+  // Modes this machine can run, reported by the backend ('nvai' appears only
+  // when the NVIDIA VFX SDK runtime is installed).
+  const [enhanceModes, setEnhanceModes] = useState<string[]>(['off', 'fsr']);
   const [showFullscreenHeader, setShowFullscreenHeader] = useState(true);
   const fullscreenHeaderTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -237,24 +242,45 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
   winLabelRef.current = winLabel;
   const panePid = useCallback((i: number) => `${winLabel}::pane-${i}`, [winLabel]);
 
-  // Toggle FSR super-resolution on every pane of THIS window. The backend
-  // restarts each pipeline around the filter swap (position is restored) and
-  // remembers the mode as the session default for new panes. Reverts the UI
-  // state if the backend refuses (e.g. GL plugins missing / EARTH_VIDEO_SR=off).
-  const toggleEnhance = useCallback(async () => {
-    const next = !enhanceOn;
-    setEnhanceOn(next);
-    const mode = next ? 'fsr' : 'off';
+  // Learn which enhance modes the backend supports (and its current mode) once
+  // the authoritative window label is known.
+  useEffect(() => {
+    if (!winReady || !isTauri()) return;
+    invoke<{ enhance?: string; enhance_modes?: string[] }>('player_get_status', {
+      playerId: `${winLabel}::pane-0`,
+    })
+      .then(s => {
+        if (Array.isArray(s?.enhance_modes) && s.enhance_modes.length) setEnhanceModes(s.enhance_modes);
+        if (s?.enhance === 'off' || s?.enhance === 'fsr' || s?.enhance === 'nvai') setEnhanceMode(s.enhance);
+      })
+      .catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [winReady, winLabel]);
+
+  // Cycle Enhance through the available modes on every pane of THIS window.
+  // The mode switches LIVE inside each pipeline (no restart); the backend also
+  // remembers it as the session default for new panes. Reverts the UI state if
+  // the backend refuses (e.g. NVIDIA SDK missing / EARTH_VIDEO_SR=off).
+  const cycleEnhance = useCallback(async () => {
+    const order = (enhanceModes.length ? enhanceModes : ['off', 'fsr']) as Array<'off' | 'fsr' | 'nvai'>;
+    const next = order[(order.indexOf(enhanceMode) + 1) % order.length] ?? 'off';
+    const prev = enhanceMode;
+    setEnhanceMode(next);
     try {
       const ids = await invoke<string[]>('player_list').catch(() => [] as string[]);
       const mine = ids.filter(id => id.startsWith(`${winLabelRef.current}::`));
       const targets = mine.length ? mine : [`${winLabelRef.current}::pane-0`];
-      await Promise.all(targets.map(id => invoke('player_set_enhance', { playerId: id, mode })));
+      await Promise.all(targets.map(id => invoke('player_set_enhance', { playerId: id, mode: next })));
     } catch (err) {
       console.error('Failed to set video enhancement:', err);
-      setEnhanceOn(!next);
+      setEnhanceMode(prev);
     }
-  }, [enhanceOn]);
+  }, [enhanceMode, enhanceModes]);
+  const ENHANCE_LABEL: Record<'off' | 'fsr' | 'nvai', string> = {
+    off: 'Enhance: Off',
+    fsr: 'Enhance: FSR upscaling',
+    nvai: 'Enhance: NVIDIA AI (RTX)',
+  };
   // Extract the pane index from a (possibly namespaced) player id like "main::pane-2".
   const paneIndexOf = useCallback((id: string | null | undefined) => {
     const m = (id || '').match(/pane-(\d+)/);
@@ -2055,6 +2081,9 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
               // The pane indicator (multi-pane) and fullscreen header already show
               // the title — suppress the viewer's own overlay to avoid a duplicate.
               showTitle={false}
+              // Photos use the FSR shaders on a WebGL canvas whenever Enhance is
+              // on (any mode — nvai is a video-pipeline backend, so photos get FSR).
+              enhance={enhanceMode !== 'off'}
             />
           )
         ) : (
@@ -2173,7 +2202,7 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
                     key={l}
                     onClick={() => changeLayout(l)}
                     className={`p-1.5 rounded transition-colors ${
-                      layout === l ? 'bg-[var(--primary-color)]/20 text-[var(--primary-color)]' : 'text-gray-400 hover:text-white'
+                      layout === l ? 'bg-green-500/25 text-green-400' : 'text-gray-400 hover:text-white'
                     }`}
                     title={l.charAt(0).toUpperCase() + l.slice(1)}
                   >
@@ -2211,7 +2240,7 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
               <div className="flex items-center gap-1 bg-black/30 rounded p-1">
                 <button
                   onClick={() => setPlaybackState(prev => ({ ...prev, isShuffled: !prev.isShuffled }))}
-                  className={`p-1.5 rounded transition-colors ${playbackState.isShuffled ? 'bg-[var(--primary-color)]/20 text-[var(--primary-color)]' : 'text-gray-400 hover:text-white'}`}
+                  className={`p-1.5 rounded transition-colors ${playbackState.isShuffled ? 'bg-green-500/25 text-green-400' : 'text-gray-400 hover:text-white'}`}
                   title={playbackState.isShuffled ? 'Shuffle: on (re-shuffles each repeat pass)' : 'Shuffle: off'}
                 >
                   <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -2223,7 +2252,7 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
                     const order = ['none', 'all', 'one'] as const;
                     return { ...prev, repeatMode: order[(order.indexOf(prev.repeatMode) + 1) % order.length] };
                   })}
-                  className={`relative p-1.5 rounded transition-colors ${playbackState.repeatMode !== 'none' ? 'bg-[var(--primary-color)]/20 text-[var(--primary-color)]' : 'text-gray-400 hover:text-white'}`}
+                  className={`relative p-1.5 rounded transition-colors ${playbackState.repeatMode !== 'none' ? 'bg-green-500/25 text-green-400' : 'text-gray-400 hover:text-white'}`}
                   title={playbackState.repeatMode === 'none' ? 'Repeat: off' : playbackState.repeatMode === 'all' ? 'Repeat: all (loop the queue)' : 'Repeat: one'}
                 >
                   <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -2241,7 +2270,7 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
                 <button
                   onClick={toggleSlideshow}
                   className={`p-1.5 rounded transition-colors ${
-                    slideshow.enabled ? 'bg-[var(--primary-color)]/20 text-[var(--primary-color)]' : 'text-gray-400 hover:text-white'
+                    slideshow.enabled ? 'bg-green-500/25 text-green-400' : 'text-gray-400 hover:text-white'
                   }`}
                   title={slideshow.enabled ? 'Stop Slideshow' : 'Start Slideshow'}
                 >
@@ -2299,24 +2328,27 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
                 </span>
               )}
 
-              {/* Enhance (FSR super-resolution) toggle */}
+              {/* Enhance (super-resolution) mode cycle — applies to videos AND photos */}
               <button
-                onClick={toggleEnhance}
-                className={`p-2 rounded transition-colors ${
-                  enhanceOn ? 'bg-[var(--primary-color)]/20 text-[var(--primary-color)]' : 'text-gray-400 hover:text-white'
+                onClick={cycleEnhance}
+                className={`p-2 rounded transition-colors relative ${
+                  enhanceMode !== 'off' ? 'bg-yellow-500/25 text-yellow-400' : 'text-gray-400 hover:text-white'
                 }`}
-                title={enhanceOn ? 'Enhance: FSR upscaling ON' : 'Enhance video (FSR upscaling)'}
+                title={`${ENHANCE_LABEL[enhanceMode]} — click to cycle`}
               >
                 <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 3v4M3 5h4M6 17v4m-2-2h4m5-16l2.286 6.857L21 12l-5.714 2.143L13 21l-2.286-6.857L5 12l5.714-2.143L13 3z" />
                 </svg>
+                {enhanceMode === 'nvai' && (
+                  <span className="absolute -top-0.5 -right-0.5 text-[6px] font-bold bg-yellow-400 text-black rounded-full w-3 h-3 flex items-center justify-center">AI</span>
+                )}
               </button>
 
               {/* Playlist toggle */}
               <button
                 onClick={() => setShowPlaylistPanel(!showPlaylistPanel)}
                 className={`p-2 rounded transition-colors ${
-                  showPlaylistPanel ? 'bg-[var(--primary-color)]/20 text-[var(--primary-color)]' : 'text-gray-400 hover:text-white'
+                  showPlaylistPanel ? 'bg-green-500/25 text-green-400' : 'text-gray-400 hover:text-white'
                 }`}
                 title="Playlists"
               >
@@ -2329,7 +2361,7 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
               <button
                 onClick={() => setShowPrivacyPanel(!showPrivacyPanel)}
                 className={`p-2 rounded transition-colors ${
-                  showPrivacyPanel ? 'bg-[var(--primary-color)]/20 text-[var(--primary-color)]' : 'text-gray-400 hover:text-white'
+                  showPrivacyPanel ? 'bg-green-500/25 text-green-400' : 'text-gray-400 hover:text-white'
                 }`}
                 title="Privacy Settings"
               >
@@ -2493,7 +2525,7 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
                 title={`Drive controls for pane ${i + 1}`}
                 className={`w-6 h-6 rounded text-xs font-medium transition-colors ${
                   activePane === i
-                    ? 'bg-[var(--primary-color)] text-white'
+                    ? 'bg-green-600 text-white'
                     : mediaItems[i]
                     ? 'bg-black/40 text-gray-300 hover:text-white'
                     : 'bg-black/20 text-gray-600'
@@ -2512,7 +2544,7 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
               key={l}
               onClick={() => changeLayout(l)}
               className={`p-1.5 rounded transition-colors ${
-                layout === l ? 'bg-[var(--primary-color)]/20 text-[var(--primary-color)]' : 'text-gray-400 hover:text-white'
+                layout === l ? 'bg-green-500/25 text-green-400' : 'text-gray-400 hover:text-white'
               }`}
               title={l.charAt(0).toUpperCase() + l.slice(1)}
             >
@@ -2549,7 +2581,7 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
         <div className="flex items-center gap-1 bg-black/30 rounded p-1">
           <button
             onClick={() => setPlaybackState(prev => ({ ...prev, isShuffled: !prev.isShuffled }))}
-            className={`p-1.5 rounded transition-colors ${playbackState.isShuffled ? 'bg-[var(--primary-color)]/20 text-[var(--primary-color)]' : 'text-gray-400 hover:text-white'}`}
+            className={`p-1.5 rounded transition-colors ${playbackState.isShuffled ? 'bg-green-500/25 text-green-400' : 'text-gray-400 hover:text-white'}`}
             title={playbackState.isShuffled ? 'Shuffle: on (re-shuffles each repeat pass)' : 'Shuffle: off'}
           >
             <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -2561,7 +2593,7 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
               const order = ['none', 'all', 'one'] as const;
               return { ...prev, repeatMode: order[(order.indexOf(prev.repeatMode) + 1) % order.length] };
             })}
-            className={`relative p-1.5 rounded transition-colors ${playbackState.repeatMode !== 'none' ? 'bg-[var(--primary-color)]/20 text-[var(--primary-color)]' : 'text-gray-400 hover:text-white'}`}
+            className={`relative p-1.5 rounded transition-colors ${playbackState.repeatMode !== 'none' ? 'bg-green-500/25 text-green-400' : 'text-gray-400 hover:text-white'}`}
             title={playbackState.repeatMode === 'none' ? 'Repeat: off' : playbackState.repeatMode === 'all' ? 'Repeat: all (loop the queue)' : 'Repeat: one'}
           >
             <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -2579,7 +2611,7 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
           <button
             onClick={toggleSlideshow}
             className={`p-1.5 rounded transition-colors ${
-              slideshow.enabled ? 'bg-[var(--primary-color)]/20 text-[var(--primary-color)]' : 'text-gray-400 hover:text-white'
+              slideshow.enabled ? 'bg-green-500/25 text-green-400' : 'text-gray-400 hover:text-white'
             }`}
             title={slideshow.enabled ? 'Stop Slideshow' : 'Start Slideshow'}
           >
@@ -2636,24 +2668,27 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
           </span>
         )}
 
-        {/* Enhance (FSR super-resolution) toggle */}
+        {/* Enhance (super-resolution) mode cycle — applies to videos AND photos */}
         <button
-          onClick={toggleEnhance}
-          className={`p-2 rounded transition-colors ${
-            enhanceOn ? 'bg-[var(--primary-color)]/20 text-[var(--primary-color)]' : 'text-gray-400 hover:text-white'
+          onClick={cycleEnhance}
+          className={`p-2 rounded transition-colors relative ${
+            enhanceMode !== 'off' ? 'bg-yellow-500/25 text-yellow-400' : 'text-gray-400 hover:text-white'
           }`}
-          title={enhanceOn ? 'Enhance: FSR upscaling ON' : 'Enhance video (FSR upscaling)'}
+          title={`${ENHANCE_LABEL[enhanceMode]} — click to cycle`}
         >
           <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 3v4M3 5h4M6 17v4m-2-2h4m5-16l2.286 6.857L21 12l-5.714 2.143L13 21l-2.286-6.857L5 12l5.714-2.143L13 3z" />
           </svg>
+          {enhanceMode === 'nvai' && (
+            <span className="absolute -top-0.5 -right-0.5 text-[6px] font-bold bg-yellow-400 text-black rounded-full w-3 h-3 flex items-center justify-center">AI</span>
+          )}
         </button>
 
         {/* Playlist toggle */}
         <button
           onClick={() => setShowPlaylistPanel(!showPlaylistPanel)}
           className={`p-2 rounded transition-colors ${
-            showPlaylistPanel ? 'bg-[var(--primary-color)]/20 text-[var(--primary-color)]' : 'text-gray-400 hover:text-white'
+            showPlaylistPanel ? 'bg-green-500/25 text-green-400' : 'text-gray-400 hover:text-white'
           }`}
           title="Playlists"
         >
@@ -2666,7 +2701,7 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
         <button
           onClick={() => setShowPrivacyPanel(!showPrivacyPanel)}
           className={`p-2 rounded transition-colors ${
-            showPrivacyPanel ? 'bg-[var(--primary-color)]/20 text-[var(--primary-color)]' : 'text-gray-400 hover:text-white'
+            showPrivacyPanel ? 'bg-green-500/25 text-green-400' : 'text-gray-400 hover:text-white'
           }`}
           title="Privacy Settings"
         >
@@ -2679,7 +2714,7 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
         <button
           onClick={toggleFullscreen}
           className={`p-2 rounded transition-colors ${
-            isFullscreen ? 'bg-[var(--primary-color)]/20 text-[var(--primary-color)]' : 'text-gray-400 hover:text-white'
+            isFullscreen ? 'bg-green-500/25 text-green-400' : 'text-gray-400 hover:text-white'
           }`}
           title={isFullscreen ? 'Exit Fullscreen' : 'Fullscreen'}
         >
