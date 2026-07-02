@@ -177,7 +177,9 @@ void main() {
 }
 `;
 
-const RCAS_SHARPNESS = 0.87055; // exp2(-0.2), matches the video pipeline
+/// Default RCAS sharpening in stops (0 = sharpest, 2 = softest) — matches the
+/// video pipeline's EnhanceSettings default.
+const DEFAULT_SHARPNESS_STOPS = 0.2;
 
 function compile(gl: WebGLRenderingContext, type: number, src: string): WebGLShader | null {
   const sh = gl.createShader(type);
@@ -229,7 +231,13 @@ export function fsrOutputSize(
 /// Render `img` super-resolved (EASU + RCAS) into `canvas`. Sets the canvas
 /// dimensions itself. Returns true on success; on any failure the canvas is
 /// untouched and the caller keeps showing the plain <img>.
-export function fsrUpscaleToCanvas(img: HTMLImageElement, canvas: HTMLCanvasElement): boolean {
+/// `sharpnessStops` is RCAS sharpening in stops (0 sharpest ..= 2 softest),
+/// mirroring the video pipeline's Enhance sharpness setting.
+export function fsrUpscaleToCanvas(
+  img: HTMLImageElement,
+  canvas: HTMLCanvasElement,
+  sharpnessStops: number = DEFAULT_SHARPNESS_STOPS,
+): boolean {
   try {
     const sw = img.naturalWidth;
     const sh = img.naturalHeight;
@@ -304,7 +312,10 @@ export function fsrUpscaleToCanvas(img: HTMLImageElement, canvas: HTMLCanvasElem
     gl.uniform1i(gl.getUniformLocation(rcas, 'tex'), 0);
     setF(rcas, 'u_dst_w', out.w);
     setF(rcas, 'u_dst_h', out.h);
-    setF(rcas, 'u_sharpness', RCAS_SHARPNESS);
+    const stops = Number.isFinite(sharpnessStops)
+      ? Math.min(2, Math.max(0, sharpnessStops))
+      : DEFAULT_SHARPNESS_STOPS;
+    setF(rcas, 'u_sharpness', Math.pow(2, -stops));
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     gl.finish();
 

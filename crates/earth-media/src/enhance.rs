@@ -36,7 +36,7 @@
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use crate::MediaError;
@@ -47,9 +47,40 @@ const SCALE: f64 = 2.0;
 const MAX_W: i32 = 3840;
 const MAX_H: i32 = 2160;
 
-/// RCAS sharpness as exp2(-stops): 0.0 stops = 1.0 (max). 0.2 stops is FSR's
-/// commonly-shipped default — visibly sharper without halos.
-const RCAS_SHARPNESS: f32 = 0.870_55; // exp2(-0.2)
+/// User-tunable Enhance parameters (see `EnhanceCtl::set_settings`). Both are
+/// LIVE-safe: sharpness is a shader uniform (no caps change, no recompile) and
+/// AI strength is a plain element property read per frame — neither ever
+/// triggers renegotiation.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct EnhanceSettings {
+    /// RCAS sharpening in stops, 0.0 (maximum) ..= 2.0 (softest). The RCAS
+    /// uniform is exp2(-stops); 0.2 stops is FSR's commonly-shipped default —
+    /// visibly sharper without halos.
+    pub fsr_sharpness: f32,
+    /// AI blend strength 0.0 ..= 1.0: the NvSR output mixed against a plain
+    /// nearest-neighbour upscale of the source (1.0 = pure AI).
+    pub ai_strength: f32,
+}
+
+impl Default for EnhanceSettings {
+    fn default() -> Self {
+        Self { fsr_sharpness: 0.2, ai_strength: 1.0 }
+    }
+}
+
+impl EnhanceSettings {
+    pub fn clamped(self) -> Self {
+        Self {
+            fsr_sharpness: if self.fsr_sharpness.is_finite() { self.fsr_sharpness.clamp(0.0, 2.0) } else { 0.2 },
+            ai_strength: if self.ai_strength.is_finite() { self.ai_strength.clamp(0.0, 1.0) } else { 1.0 },
+        }
+    }
+
+    /// The RCAS `u_sharpness` uniform for this setting.
+    fn rcas_uniform(&self) -> f32 {
+        (-self.fsr_sharpness).exp2()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -101,6 +132,26 @@ pub fn set_default_enhance(mode: EnhanceMode) {
         EnhanceMode::NvAi => 2,
     };
     DEFAULT_ENHANCE.store(v, Ordering::Relaxed);
+}
+
+/// Session-wide default Enhance settings, same lifecycle as DEFAULT_ENHANCE
+/// (new panes inherit; incognito webview can't persist them). Stored in
+/// milli-units so plain integer atomics carry the floats.
+static DEFAULT_SHARPNESS_MILLI: AtomicU32 = AtomicU32::new(200); // 0.2 stops
+static DEFAULT_AI_STRENGTH_MILLI: AtomicU32 = AtomicU32::new(1000); // 1.0
+
+pub fn default_enhance_settings() -> EnhanceSettings {
+    EnhanceSettings {
+        fsr_sharpness: DEFAULT_SHARPNESS_MILLI.load(Ordering::Relaxed) as f32 / 1000.0,
+        ai_strength: DEFAULT_AI_STRENGTH_MILLI.load(Ordering::Relaxed) as f32 / 1000.0,
+    }
+    .clamped()
+}
+
+pub fn set_default_enhance_settings(s: EnhanceSettings) {
+    let s = s.clamped();
+    DEFAULT_SHARPNESS_MILLI.store((s.fsr_sharpness * 1000.0).round() as u32, Ordering::Relaxed);
+    DEFAULT_AI_STRENGTH_MILLI.store((s.ai_strength * 1000.0).round() as u32, Ordering::Relaxed);
 }
 
 /// EARTH_VIDEO_SR=off disables enhancement entirely (isolation/debug hatch,
@@ -374,6 +425,9 @@ fn shader_uniforms(pairs: &[(&str, f32)]) -> gst::Structure {
 
 struct CtlState {
     mode: EnhanceMode,
+    /// Tunables (sharpness/strength). NOT part of `applied` — settings changes
+    /// go straight to uniforms/properties in set_settings and never touch caps.
+    settings: EnhanceSettings,
     /// Last input caps seen at the GL stage (post-NvSR): width, height, PAR.
     last_in: Option<(i32, i32, Option<gst::Fraction>)>,
     /// What apply() last wrote to the GL stage: (fsr_shaders, out_w, out_h, par).
@@ -439,12 +493,57 @@ impl EnhanceCtl {
         self.state.lock().map(|s| s.mode).unwrap_or(EnhanceMode::Off)
     }
 
+    pub fn settings(&self) -> EnhanceSettings {
+        self.state.lock().map(|s| s.settings).unwrap_or_default()
+    }
+
+    /// Tune Enhance LIVE. Deliberately renegotiation-free (see the stability
+    /// rules): sharpness lands as a glshader UNIFORM (picked up next frame, no
+    /// `update-shader`, no caps change) and AI strength as a plain property on
+    /// the NvSR element (read per frame in transform). Strict no-op when the
+    /// values don't change.
+    pub fn set_settings(&self, settings: EnhanceSettings) -> Result<(), MediaError> {
+        let settings = settings.clamped();
+        let applied = {
+            let mut st = self
+                .state
+                .lock()
+                .map_err(|e| MediaError::PlayerError(format!("enhance state poisoned: {}", e)))?;
+            if st.settings == settings {
+                return Ok(());
+            }
+            st.settings = settings;
+            st.applied
+        };
+        if let Some(nvsr) = &self.nvsr {
+            nvsr.set_property("strength", settings.ai_strength as f64);
+        }
+        // Refresh the RCAS uniforms only when FSR shaders are live; otherwise
+        // apply() writes them (with these settings) whenever FSR next engages.
+        if let Some((true, ow, oh, _)) = applied {
+            self.rcas.set_property(
+                "uniforms",
+                shader_uniforms(&[
+                    ("u_dst_w", ow as f32),
+                    ("u_dst_h", oh as f32),
+                    ("u_sharpness", settings.rcas_uniform()),
+                ]),
+            );
+        }
+        log::info!(
+            "[earth-media] enhance settings -> sharpness {:.2} stops, AI strength {:.0}% (live)",
+            settings.fsr_sharpness,
+            settings.ai_strength * 100.0
+        );
+        Ok(())
+    }
+
     /// (Re)apply shaders, caps and uniforms for the current mode + last-seen
     /// input size. Called on mode changes and from the caps probe. Strictly a
     /// no-op when nothing would change (see CtlState::applied).
     fn apply(&self) {
-        let (mode, last_in) = match self.state.lock() {
-            Ok(s) => (s.mode, s.last_in),
+        let (mode, last_in, settings) = match self.state.lock() {
+            Ok(s) => (s.mode, s.last_in, s.settings),
             Err(_) => return,
         };
         let Some((w, h, par)) = last_in else { return };
@@ -533,7 +632,7 @@ impl EnhanceCtl {
                 shader_uniforms(&[
                     ("u_dst_w", ow as f32),
                     ("u_dst_h", oh as f32),
-                    ("u_sharpness", RCAS_SHARPNESS),
+                    ("u_sharpness", settings.rcas_uniform()),
                 ]),
             );
             log::info!("[earth-media] enhance: FSR {}x{} -> {}x{}", w, h, ow, oh);
@@ -618,13 +717,19 @@ pub fn build_enhance_bin(initial: EnhanceMode) -> Result<(gst::Element, Arc<Enha
     bin.add_pad(&src_pad)
         .map_err(|e| MediaError::PlayerError(format!("enhance: add src pad failed: {}", e)))?;
 
+    // New panes inherit the session's tunables (like the mode default below).
+    let settings = default_enhance_settings();
+    if let Some(n) = &nvsr {
+        n.set_property("strength", settings.ai_strength as f64);
+    }
+
     let ctl = Arc::new(EnhanceCtl {
         easu,
         rcas,
         caps_scale,
         caps_out,
         nvsr: nvsr.clone(),
-        state: Mutex::new(CtlState { mode: EnhanceMode::Off, last_in: None, applied: None }),
+        state: Mutex::new(CtlState { mode: EnhanceMode::Off, settings, last_in: None, applied: None }),
     });
 
     // Track the GL stage's input size from the caps flowing into glupload —
@@ -676,6 +781,27 @@ mod tests {
         // Cap binds on the larger axis; scale stays uniform.
         assert_eq!(output_size(2560, 1440), Some((3840, 2160)));
         assert_eq!(output_size(0, 720), None);
+    }
+
+    #[test]
+    fn enhance_settings_clamp_and_defaults() {
+        let d = EnhanceSettings::default();
+        assert_eq!(d.fsr_sharpness, 0.2);
+        assert_eq!(d.ai_strength, 1.0);
+        let c = EnhanceSettings { fsr_sharpness: 9.0, ai_strength: -3.0 }.clamped();
+        assert_eq!(c.fsr_sharpness, 2.0);
+        assert_eq!(c.ai_strength, 0.0);
+        let n = EnhanceSettings { fsr_sharpness: f32::NAN, ai_strength: f32::INFINITY }.clamped();
+        assert_eq!(n.fsr_sharpness, 0.2);
+        assert_eq!(n.ai_strength, 1.0);
+        // RCAS uniform: 0 stops = 1.0 (max), 1 stop = 0.5.
+        assert!((EnhanceSettings { fsr_sharpness: 0.0, ai_strength: 1.0 }.rcas_uniform() - 1.0).abs() < 1e-6);
+        assert!((EnhanceSettings { fsr_sharpness: 1.0, ai_strength: 1.0 }.rcas_uniform() - 0.5).abs() < 1e-6);
+        // Session-default roundtrip (milli-unit atomics).
+        set_default_enhance_settings(EnhanceSettings { fsr_sharpness: 0.55, ai_strength: 0.7 });
+        let r = default_enhance_settings();
+        assert!((r.fsr_sharpness - 0.55).abs() < 1e-3 && (r.ai_strength - 0.7).abs() < 1e-3);
+        set_default_enhance_settings(EnhanceSettings::default()); // restore for other tests
     }
 
     #[test]
@@ -824,8 +950,17 @@ mod tests {
 
         ctl.set_mode(EnhanceMode::Fsr).unwrap();
         settle(640, "fsr", &bus);
+        // Tune LIVE mid-FSR: uniform-only update — must not renegotiate or error.
+        ctl.set_settings(EnhanceSettings { fsr_sharpness: 0.8, ai_strength: 0.5 }).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        no_errors(&bus, "fsr-settings");
         ctl.set_mode(EnhanceMode::NvAi).unwrap();
         settle(640, "nvai", &bus);
+        // Tune LIVE mid-AI: strength is a plain element property — same rules.
+        ctl.set_settings(EnhanceSettings { fsr_sharpness: 0.2, ai_strength: 0.25 }).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        no_errors(&bus, "nvai-settings");
+        ctl.set_settings(EnhanceSettings::default()).unwrap();
         ctl.set_mode(EnhanceMode::Off).unwrap();
         settle(320, "off", &bus);
 

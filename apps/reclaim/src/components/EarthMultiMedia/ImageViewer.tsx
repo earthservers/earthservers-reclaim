@@ -21,6 +21,9 @@ interface ImageViewerProps {
   /// Super-resolve the photo (FSR shaders on a WebGL canvas — the photo twin of
   /// the video pipeline's Enhance). Falls back to the plain image on failure.
   enhance?: boolean;
+  /// RCAS sharpening in stops (0 = sharpest, 2 = softest); mirrors the video
+  /// pipeline's Enhance sharpness setting. Default 0.2 (the FSR default).
+  sharpness?: number;
 }
 
 interface ImageState {
@@ -49,6 +52,7 @@ export function ImageViewer({
   showControls = true,
   showTitle = true,
   enhance = false,
+  sharpness = 0.2,
 }: ImageViewerProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const imageRef = useRef<HTMLImageElement>(null);
@@ -359,12 +363,12 @@ export function ImageViewer({
     const img = imageRef.current;
     const canvas = enhanceCanvasRef.current;
     if (state.isLoading || state.error || !img || !canvas || !state.naturalWidth) return;
-    if (fsrUpscaleToCanvas(img, canvas)) {
+    if (fsrUpscaleToCanvas(img, canvas, sharpness)) {
       setEnhancedSize({ w: canvas.width, h: canvas.height });
     } else {
       setEnhancedSize(null);
     }
-  }, [enhance, state.isLoading, state.error, state.naturalWidth, source]);
+  }, [enhance, sharpness, state.isLoading, state.error, state.naturalWidth, source]);
 
   return (
     <div

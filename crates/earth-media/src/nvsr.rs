@@ -389,6 +389,37 @@ pub(crate) fn nv_factor(w: i32, h: i32) -> i32 {
     }
 }
 
+/// Blend an AI-upscaled 2x RGBA frame (in `output`) against a nearest-
+/// neighbour 2x of the source, in place: out = ai*strength + orig*(1-strength).
+/// Integer math per channel; alpha forced opaque. `strength` is 0.0..=1.0.
+pub(crate) fn blend_with_nearest(
+    input: &[u8],
+    in_w: usize,
+    in_h: usize,
+    in_stride: usize,
+    output: &mut [u8],
+    out_w: usize,
+    out_h: usize,
+    out_stride: usize,
+    strength: f32,
+) {
+    let q = (strength.clamp(0.0, 1.0) * 256.0 + 0.5) as u32; // 256 = pure AI
+    let r = 256 - q;
+    for oy in 0..out_h {
+        let iy = (oy / 2).min(in_h - 1);
+        let src = &input[iy * in_stride..iy * in_stride + in_w * 4];
+        let dst = &mut output[oy * out_stride..oy * out_stride + out_w * 4];
+        for (ox, px) in dst.chunks_exact_mut(4).enumerate() {
+            let ix = (ox / 2).min(in_w - 1);
+            let sp = &src[ix * 4..ix * 4 + 4];
+            px[0] = ((px[0] as u32 * q + sp[0] as u32 * r) >> 8) as u8;
+            px[1] = ((px[1] as u32 * q + sp[1] as u32 * r) >> 8) as u8;
+            px[2] = ((px[2] as u32 * q + sp[2] as u32 * r) >> 8) as u8;
+            px[3] = 255;
+        }
+    }
+}
+
 mod imp {
     use super::*;
     use gst::subclass::prelude::*;
@@ -398,7 +429,7 @@ mod imp {
     use gstreamer_video as gst_video;
     use gst_video::prelude::*;
     use gst_video::subclass::prelude::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     /// The AI backend actually driving an engaged element.
     pub enum Engine {
@@ -408,11 +439,24 @@ mod imp {
         Onnx,
     }
 
-    #[derive(Default)]
     pub struct EarthNvSr {
         pub engaged: AtomicBool,
+        /// AI blend strength 0.0..=1.0 as f32 bits (1.0 = pure AI output). A
+        /// plain property read per frame — changing it never renegotiates.
+        pub strength: AtomicU32,
         pub engine: Mutex<Option<Engine>>,
         pub infos: Mutex<Option<(gst_video::VideoInfo, gst_video::VideoInfo)>>,
+    }
+
+    impl Default for EarthNvSr {
+        fn default() -> Self {
+            Self {
+                engaged: AtomicBool::new(false),
+                strength: AtomicU32::new(1.0f32.to_bits()),
+                engine: Mutex::new(None),
+                infos: Mutex::new(None),
+            }
+        }
     }
 
     #[glib::object_subclass]
@@ -426,15 +470,31 @@ mod imp {
         fn properties() -> &'static [glib::ParamSpec] {
             static PROPS: OnceLock<Vec<glib::ParamSpec>> = OnceLock::new();
             PROPS.get_or_init(|| {
-                vec![glib::ParamSpecBoolean::builder("engaged")
-                    .nick("Engaged")
-                    .blurb("Run NVIDIA SuperRes (false = zero-cost passthrough)")
-                    .default_value(false)
-                    .build()]
+                vec![
+                    glib::ParamSpecBoolean::builder("engaged")
+                        .nick("Engaged")
+                        .blurb("Run NVIDIA SuperRes (false = zero-cost passthrough)")
+                        .default_value(false)
+                        .build(),
+                    glib::ParamSpecDouble::builder("strength")
+                        .nick("AI strength")
+                        .blurb("Blend of AI output vs nearest-upscaled source (1.0 = pure AI)")
+                        .minimum(0.0)
+                        .maximum(1.0)
+                        .default_value(1.0)
+                        .build(),
+                ]
             })
         }
 
         fn set_property(&self, _id: usize, value: &glib::Value, pspec: &glib::ParamSpec) {
+            if pspec.name() == "strength" {
+                let s = value.get::<f64>().unwrap_or(1.0).clamp(0.0, 1.0) as f32;
+                // Property-only: transform_frame reads this per frame; no
+                // renegotiation, no reconfigure (see the stability rules).
+                self.strength.store(s.to_bits(), Ordering::Relaxed);
+                return;
+            }
             if pspec.name() == "engaged" {
                 let engaged = value.get::<bool>().unwrap_or(false);
                 self.engaged.store(engaged, Ordering::Relaxed);
@@ -469,10 +529,10 @@ mod imp {
         }
 
         fn property(&self, _id: usize, pspec: &glib::ParamSpec) -> glib::Value {
-            if pspec.name() == "engaged" {
-                self.engaged.load(Ordering::Relaxed).to_value()
-            } else {
-                unimplemented!()
+            match pspec.name() {
+                "engaged" => self.engaged.load(Ordering::Relaxed).to_value(),
+                "strength" => (f32::from_bits(self.strength.load(Ordering::Relaxed)) as f64).to_value(),
+                _ => unimplemented!(),
             }
         }
     }
@@ -648,7 +708,20 @@ mod imp {
                         ),
                     };
                     match res {
-                        Ok(()) => return Ok(gst::FlowSuccess::Ok),
+                        Ok(()) => {
+                            // AI strength < 100%: mix the AI result against a
+                            // plain nearest-neighbour 2x of the source. Skipped
+                            // entirely at full strength (the common case).
+                            let s = f32::from_bits(self.strength.load(Ordering::Relaxed))
+                                .clamp(0.0, 1.0);
+                            if s < 1.0 {
+                                blend_with_nearest(
+                                    input, in_w, in_h, in_stride as usize,
+                                    output, out_w, out_h, out_stride as usize, s,
+                                );
+                            }
+                            return Ok(gst::FlowSuccess::Ok);
+                        }
                         Err(err) => {
                             log::warn!("[earth-media] AI frame failed: {} — fallback scaling", err);
                             *engine = None; // don't retry every frame
@@ -700,6 +773,18 @@ fn ensure_registered() -> bool {
 /// Real-ESRGAN/onnxruntime path).
 pub fn ai_available() -> bool {
     available() || crate::aisr::available()
+}
+
+/// Human-readable name of the AI model/backend that would drive 'nvai', for
+/// the UI's Enhance settings. None when no backend is installed.
+pub fn ai_model_label() -> Option<String> {
+    if available() {
+        return Some("NVIDIA Maxine SuperRes 2x".to_string());
+    }
+    if crate::aisr::available() {
+        return Some(crate::aisr::model_label());
+    }
+    None
 }
 
 /// Engage-time preflight for the active backend, so switching to the AI mode
@@ -757,6 +842,31 @@ mod tests {
         // engine would hard-fail on sub-profile shapes.
         assert_eq!(nv_factor(24, 18), 1);
         assert_eq!(nv_factor(0, 0), 1);
+    }
+
+    /// AI-strength blend: 0 = pure nearest-upscale of the source, 1 → left as
+    /// AI output (the caller skips the call), midpoints mix; alpha opaque.
+    #[test]
+    fn blend_with_nearest_mixes() {
+        let (in_w, in_h) = (2usize, 1usize);
+        let input = [
+            100u8, 20, 40, 255, // src px 0
+            200, 60, 80, 255, // src px 1
+        ];
+        let (out_w, out_h) = (4usize, 2usize);
+        // "AI output": all-zero so the blend result is (1-s) * nearest.
+        let mut output = vec![0u8; out_w * out_h * 4];
+        blend_with_nearest(&input, in_w, in_h, in_w * 4, &mut output, out_w, out_h, out_w * 4, 0.0);
+        // strength 0 → exactly the nearest-neighbour doubling.
+        assert_eq!(&output[0..4], &[100, 20, 40, 255], "px(0,0) <- src 0");
+        assert_eq!(&output[8..12], &[200, 60, 80, 255], "px(2,0) <- src 1");
+        assert_eq!(&output[out_w * 4..out_w * 4 + 4], &[100, 20, 40, 255], "row doubled");
+
+        let mut output = vec![0u8; out_w * out_h * 4];
+        blend_with_nearest(&input, in_w, in_h, in_w * 4, &mut output, out_w, out_h, out_w * 4, 0.5);
+        // strength 0.5 over zero AI output → half the source (integer >>8).
+        assert!((output[0] as i32 - 50).abs() <= 1, "half blend, got {}", output[0]);
+        assert_eq!(output[3], 255, "alpha stays opaque");
     }
 
     /// Element sanity without the SDK: registers, negotiates passthrough when

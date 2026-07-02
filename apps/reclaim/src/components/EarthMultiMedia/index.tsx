@@ -209,6 +209,13 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
   // Modes this machine can run, reported by the backend ('nvai' appears only
   // when the NVIDIA VFX SDK runtime is installed).
   const [enhanceModes, setEnhanceModes] = useState<string[]>(['off', 'fsr']);
+  // Enhance tunables (backend-persisted as the session default, like the mode):
+  // FSR sharpness in RCAS stops (0 = sharpest, 2 = softest) and AI blend
+  // strength 0..1. Right-clicking the Enhance button opens the settings panel.
+  const [showEnhancePanel, setShowEnhancePanel] = useState(false);
+  const [enhanceSharpness, setEnhanceSharpness] = useState(0.2);
+  const [aiStrength, setAiStrength] = useState(1.0);
+  const [enhanceModel, setEnhanceModel] = useState<string | null>(null);
   const [showFullscreenHeader, setShowFullscreenHeader] = useState(true);
   const fullscreenHeaderTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -246,12 +253,20 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
   // the authoritative window label is known.
   useEffect(() => {
     if (!winReady || !isTauri()) return;
-    invoke<{ enhance?: string; enhance_modes?: string[] }>('player_get_status', {
+    invoke<{
+      enhance?: string;
+      enhance_modes?: string[];
+      enhance_settings?: { fsr_sharpness?: number; ai_strength?: number };
+      enhance_model?: string | null;
+    }>('player_get_status', {
       playerId: `${winLabel}::pane-0`,
     })
       .then(s => {
         if (Array.isArray(s?.enhance_modes) && s.enhance_modes.length) setEnhanceModes(s.enhance_modes);
         if (s?.enhance === 'off' || s?.enhance === 'fsr' || s?.enhance === 'nvai') setEnhanceMode(s.enhance);
+        if (typeof s?.enhance_settings?.fsr_sharpness === 'number') setEnhanceSharpness(s.enhance_settings.fsr_sharpness);
+        if (typeof s?.enhance_settings?.ai_strength === 'number') setAiStrength(s.enhance_settings.ai_strength);
+        if (typeof s?.enhance_model === 'string') setEnhanceModel(s.enhance_model);
       })
       .catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -261,9 +276,7 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
   // The mode switches LIVE inside each pipeline (no restart); the backend also
   // remembers it as the session default for new panes. Reverts the UI state if
   // the backend refuses (e.g. NVIDIA SDK missing / EARTH_VIDEO_SR=off).
-  const cycleEnhance = useCallback(async () => {
-    const order = (enhanceModes.length ? enhanceModes : ['off', 'fsr']) as Array<'off' | 'fsr' | 'nvai'>;
-    const next = order[(order.indexOf(enhanceMode) + 1) % order.length] ?? 'off';
+  const setEnhanceTo = useCallback(async (next: 'off' | 'fsr' | 'nvai') => {
     const prev = enhanceMode;
     setEnhanceMode(next);
     try {
@@ -275,7 +288,30 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
       console.error('Failed to set video enhancement:', err);
       setEnhanceMode(prev);
     }
-  }, [enhanceMode, enhanceModes]);
+  }, [enhanceMode]);
+  const cycleEnhance = useCallback(async () => {
+    const order = (enhanceModes.length ? enhanceModes : ['off', 'fsr']) as Array<'off' | 'fsr' | 'nvai'>;
+    const next = order[(order.indexOf(enhanceMode) + 1) % order.length] ?? 'off';
+    await setEnhanceTo(next);
+  }, [enhanceMode, enhanceModes, setEnhanceTo]);
+  // Push tuned values to every pane of THIS window, live (uniform/property
+  // updates only — no renegotiation), and let the backend keep them as the
+  // session default. Slider drags call this per change; each set is trivial.
+  const applyEnhanceSettings = useCallback(async (sharpness: number, strength: number) => {
+    setEnhanceSharpness(sharpness);
+    setAiStrength(strength);
+    if (!isTauri()) return;
+    try {
+      const ids = await invoke<string[]>('player_list').catch(() => [] as string[]);
+      const mine = ids.filter(id => id.startsWith(`${winLabelRef.current}::`));
+      const targets = mine.length ? mine : [`${winLabelRef.current}::pane-0`];
+      await Promise.all(targets.map(id => invoke('player_set_enhance_settings', {
+        playerId: id, fsrSharpness: sharpness, aiStrength: strength,
+      })));
+    } catch (err) {
+      console.error('Failed to set enhance settings:', err);
+    }
+  }, []);
   const ENHANCE_LABEL: Record<'off' | 'fsr' | 'nvai', string> = {
     off: 'Enhance: Off',
     fsr: 'Enhance: FSR upscaling',
@@ -417,7 +453,7 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
       setTimeout(() => window.dispatchEvent(new Event('resize')), 260),
     ];
     return () => ids.forEach(clearTimeout);
-  }, [showPlaylistPanel, isFullscreen]);
+  }, [showPlaylistPanel, showEnhancePanel, isFullscreen]);
 
   // Show video surfaces when mounting (returning to Media tab), hide when unmounting
   // Keep playback running in background - only hide/show the visual surfaces
@@ -2084,6 +2120,7 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
               // Photos use the FSR shaders on a WebGL canvas whenever Enhance is
               // on (any mode — nvai is a video-pipeline backend, so photos get FSR).
               enhance={enhanceMode !== 'off'}
+              sharpness={enhanceSharpness}
             />
           )
         ) : (
@@ -2185,7 +2222,7 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
           className={`absolute top-0 left-0 z-[10001] bg-gradient-to-b from-black/80 to-transparent transition-opacity duration-300 ${
             showFullscreenHeader ? 'opacity-100' : 'opacity-0 pointer-events-none'
           }`}
-          style={{ right: showPlaylistPanel ? '320px' : '0' }} // 320px = 20rem (w-80)
+          style={{ right: showPlaylistPanel || showEnhancePanel ? '320px' : '0' }} // 320px = 20rem (w-80)
         >
           <div className="flex items-center justify-between px-4 py-3">
             {/* Left: Title */}
@@ -2331,10 +2368,15 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
               {/* Enhance (super-resolution) mode cycle — applies to videos AND photos */}
               <button
                 onClick={cycleEnhance}
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  setShowEnhancePanel(v => !v);
+                  setShowPlaylistPanel(false);
+                }}
                 className={`p-2 rounded transition-colors relative ${
                   enhanceMode !== 'off' ? 'bg-yellow-500/25 text-yellow-400' : 'text-gray-400 hover:text-white'
                 }`}
-                title={`${ENHANCE_LABEL[enhanceMode]} — click to cycle`}
+                title={`${ENHANCE_LABEL[enhanceMode]} — click to cycle, right-click for settings`}
               >
                 <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 3v4M3 5h4M6 17v4m-2-2h4m5-16l2.286 6.857L21 12l-5.714 2.143L13 21l-2.286-6.857L5 12l5.714-2.143L13 3z" />
@@ -2346,7 +2388,7 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
 
               {/* Playlist toggle */}
               <button
-                onClick={() => setShowPlaylistPanel(!showPlaylistPanel)}
+                onClick={() => { setShowPlaylistPanel(!showPlaylistPanel); setShowEnhancePanel(false); }}
                 className={`p-2 rounded transition-colors ${
                   showPlaylistPanel ? 'bg-green-500/25 text-green-400' : 'text-gray-400 hover:text-white'
                 }`}
@@ -2671,10 +2713,15 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
         {/* Enhance (super-resolution) mode cycle — applies to videos AND photos */}
         <button
           onClick={cycleEnhance}
+          onContextMenu={(e) => {
+            e.preventDefault();
+            setShowEnhancePanel(v => !v);
+            setShowPlaylistPanel(false);
+          }}
           className={`p-2 rounded transition-colors relative ${
             enhanceMode !== 'off' ? 'bg-yellow-500/25 text-yellow-400' : 'text-gray-400 hover:text-white'
           }`}
-          title={`${ENHANCE_LABEL[enhanceMode]} — click to cycle`}
+          title={`${ENHANCE_LABEL[enhanceMode]} — click to cycle, right-click for settings`}
         >
           <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 3v4M3 5h4M6 17v4m-2-2h4m5-16l2.286 6.857L21 12l-5.714 2.143L13 21l-2.286-6.857L5 12l5.714-2.143L13 3z" />
@@ -2686,7 +2733,7 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
 
         {/* Playlist toggle */}
         <button
-          onClick={() => setShowPlaylistPanel(!showPlaylistPanel)}
+          onClick={() => { setShowPlaylistPanel(!showPlaylistPanel); setShowEnhancePanel(false); }}
           className={`p-2 rounded transition-colors ${
             showPlaylistPanel ? 'bg-green-500/25 text-green-400' : 'text-gray-400 hover:text-white'
           }`}
@@ -2780,6 +2827,115 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
             you couldn't remove/stop a queued video. Shrinking the video area
             makes the surface follow (via the player's ResizeObserver), leaving
             the queue clear. */}
+        {/* Enhance settings — a right side panel like Playlists/Queue (they're
+            mutually exclusive). All controls apply LIVE; the backend keeps the
+            values as the session default for new panes. */}
+        {showEnhancePanel && (
+          <div className="w-80 bg-[var(--card-bg-color)] border-l border-gray-700/50 flex flex-col flex-shrink-0">
+            <div className="p-3 border-b border-gray-700/50 flex items-center justify-between">
+              <h3 className="font-medium text-white">Enhance</h3>
+              <button
+                onClick={() => setShowEnhancePanel(false)}
+                className="text-gray-400 hover:text-white text-sm"
+                title="Close"
+              >
+                ✕
+              </button>
+            </div>
+            <div className="flex-1 overflow-y-auto p-3 space-y-5">
+              {/* Mode */}
+              <div>
+                <div className="text-gray-300 text-sm font-medium mb-2">Mode</div>
+                <div className="flex gap-1">
+                  {(['off', 'fsr', 'nvai'] as const).map(m => {
+                    const usable = enhanceModes.includes(m);
+                    return (
+                      <button
+                        key={m}
+                        disabled={!usable}
+                        onClick={() => setEnhanceTo(m)}
+                        className={`flex-1 px-2 py-1.5 rounded text-xs font-medium transition-colors ${
+                          enhanceMode === m
+                            ? 'bg-yellow-500/25 text-yellow-400'
+                            : usable
+                              ? 'bg-white/5 text-gray-300 hover:bg-white/10'
+                              : 'bg-white/5 text-gray-600 cursor-not-allowed'
+                        }`}
+                        title={!usable && m === 'nvai' ? 'Install the AI runtime (scripts/install-ai-upscaler.sh)' : undefined}
+                      >
+                        {m === 'off' ? 'Off' : m === 'fsr' ? 'FSR' : 'AI'}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* FSR sharpness (RCAS) — applies to FSR video AND photos. */}
+              <div>
+                <div className="flex items-center justify-between mb-1">
+                  <span className="text-gray-300 text-sm font-medium">Sharpness</span>
+                  <span className="text-gray-500 text-xs">
+                    {Math.round((1 - enhanceSharpness / 2) * 100)}% ({enhanceSharpness.toFixed(2)} stops)
+                  </span>
+                </div>
+                <input
+                  type="range"
+                  min={0}
+                  max={100}
+                  step={5}
+                  value={Math.round((1 - enhanceSharpness / 2) * 100)}
+                  onChange={(e) => {
+                    const pct = Number(e.target.value);
+                    const stops = Math.round((1 - pct / 100) * 2 * 100) / 100;
+                    applyEnhanceSettings(stops, aiStrength);
+                  }}
+                  className="w-full accent-yellow-400"
+                />
+                <p className="text-gray-500 text-[11px] mt-1">
+                  RCAS contrast-adaptive sharpening for FSR video and enhanced photos.
+                  90% (0.2 stops) is the FSR default; 100% can halo on noisy sources.
+                </p>
+              </div>
+
+              {/* AI strength — blend of the neural output vs the plain source. */}
+              <div className={enhanceModes.includes('nvai') ? '' : 'opacity-50'}>
+                <div className="flex items-center justify-between mb-1">
+                  <span className="text-gray-300 text-sm font-medium">AI strength</span>
+                  <span className="text-gray-500 text-xs">{Math.round(aiStrength * 100)}%</span>
+                </div>
+                <input
+                  type="range"
+                  min={0}
+                  max={100}
+                  step={5}
+                  value={Math.round(aiStrength * 100)}
+                  disabled={!enhanceModes.includes('nvai')}
+                  onChange={(e) => applyEnhanceSettings(enhanceSharpness, Number(e.target.value) / 100)}
+                  className="w-full accent-yellow-400"
+                />
+                <p className="text-gray-500 text-[11px] mt-1">
+                  Blends the neural upscale with the untouched source — turn it down
+                  if AI mode looks over-smoothed or "painted" on a given clip.
+                </p>
+              </div>
+
+              {/* Model info */}
+              <div className="rounded-lg border border-white/10 bg-black/20 p-2.5">
+                <div className="text-gray-300 text-xs font-medium mb-1">AI model</div>
+                <div className="text-gray-400 text-xs">
+                  {enhanceModel ?? 'Not installed — run scripts/install-ai-upscaler.sh'}
+                </div>
+                {enhanceModel && (
+                  <p className="text-gray-500 text-[11px] mt-1.5">
+                    AI engages on sources up to 720p (falls back to FSR above).
+                    Everything runs locally on your GPU.
+                  </p>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+
         {showPlaylistPanel && (
           <div className="w-80 bg-[var(--card-bg-color)] border-l border-gray-700/50 flex flex-col flex-shrink-0">
             <div className="p-3 border-b border-gray-700/50">

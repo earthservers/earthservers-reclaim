@@ -178,6 +178,19 @@ pub fn available() -> bool {
     model_path().exists() && ort_ready() && cuda_ready()
 }
 
+/// The execution provider the session actually got, once built.
+static ACTIVE_EP: OnceLock<&'static str> = OnceLock::new();
+
+/// UI-facing model/backend name. The provider suffix appears once the session
+/// is built (i.e. after the first engage); before that only the model is known.
+pub fn model_label() -> String {
+    match ACTIVE_EP.get() {
+        Some(ep) => format!("Real-ESRGAN compact ×2 fp16 ({})", ep),
+        None if trt_enabled() => "Real-ESRGAN compact ×2 fp16 (TensorRT)".to_string(),
+        None => "Real-ESRGAN compact ×2 fp16 (CUDA)".to_string(),
+    }
+}
+
 /// Engage-time preflight: build (and cache) the session AND run one warm-up
 /// inference, so a broken model/runtime refuses the MODE SWITCH with a clear
 /// error instead of failing per-frame mid-playback — and so the one-time
@@ -275,6 +288,7 @@ fn build_session() -> Result<Session, String> {
             });
         match built {
             Ok(s) => {
+                let _ = ACTIVE_EP.set("TensorRT");
                 log::info!("[earth-media] aisr: TensorRT execution provider active (engine cache: {})", cache);
                 return Ok(s);
             }
@@ -290,6 +304,7 @@ fn build_session() -> Result<Session, String> {
         .map_err(|e| format!("AI execution providers failed: {}", e))?
         .commit_from_file(model_path())
         .map_err(|e| format!("AI model failed to load: {}", e))?;
+    let _ = ACTIVE_EP.set("CUDA");
     log::info!("[earth-media] aisr: CUDA execution provider active");
     Ok(session)
 }

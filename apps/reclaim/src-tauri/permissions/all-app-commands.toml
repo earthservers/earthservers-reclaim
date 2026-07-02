@@ -349,6 +349,7 @@ permissions = [
   "allow-player-list",
   "allow-player-set-window-handle",
   "allow-player-set-enhance",
+  "allow-player-set-enhance-settings",
   "allow-player-expose",
   "allow-set-active-media-player",
   "allow-get-window-xid",

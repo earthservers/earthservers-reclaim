@@ -42,6 +42,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     instead of stalling playback. Measured on an RTX 4060 Ti (TensorRT fp16):
     ~13 ms/frame for 640x360→1280x720 and ~26 ms for 854x480→1708x960 —
     solidly real-time through 480p.
+  - **Enhance settings panel** — right-click the Enhance button for a side
+    panel (like Playlists/Queue) with live tuning: mode picker, **FSR
+    sharpness** (RCAS, 0–2 stops as a percentage slider; also applies to
+    enhanced photos) and **AI strength** (blends the neural output with the
+    plain source, for clips where full AI looks over-smoothed), plus the
+    active AI model name. Everything applies live with zero pipeline
+    disruption and persists as the session default for new panes.
   - Mode switches happen **live** — no pipeline restart, no black flash; the
     upscale caps at 4K; everything stays on-device (model is inert weights,
     runtime telemetry disabled, zero network at playback time).

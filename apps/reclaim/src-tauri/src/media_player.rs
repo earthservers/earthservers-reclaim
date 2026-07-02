@@ -5,7 +5,7 @@
 //! Includes YouTube support via yt-dlp.
 //! Supports VideoOverlay for embedded video playback in the app window.
 
-use earth_media::{EnhanceMode, MediaPlayer, MediaPlayerManager, PlayerStatus, VideoInfo};
+use earth_media::{EnhanceMode, EnhanceSettings, MediaPlayer, MediaPlayerManager, PlayerStatus, VideoInfo};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use tauri::State;
@@ -206,6 +206,27 @@ pub async fn player_set_enhance(
         .set_enhance(&player_id, parsed)
         .map_err(|e| e.to_string())?;
     Ok(parsed.as_str().to_string())
+}
+
+/// Tune Enhance on a specific player/pane, LIVE (no pipeline restart):
+/// `fsr_sharpness` = RCAS sharpening in stops (0.0 sharpest ..= 2.0 softest),
+/// `ai_strength` = AI blend 0.0..=1.0 (1.0 = pure AI output). Values are
+/// clamped backend-side and also become the session default for new panes.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn player_set_enhance_settings(
+    player_id: String,
+    fsr_sharpness: f64,
+    ai_strength: f64,
+) -> Result<(), String> {
+    GLOBAL_PLAYER_MANAGER
+        .set_enhance_settings(
+            &player_id,
+            EnhanceSettings {
+                fsr_sharpness: fsr_sharpness as f32,
+                ai_strength: ai_strength as f32,
+            },
+        )
+        .map_err(|e| e.to_string())
 }
 
 /// Get status of a specific player/pane

@@ -9,7 +9,7 @@ mod enhance;
 mod nvsr;
 mod youtube;
 
-pub use enhance::EnhanceMode;
+pub use enhance::{EnhanceMode, EnhanceSettings};
 pub use youtube::{VideoInfo, YouTubeError, YouTubeExtractor};
 
 use gstreamer as gst;
@@ -163,6 +163,10 @@ pub struct PlayerStatus {
     pub enhance: String,
     /// Enhancement modes this player can run (drives the UI's mode cycle).
     pub enhance_modes: Vec<String>,
+    /// Enhance tunables (FSR sharpness in stops, AI blend strength 0..1).
+    pub enhance_settings: enhance::EnhanceSettings,
+    /// Name of the AI model/backend behind 'nvai' (None = not installed).
+    pub enhance_model: Option<String>,
 }
 
 /// Hardware-accelerated media player using GStreamer playbin directly
@@ -742,6 +746,8 @@ impl MediaPlayer {
             eos: self.eos.lock().map(|e| *e).unwrap_or(false),
             enhance: self.get_enhance().as_str().to_string(),
             enhance_modes: self.enhance_modes().iter().map(|s| s.to_string()).collect(),
+            enhance_settings: self.get_enhance_settings(),
+            enhance_model: nvsr::ai_model_label(),
         }
     }
 
@@ -772,6 +778,23 @@ impl MediaPlayer {
             None => Err(MediaError::PlayerError(
                 "video enhancement unavailable (GL probe failed or EARTH_VIDEO_SR=off)".to_string(),
             )),
+        }
+    }
+
+    /// Current Enhance tunables (session defaults when no bin is resident).
+    pub fn get_enhance_settings(&self) -> EnhanceSettings {
+        self.enhance_ctl
+            .as_ref()
+            .map(|c| c.settings())
+            .unwrap_or_else(enhance::default_enhance_settings)
+    }
+
+    /// Tune Enhance LIVE — uniform/property updates only, no renegotiation.
+    /// Without a resident bin this is a harmless no-op (settings gate nothing).
+    pub fn set_enhance_settings(&self, settings: EnhanceSettings) -> Result<(), MediaError> {
+        match &self.enhance_ctl {
+            Some(ctl) => ctl.set_settings(settings),
+            None => Ok(()),
         }
     }
 
@@ -995,6 +1018,24 @@ impl MediaPlayerManager {
         if let Some(player) = players.get(player_id) {
             player.set_enhance(mode)?;
             enhance::set_default_enhance(mode);
+            Ok(())
+        } else {
+            Err(MediaError::PlayerError(format!("Player {} not found", player_id)))
+        }
+    }
+
+    /// Tune Enhance on a specific player (auto-creates if needed) and make the
+    /// values the session default so panes created later inherit them.
+    pub fn set_enhance_settings(
+        &self,
+        player_id: &str,
+        settings: EnhanceSettings,
+    ) -> Result<(), MediaError> {
+        self.get_or_create_player(player_id)?;
+        let players = recover_lock(self.players.lock())?;
+        if let Some(player) = players.get(player_id) {
+            player.set_enhance_settings(settings)?;
+            enhance::set_default_enhance_settings(settings);
             Ok(())
         } else {
             Err(MediaError::PlayerError(format!("Player {} not found", player_id)))
