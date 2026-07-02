@@ -36,11 +36,48 @@ interface DomainStats {
   avg_trust_score: number;
 }
 
+/// One tab's search page state. Owned by App (Record<tabId, SearchTabState>) so
+/// each search tab keeps its OWN query/results/config: DomainManager renders the
+/// ACTIVE tab's slice as a controlled component, and switching tabs just swaps the
+/// slice (results are preserved via the per-tab cache in LocalSearchResults).
+export interface SearchTabState {
+  /// Text in the search/URL bar (kept per tab so switching preserves typing).
+  urlInput: string;
+  /// The query whose results are shown inline ('' = no active search).
+  liveQuery: string;
+  /// Bumped to re-run the same query string on repeat Enter.
+  searchNonce: number;
+  page: number;
+  retention: Retention;
+  kindsMode: KindsMode;
+  /// Selected source ids; null = the backend's default-enabled set.
+  sources: string[] | null;
+  showDebug: boolean;
+  domainsCollapsed: boolean;
+}
+
+export const EMPTY_SEARCH_TAB: SearchTabState = {
+  urlInput: '',
+  liveQuery: '',
+  searchNonce: 0,
+  page: 0,
+  retention: 'cache',
+  kindsMode: 'all',
+  sources: null,
+  showDebug: false,
+  domainsCollapsed: false,
+};
+
 interface DomainManagerProps {
   profileId: number | null;
   // opts.fromAddressBar = the URL was TYPED (navigate current tab); a domain CLICK
   // omits it so it respects the "When opening links" toggle (e.g. opens a new tab).
   onOpenUrl?: (url: string, opts?: { fromAddressBar?: boolean }) => void;
+  /// The active tab's id (-1 when no tab is open) — keys the per-tab result cache.
+  searchTabId: number;
+  /// The active tab's search slice + its updater (state lives in App, per tab).
+  searchTab: SearchTabState;
+  onSearchTabChange: (patch: Partial<SearchTabState>) => void;
 }
 
 const DEFAULT_CATEGORIES = [
@@ -58,25 +95,19 @@ const DEFAULT_CATEGORIES = [
   'other',
 ];
 
-export function DomainManager({ profileId, onOpenUrl }: DomainManagerProps) {
+export function DomainManager({ profileId, onOpenUrl, searchTabId, searchTab, onSearchTabChange }: DomainManagerProps) {
   const [domains, setDomains] = useState<Domain[]>([]);
   const [lists, setLists] = useState<DomainList[]>([]);
   const [stats, setStats] = useState<DomainStats | null>(null);
   const [categories, setCategories] = useState<string[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
-  const [urlInput, setUrlInput] = useState('');
-  // Active local-search query (rendered inline below the bar). nonce re-runs the
-  // same query string on repeat Enter.
-  const [liveQuery, setLiveQuery] = useState('');
-  const [searchNonce, setSearchNonce] = useState(0);
-  const [page, setPage] = useState(0);
-  // Search config — lifted here so it's selectable BEFORE a search.
-  const [retention, setRetention] = useState<Retention>('cache');
-  const [kindsMode, setKindsMode] = useState<KindsMode>('all');
-  const [sources, setSources] = useState<string[]>([]);
+  // Per-tab search state (query, config, pagination, collapse) is the ACTIVE
+  // tab's slice, owned by App — see SearchTabState above.
+  const { urlInput, liveQuery, searchNonce, page, retention, kindsMode, showDebug, domainsCollapsed } = searchTab;
+  // Backend default-enabled sources; a tab with sources=null follows these.
+  const [defaultSources, setDefaultSources] = useState<string[]>([]);
   const [sourcesReady, setSourcesReady] = useState(false);
-  const [showDebug, setShowDebug] = useState(false);
-  const [domainsCollapsed, setDomainsCollapsed] = useState(false);
+  const sources = searchTab.sources ?? defaultSources;
   const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -124,11 +155,12 @@ export function DomainManager({ profileId, onOpenUrl }: DomainManagerProps) {
     loadData();
   }, [loadData]);
 
-  // Initialize the selected search sources from the backend's default-enabled set.
+  // Load the backend's default-enabled source set (tabs without an explicit
+  // selection follow it; an explicit per-tab selection overrides it).
   useEffect(() => {
     invoke<Array<{ id: string; defaultEnabled: boolean }>>('list_search_sources')
-      .then(list => setSources(list.filter(s => s.defaultEnabled).map(s => s.id)))
-      .catch(() => setSources(['web']))
+      .then(list => setDefaultSources(list.filter(s => s.defaultEnabled).map(s => s.id)))
+      .catch(() => setDefaultSources(['web']))
       .finally(() => setSourcesReady(true));
   }, []);
 
@@ -283,14 +315,11 @@ export function DomainManager({ profileId, onOpenUrl }: DomainManagerProps) {
     if (isUrlShaped(raw)) {
       const target = /^https?:\/\//i.test(raw) || raw.startsWith('earth://') ? raw : `https://${raw}`;
       onOpenUrl?.(target, { fromAddressBar: true });
-      setUrlInput('');
+      onSearchTabChange({ urlInput: '' });
       return;
     }
     // Free-text query → local search inline (bump nonce to re-run if unchanged).
-    setLiveQuery(raw);
-    setPage(0);
-    setSearchNonce(n => n + 1);
-    setDomainsCollapsed(true);
+    onSearchTabChange({ liveQuery: raw, page: 0, searchNonce: searchNonce + 1, domainsCollapsed: true });
   };
 
   // Escape hatch the user asked to keep: open the query on DuckDuckGo in a tab.
@@ -336,7 +365,7 @@ export function DomainManager({ profileId, onOpenUrl }: DomainManagerProps) {
           <input
             type="text"
             value={urlInput}
-            onChange={(e) => setUrlInput(e.target.value)}
+            onChange={(e) => onSearchTabChange({ urlInput: e.target.value })}
             onKeyDown={(e) => e.key === 'Enter' && goToUrl()}
             placeholder="Search or enter a URL to visit"
             className="w-full bg-black/30 border border-white/10 rounded-lg px-4 py-2.5 pl-10 text-white placeholder-gray-500 focus:outline-none focus:border-theme-primary transition-colors"
@@ -360,10 +389,10 @@ export function DomainManager({ profileId, onOpenUrl }: DomainManagerProps) {
       <div className="text-xs font-semibold text-[var(--text-muted-color)] uppercase tracking-wide">SearchControls:</div>
       <SearchControls
         profileId={profileId}
-        retention={retention} setRetention={setRetention}
-        kindsMode={kindsMode} setKindsMode={setKindsMode}
-        sources={sources} setSources={setSources}
-        showDebug={showDebug} setShowDebug={setShowDebug}
+        retention={retention} setRetention={(r) => onSearchTabChange({ retention: r })}
+        kindsMode={kindsMode} setKindsMode={(k) => onSearchTabChange({ kindsMode: k })}
+        sources={sources} setSources={(s) => onSearchTabChange({ sources: s })}
+        showDebug={showDebug} setShowDebug={(b) => onSearchTabChange({ showDebug: b })}
         query={liveQuery || urlInput}
         onOpenInDuckDuckGo={openInDuckDuckGo}
       />
@@ -373,10 +402,11 @@ export function DomainManager({ profileId, onOpenUrl }: DomainManagerProps) {
         <div>
           <div className="flex items-center justify-between mb-2">
             <div className="text-sm text-white truncate">Results for “{liveQuery}”</div>
-            <button onClick={() => { setLiveQuery(''); setDomainsCollapsed(false); }} className="text-xs text-gray-400 hover:text-white">Clear</button>
+            <button onClick={() => onSearchTabChange({ liveQuery: '', domainsCollapsed: false })} className="text-xs text-gray-400 hover:text-white">Clear</button>
           </div>
           <LocalSearchResults
             profileId={profileId}
+            cacheKey={searchTabId}
             query={liveQuery}
             searchNonce={searchNonce}
             retention={retention}
@@ -387,8 +417,8 @@ export function DomainManager({ profileId, onOpenUrl }: DomainManagerProps) {
             page={page}
             onOpenUrl={onOpenUrl}
             onOpenInDuckDuckGo={openInDuckDuckGo}
-            onNextPage={() => setPage(p => p + 1)}
-            onPrevPage={() => setPage(p => Math.max(0, p - 1))}
+            onNextPage={() => onSearchTabChange({ page: page + 1 })}
+            onPrevPage={() => onSearchTabChange({ page: Math.max(0, page - 1) })}
           />
         </div>
       )}
@@ -403,7 +433,7 @@ export function DomainManager({ profileId, onOpenUrl }: DomainManagerProps) {
 
       {/* Domain manager — collapsed while searching to keep results in focus. */}
       <button
-        onClick={() => setDomainsCollapsed(c => !c)}
+        onClick={() => onSearchTabChange({ domainsCollapsed: !domainsCollapsed })}
         className="flex items-center gap-1.5 text-sm text-[var(--text-muted-color)] hover:text-white transition-colors"
       >
         <svg className={`w-3 h-3 transition-transform ${domainsCollapsed ? '' : 'rotate-90'}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">

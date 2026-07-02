@@ -14,7 +14,9 @@ import { ThemeCustomizer } from './components/ThemeCustomizer';
 import { ThemeProvider, useTheme } from './contexts/ThemeContext';
 import { BrowserProvider } from './contexts/BrowserContext';
 import { AnimationLayer } from './components/AnimationLayer';
-import { DomainManager } from './components/DomainManager';
+import { DomainManager, SearchTabState, EMPTY_SEARCH_TAB } from './components/DomainManager';
+import { pruneSearchResultsCache } from './components/LocalSearchResults';
+import { SearchHistoryPanel } from './components/SearchHistoryPanel';
 import { MemoryManager } from './components/MemoryManager';
 import { EarthMultiMedia, lockAllMediaSessions } from './components/EarthMultiMedia';
 import { TabBar, Tab, TabBehavior, TAB_BEHAVIOR_OPTIONS } from './components/TabBar';
@@ -146,15 +148,27 @@ function loadAiSettings(): AiSettings {
   return { curator: true, assistant: false };
 }
 
+// Packaged secondary windows are served from the localhost asset server (see
+// app_content_url / assets_server, port 9877). That origin ALONE marks a window
+// as secondary: it must never flash the Search service on boot, and must stay
+// media-only even if IPC fails (e.g. an ACL gap) — falling back to "main" here
+// is what put a broken Search tab on secondary windows.
+const bootedFromAssetServer = typeof window !== 'undefined' && window.location.port === '9877';
+
+// Sentinel key for the search page's state when NO tab is open (all tabs closed).
+const NO_TAB_SEARCH_KEY = -1;
+
 function App() {
-  const [activeService, setActiveService] = useState<'search' | 'memory' | 'media' | 'scraper' | 'ai'>('search');
+  const [activeService, setActiveService] = useState<'search' | 'memory' | 'media' | 'scraper' | 'ai'>(
+    bootedFromAssetServer ? 'media' : 'search',
+  );
   // The browser engine is single-window (hard-wired to the "main" window), so any
   // OTHER window is media-only: hide the Search (browser) service there, default it
   // to Media, and never let it touch the global browser surface. `isMainWindow` is
   // null until the backend resolves the authoritative window label — browser ops
   // stay gated on `=== true` so a secondary window (or the brief pre-resolve moment)
   // can't hide/disrupt the main window's page.
-  const [isMainWindow, setIsMainWindow] = useState<boolean | null>(null);
+  const [isMainWindow, setIsMainWindow] = useState<boolean | null>(bootedFromAssetServer ? false : null);
   useEffect(() => {
     if (!isTauri()) { setIsMainWindow(true); return; }
     invoke<string>('media_window_label')
@@ -163,7 +177,9 @@ function App() {
         setIsMainWindow(main);
         if (!main) setActiveService('media');
       })
-      .catch(() => setIsMainWindow(true));
+      // Backend unreachable → keep the boot-time origin verdict, never promote a
+      // window served from the asset server to "main".
+      .catch(() => setIsMainWindow(!bootedFromAssetServer));
   }, []);
   const isSecondaryWindow = isMainWindow === false;
   const serviceItems = isSecondaryWindow
@@ -207,6 +223,71 @@ function App() {
   const [showOTPAuthenticator, setShowOTPAuthenticator] = useState(false);
   const [tabBehavior, setTabBehavior] = useState<TabBehavior>('new-tab');
   const [tabRefreshTrigger, setTabRefreshTrigger] = useState(0);
+  // Per-tab search state: each search tab keeps its OWN query/config/pagination
+  // (one shared DomainManager instance used to make every tab show the same
+  // search). Keyed by tab id; NO_TAB_SEARCH_KEY holds the no-tab search page.
+  const [searchTabs, setSearchTabs] = useState<Record<number, SearchTabState>>({});
+  const [showSearchHistory, setShowSearchHistory] = useState(false);
+  const activeSearchTabId = activeTab?.id ?? NO_TAB_SEARCH_KEY;
+  const activeSearchTab = searchTabs[activeSearchTabId] ?? EMPTY_SEARCH_TAB;
+  const updateSearchTab = useCallback((tabId: number, patch: Partial<SearchTabState>) => {
+    setSearchTabs(prev => ({ ...prev, [tabId]: { ...EMPTY_SEARCH_TAB, ...prev[tabId], ...patch } }));
+  }, []);
+  // Drop search state (and cached result streams) for tabs that no longer exist.
+  // TabBar reports the fresh list on every reload, covering all close paths
+  // (tab X, context menu, close-all/unpinned, drag-out).
+  const handleTabsChange = useCallback((tabs: Tab[]) => {
+    const live = new Set(tabs.map(t => t.id));
+    setSearchTabs(prev => {
+      const stale = Object.keys(prev).map(Number).filter(id => id !== NO_TAB_SEARCH_KEY && !live.has(id));
+      if (stale.length === 0) return prev;
+      const next = { ...prev };
+      stale.forEach(id => delete next[id]);
+      return next;
+    });
+    pruneSearchResultsCache(live);
+  }, []);
+  // Run a query from the Searches panel: into the current search tab, or a new
+  // search tab if the active tab is showing a web page. Saved searches restore
+  // their stored config; history entries keep the tab's current one.
+  const runSearchFromPanel = async (
+    query: string,
+    cfg?: { retention: SearchTabState['retention']; kindsMode: SearchTabState['kindsMode']; sources: string[] | null },
+  ) => {
+    let tabId = activeTab?.id ?? NO_TAB_SEARCH_KEY;
+    if (activeTab?.url && !activeTab.url.startsWith('earth://')) {
+      try {
+        const newTab = await invoke<Tab>('create_tab', {
+          profileId: activeProfile?.id ?? 1,
+          url: 'earth://search',
+          title: 'Search',
+        });
+        await invoke('set_active_tab', { tabId: newTab.id });
+        setActiveTab(newTab);
+        setTabRefreshTrigger(prev => prev + 1);
+        tabId = newTab.id;
+      } catch (err) {
+        console.error('Failed to open a search tab for the saved search:', err);
+        return;
+      }
+    }
+    setSearchTabs(prev => {
+      const cur = prev[tabId] ?? EMPTY_SEARCH_TAB;
+      return {
+        ...prev,
+        [tabId]: {
+          ...cur,
+          ...cfg,
+          urlInput: query,
+          liveQuery: query,
+          page: 0,
+          searchNonce: cur.searchNonce + 1,
+          domainsCollapsed: true,
+        },
+      };
+    });
+    setActiveService('search');
+  };
   const [mediaFullscreen, setMediaFullscreen] = useState(false);
   // Track window maximize state (used by maximize/restore controls). The value
   // itself is no longer read for corner-rounding (top corners are square now).
@@ -838,6 +919,23 @@ function App() {
             )}
           </RightDockPanel>
 
+          {/* Saved searches & search history — same right dock as the other panels.
+              Runs entries into the current search tab (or a fresh one from a page). */}
+          <SearchHistoryPanel
+            profileId={activeProfile?.id ?? null}
+            isOpen={showSearchHistory}
+            onClose={() => setShowSearchHistory(false)}
+            current={activeSearchTab.liveQuery
+              ? {
+                  query: activeSearchTab.liveQuery,
+                  retention: activeSearchTab.retention,
+                  kindsMode: activeSearchTab.kindsMode,
+                  sources: activeSearchTab.sources,
+                }
+              : null}
+            onRun={runSearchFromPanel}
+          />
+
           {/* Autosave "Save password?" prompt — a right-dock panel so it squishes
               the page (insets the native surface) instead of hiding it. */}
           <RightDockPanel
@@ -1097,6 +1195,26 @@ function App() {
                   </button>
                   </>)}
 
+                  {/* Saved searches & search history (right-dock panel) — search tab only */}
+                  {activeService === 'search' && (
+                  <button
+                    onClick={() => setShowSearchHistory(v => !v)}
+                    className={`hidden xs:block rounded-lg border transition-all ${navbarCollapsed ? 'p-0.5 opacity-0 w-0 overflow-hidden' : 'p-1 sm:p-1.5 lg:p-2 opacity-100'} ${
+                      showSearchHistory
+                        ? 'bg-white/20 border-white/30 text-white'
+                        : 'bg-white/10 border-white/20 text-white/80 hover:bg-white/15 hover:text-white'
+                    }`}
+                    title="Saved searches & search history"
+                    style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
+                  >
+                    <svg className="w-3.5 h-3.5 lg:w-4 lg:h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      {/* magnifier + clock hands */}
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 7v3l2 2" />
+                    </svg>
+                  </button>
+                  )}
+
                   {/* History Button - hidden on very small screens */}
                   <button
                     onClick={() => setShowHistory(true)}
@@ -1296,6 +1414,7 @@ function App() {
                 onTabChange={(tab) => {
                   setActiveTab(tab);
                 }}
+                onTabsChange={handleTabsChange}
                 refreshTrigger={tabRefreshTrigger}
               />
               {/* Show bookmark bar toggle when hidden */}
@@ -1373,6 +1492,9 @@ function App() {
                   rightInset={rightInset}
                   tabBehavior={tabBehavior}
                   onTabBehaviorChange={setTabBehavior}
+                  searchTabId={activeSearchTabId}
+                  searchTab={activeSearchTab}
+                  onSearchTabChange={(patch) => updateSearchTab(activeSearchTabId, patch)}
                 />
               </div>
             ) : (
@@ -1390,6 +1512,7 @@ function App() {
                   onAiSettingsChange={updateAiSettings}
                   onSelectService={setActiveService}
                   isIncognito={isIncognito}
+                  onRunSearch={runSearchFromPanel}
                 />
               </div>
             )}
@@ -1561,7 +1684,7 @@ function App() {
   );
 }
 
-function Home({ activeService, profileId, onOpenUrl, activeTab, onMediaFullscreenChange, chromeHeight, onEngine, rightInset, tabBehavior, onTabBehaviorChange, aiSettings, onAiSettingsChange, onSelectService, isIncognito }: {
+function Home({ activeService, profileId, onOpenUrl, activeTab, onMediaFullscreenChange, chromeHeight, onEngine, rightInset, tabBehavior, onTabBehaviorChange, aiSettings, onAiSettingsChange, onSelectService, isIncognito, searchTabId, searchTab, onSearchTabChange, onRunSearch }: {
   activeService: 'search' | 'memory' | 'media' | 'scraper' | 'ai';
   profileId: number | null;
   isIncognito?: boolean;
@@ -1576,6 +1699,12 @@ function Home({ activeService, profileId, onOpenUrl, activeTab, onMediaFullscree
   aiSettings?: AiSettings;
   onAiSettingsChange?: (next: Partial<AiSettings>) => void;
   onSelectService?: (service: 'search' | 'memory' | 'media' | 'scraper' | 'ai') => void;
+  // Per-tab search state (only passed on the search-home render path).
+  searchTabId?: number;
+  searchTab?: SearchTabState;
+  onSearchTabChange?: (patch: Partial<SearchTabState>) => void;
+  // Run a saved/recent search (Searches tab on the Local AI / History page).
+  onRunSearch?: (query: string, cfg?: { retention: SearchTabState['retention']; kindsMode: SearchTabState['kindsMode']; sources: string[] | null }) => void;
 }) {
   // Local AI hub (toggles + entry into the knowledge graph).
   if (activeService === 'ai' && aiSettings && onAiSettingsChange) {
@@ -1586,6 +1715,7 @@ function Home({ activeService, profileId, onOpenUrl, activeTab, onMediaFullscree
         onChange={onAiSettingsChange}
         onOpenMemory={() => onSelectService?.('memory')}
         onOpenUrl={onOpenUrl}
+        onRunSearch={onRunSearch}
         isIncognito={isIncognito}
       />
     );
@@ -1655,7 +1785,13 @@ function Home({ activeService, profileId, onOpenUrl, activeTab, onMediaFullscree
               })}
             </div>
           )}
-          <DomainManager profileId={profileId} onOpenUrl={onOpenUrl} />
+          <DomainManager
+            profileId={profileId}
+            onOpenUrl={onOpenUrl}
+            searchTabId={searchTabId ?? NO_TAB_SEARCH_KEY}
+            searchTab={searchTab ?? EMPTY_SEARCH_TAB}
+            onSearchTabChange={onSearchTabChange ?? (() => {})}
+          />
         </div>
       </div>
     );

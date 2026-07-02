@@ -1,13 +1,16 @@
-// Local AI hub — the home of Reclaim's on-device AI. Two tabs:
+// Local AI hub — the home of Reclaim's on-device AI. Three tabs:
 //   • AI       — all AI controls (curator/assistant toggles) + a ChatGPT/Claude
 //                style assistant with multiple, persisted chat sessions.
 //   • History  — the EarthMemory index of pages the curator has journaled.
+//   • Searches — saved searches & the local search history (same lists as the
+//                right-dock Searches panel).
 // Everything here runs locally; nothing leaves the device.
 
 import { useState, useEffect, useRef } from 'react';
 import { invoke, listen } from '../lib/tauri';
 import type { AiSettings } from '../App';
 import { MemoryManager } from './MemoryManager';
+import { SearchHistoryList, type RunSearch } from './SearchHistoryPanel';
 import { VaultAutofill } from './VaultAutofill';
 
 interface LocalAIHubProps {
@@ -16,6 +19,7 @@ interface LocalAIHubProps {
   onChange: (next: Partial<AiSettings>) => void;
   onOpenMemory: () => void;             // legacy deep-link; History is now a tab
   onOpenUrl?: (url: string) => void;    // open an indexed page in Search
+  onRunSearch?: RunSearch;              // run a saved/recent search in the Search service
   isIncognito?: boolean;                // disabled in incognito / on the Incognito profile
 }
 
@@ -497,8 +501,8 @@ function AiLockModal({ profileId, hasPw, onClose, onChanged }: { profileId: numb
   );
 }
 
-export function LocalAIHub({ profileId, settings, onChange, onOpenUrl, isIncognito }: LocalAIHubProps) {
-  const [tab, setTab] = useState<'ai' | 'history'>('ai');
+export function LocalAIHub({ profileId, settings, onChange, onOpenUrl, onRunSearch, isIncognito }: LocalAIHubProps) {
+  const [tab, setTab] = useState<'ai' | 'history' | 'searches'>('ai');
   const [locked, setLocked] = useState<boolean | null>(null); // null = still checking
   const [hasPw, setHasPw] = useState(false);
   const [unlockInput, setUnlockInput] = useState('');
@@ -604,7 +608,7 @@ export function LocalAIHub({ profileId, settings, onChange, onOpenUrl, isIncogni
 
       {/* Tab switcher */}
       <div className="inline-flex rounded-xl border border-white/10 bg-black/20 p-1 mb-5">
-        {([['ai', 'AI'], ['history', 'History']] as const).map(([id, label]) => (
+        {([['ai', 'AI'], ['history', 'History'], ['searches', 'Searches']] as const).map(([id, label]) => (
           <button
             key={id}
             onClick={() => setTab(id)}
@@ -617,9 +621,18 @@ export function LocalAIHub({ profileId, settings, onChange, onOpenUrl, isIncogni
         ))}
       </div>
 
-      {tab === 'ai'
-        ? <AiTab profileId={profileId} settings={settings} onChange={onChange} />
-        : <MemoryManager profileId={profileId} onOpenUrl={onOpenUrl} />}
+      {tab === 'ai' && <AiTab profileId={profileId} settings={settings} onChange={onChange} />}
+      {tab === 'history' && <MemoryManager profileId={profileId} onOpenUrl={onOpenUrl} />}
+      {tab === 'searches' && (
+        <div className="max-w-xl">
+          <SearchHistoryList
+            profileId={profileId}
+            active={tab === 'searches'}
+            current={null}
+            onRun={(query, cfg) => onRunSearch?.(query, cfg)}
+          />
+        </div>
+      )}
 
       {showLockModal && (
         <AiLockModal

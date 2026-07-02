@@ -224,10 +224,13 @@ export const TAB_BEHAVIOR_OPTIONS: { value: TabBehavior; label: string; color: s
 interface TabBarProps {
   profileId: number;
   onTabChange?: (tab: Tab) => void;
+  /// Reports the freshly loaded tab list on every reload (create/close/switch/…).
+  /// App uses it to prune per-tab state (e.g. each tab's search) for closed tabs.
+  onTabsChange?: (tabs: Tab[]) => void;
   refreshTrigger?: number;
 }
 
-export function TabBar({ profileId, onTabChange, refreshTrigger }: TabBarProps) {
+export function TabBar({ profileId, onTabChange, onTabsChange, refreshTrigger }: TabBarProps) {
   const [tabs, setTabs] = useState<Tab[]>([]);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; tabId: number } | null>(null);
 
@@ -247,6 +250,7 @@ export function TabBar({ profileId, onTabChange, refreshTrigger }: TabBarProps) 
     try {
       const loadedTabs = await invoke<Tab[]>('get_all_tabs', { profileId: profileId });
       setTabs(loadedTabs);
+      onTabsChange?.(loadedTabs);
 
       // On initial load, notify parent of the active tab
       if (!hasNotifiedInitialTab.current && loadedTabs.length > 0) {
@@ -259,7 +263,7 @@ export function TabBar({ profileId, onTabChange, refreshTrigger }: TabBarProps) 
     } catch (err) {
       console.error('Failed to load tabs:', err);
     }
-  }, [profileId, onTabChange]);
+  }, [profileId, onTabChange, onTabsChange]);
 
   // The profile loads async, so the first loadTabs can run with the default
   // profileId before the real one resolves. Reset the notify-once guard whenever
