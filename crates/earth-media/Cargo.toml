@@ -21,6 +21,10 @@ gstreamer-base = { workspace = true }
 # Runtime (dlopen) loading of the optional NVIDIA Maxine VFX SDK — never a
 # link-time dependency, so builds/servers without the SDK are unaffected.
 libloading = "0.8"
+# ONNX Runtime bindings for the open AI upscaler (Real-ESRGAN). load-dynamic =
+# dlopen at runtime (system lib or ~/.earthreclaim/aisr), never a link-time dep.
+# api-20 matches onnxruntime 1.20 (the oldest we target); no download-binaries.
+ort = { version = "2.0.0-rc.12", default-features = false, features = ["std", "load-dynamic", "cuda", "api-20", "ndarray"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # GTK for video widget embedding (optional, for future use)

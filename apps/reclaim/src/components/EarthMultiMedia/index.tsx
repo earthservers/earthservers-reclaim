@@ -279,7 +279,7 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
   const ENHANCE_LABEL: Record<'off' | 'fsr' | 'nvai', string> = {
     off: 'Enhance: Off',
     fsr: 'Enhance: FSR upscaling',
-    nvai: 'Enhance: NVIDIA AI (RTX)',
+    nvai: 'Enhance: AI (Real-ESRGAN)',
   };
   // Extract the pane index from a (possibly namespaced) player id like "main::pane-2".
   const paneIndexOf = useCallback((id: string | null | undefined) => {

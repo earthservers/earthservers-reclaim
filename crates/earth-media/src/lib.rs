@@ -4,6 +4,7 @@
 //! Bypasses gst_player API to avoid unwanted GTK overlay controls.
 //! Includes YouTube support via yt-dlp.
 
+mod aisr;
 mod enhance;
 mod nvsr;
 mod youtube;

@@ -391,10 +391,18 @@ mod imp {
     use gst_video::subclass::prelude::*;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    /// The AI backend actually driving an engaged element.
+    pub enum Engine {
+        /// NVIDIA Maxine SuperRes (proprietary SDK, per-size effect instance).
+        Maxine(SuperRes),
+        /// Open Real-ESRGAN via onnxruntime (module-level session, any size).
+        Onnx,
+    }
+
     #[derive(Default)]
     pub struct EarthNvSr {
         pub engaged: AtomicBool,
-        pub engine: Mutex<Option<SuperRes>>,
+        pub engine: Mutex<Option<Engine>>,
         pub infos: Mutex<Option<(gst_video::VideoInfo, gst_video::VideoInfo)>>,
     }
 
@@ -537,14 +545,23 @@ mod imp {
             let mut engine = self.engine.lock().unwrap();
             *engine = None;
             if engaged && out_info.width() == in_info.width() * 2 {
-                match SuperRes::new(in_info.width(), in_info.height()) {
-                    Ok(e) => *engine = Some(e),
-                    Err(err) => {
-                        // Per-size engine failure: playback survives via the
-                        // nearest-neighbor fallback in transform_frame.
-                        log::warn!("[earth-media] nvai engine for {}x{} failed: {} — fallback scaling",
-                            in_info.width(), in_info.height(), err);
+                // Prefer the Maxine SDK when installed; otherwise the open
+                // Real-ESRGAN/onnxruntime backend (the one users can freely get).
+                if available() {
+                    match SuperRes::new(in_info.width(), in_info.height()) {
+                        Ok(e) => *engine = Some(Engine::Maxine(e)),
+                        Err(err) => {
+                            log::warn!("[earth-media] Maxine engine for {}x{} failed: {} — trying ONNX",
+                                in_info.width(), in_info.height(), err);
+                        }
                     }
+                }
+                if engine.is_none() && crate::aisr::available() {
+                    *engine = Some(Engine::Onnx);
+                }
+                if engine.is_none() {
+                    // Playback survives via the fallback scaling in transform_frame.
+                    log::warn!("[earth-media] no AI backend usable — fallback scaling");
                 }
             }
             *self.infos.lock().unwrap() = Some((in_info.clone(), out_info.clone()));
@@ -569,10 +586,16 @@ mod imp {
                 if let Some(e) = engine.as_mut() {
                     let input = inframe.plane_data(0).map_err(|_| gst::FlowError::Error)?;
                     let output = outframe.plane_data_mut(0).map_err(|_| gst::FlowError::Error)?;
-                    match e.process(input, in_stride, output, out_stride) {
+                    let res = match e {
+                        Engine::Maxine(m) => m.process(input, in_stride, output, out_stride),
+                        Engine::Onnx => crate::aisr::process(
+                            input, in_w, in_h, in_stride as usize, output, out_stride as usize,
+                        ),
+                    };
+                    match res {
                         Ok(()) => return Ok(gst::FlowSuccess::Ok),
                         Err(err) => {
-                            log::warn!("[earth-media] nvai frame failed: {} — fallback scaling", err);
+                            log::warn!("[earth-media] AI frame failed: {} — fallback scaling", err);
                             *engine = None; // don't retry every frame
                         }
                     }
@@ -618,10 +641,28 @@ fn ensure_registered() -> bool {
     })
 }
 
-/// The AI stage for the enhance bin, or None when the Maxine runtime isn't
-/// installed (the bin then simply omits the stage).
+/// Whether ANY AI super-resolution backend can run (Maxine SDK or the open
+/// Real-ESRGAN/onnxruntime path).
+pub fn ai_available() -> bool {
+    available() || crate::aisr::available()
+}
+
+/// Engage-time preflight for the active backend, so switching to the AI mode
+/// fails fast with a clear message instead of degrading per-frame.
+pub fn ai_preflight() -> Result<(), String> {
+    if available() {
+        return preflight();
+    }
+    if crate::aisr::available() {
+        return crate::aisr::preflight();
+    }
+    Err("no AI upscaler installed (Real-ESRGAN model + onnxruntime, or the NVIDIA VFX SDK)".into())
+}
+
+/// The AI stage for the enhance bin, or None when no backend is installed
+/// (the bin then simply omits the stage).
 pub fn make_element() -> Option<gst::Element> {
-    if !available() || !ensure_registered() {
+    if !ai_available() || !ensure_registered() {
         return None;
     }
     let e = gst::ElementFactory::make("earthnvsr").build().ok()?;
@@ -686,5 +727,49 @@ mod tests {
         let s = out.structure(0).unwrap();
         assert_eq!(s.get::<i32>("width").unwrap(), 320);
         pipeline.set_state(gst::State::Null).unwrap();
+    }
+
+    /// ENGAGED element in a real pipeline: needs an AI backend installed
+    /// (Real-ESRGAN model + onnxruntime in ~/.earthreclaim/aisr, or Maxine).
+    /// Verifies set_info -> engine creation -> transform_frame produce 2x caps.
+    #[test]
+    #[ignore = "needs an AI backend installed"]
+    fn earthnvsr_engaged_doubles_resolution() {
+        gst::init().unwrap();
+        assert!(ensure_registered());
+        assert!(ai_available(), "no AI backend installed");
+        let e = gst::ElementFactory::make("earthnvsr").build().unwrap();
+        e.set_property("engaged", true);
+
+        let pipeline = gst::Pipeline::new();
+        let src = gst::ElementFactory::make("videotestsrc")
+            .property("num-buffers", 3i32)
+            .build()
+            .unwrap();
+        let capsf = gst::ElementFactory::make("capsfilter").build().unwrap();
+        capsf.set_property(
+            "caps",
+            gst::Caps::builder("video/x-raw")
+                .field("format", "RGBA")
+                .field("width", 320i32)
+                .field("height", 240i32)
+                .build(),
+        );
+        let sink = gst::ElementFactory::make("fakesink").build().unwrap();
+        pipeline.add_many([&src, &capsf, &e, &sink]).unwrap();
+        gst::Element::link_many([&src, &capsf, &e, &sink]).unwrap();
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let bus = pipeline.bus().unwrap();
+        let msg = bus.timed_pop_filtered(
+            gst::ClockTime::from_seconds(30),
+            &[gst::MessageType::Eos, gst::MessageType::Error],
+        );
+        let got_eos = matches!(msg.as_ref().map(|m| m.type_()), Some(gst::MessageType::Eos));
+        let out = e.static_pad("src").unwrap().current_caps().unwrap();
+        let s = out.structure(0).unwrap();
+        let w = s.get::<i32>("width").unwrap();
+        pipeline.set_state(gst::State::Null).unwrap();
+        assert!(got_eos, "pipeline errored: {:?}", msg);
+        assert_eq!(w, 640, "engaged earthnvsr must negotiate 2x output");
     }
 }

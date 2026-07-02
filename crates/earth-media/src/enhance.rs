@@ -401,10 +401,16 @@ impl EnhanceCtl {
     /// glshader's `update-shader` (recompiled for the next frame) and the mid-
     /// bin capsfilters renegotiate in place.
     pub fn set_mode(&self, mode: EnhanceMode) -> Result<(), MediaError> {
-        if mode == EnhanceMode::NvAi && self.nvsr.is_none() {
-            return Err(MediaError::PlayerError(
-                "NVIDIA AI SR is not available (VFX SDK runtime not installed)".to_string(),
-            ));
+        if mode == EnhanceMode::NvAi {
+            if self.nvsr.is_none() {
+                return Err(MediaError::PlayerError(
+                    "AI upscaling is not available (install the Real-ESRGAN model + onnxruntime, \
+                     or the NVIDIA VFX SDK)".to_string(),
+                ));
+            }
+            // Fail the SWITCH fast (clear error, UI reverts) rather than
+            // degrading per-frame mid-playback.
+            crate::nvsr::ai_preflight().map_err(MediaError::PlayerError)?;
         }
         {
             let mut st = self
