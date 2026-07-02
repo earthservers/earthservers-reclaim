@@ -29,8 +29,10 @@
 //!     caches it in <dir>/trt-cache; every later run loads in seconds. Kill
 //!     switch: EARTH_AISR_TRT=off falls back to the CUDA provider.
 //!
-//! Per-frame path: reusable IOBound buffers (CUDA-pinned host memory when
-//! available) — no per-frame tensor allocation, and DMA-friendly transfers.
+//! Per-frame path: a reusable (CUDA-pinned when available) input buffer — no
+//! per-frame input allocation — through plain `session.run`. NOT IoBinding:
+//! bound outputs came back with un-fenced/stale plane data on the CUDA and
+//! TensorRT providers (see `Bound`).
 
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
@@ -38,7 +40,7 @@ use std::sync::{Mutex, OnceLock};
 use ort::execution_providers::{CUDAExecutionProvider, TensorRTExecutionProvider};
 use ort::memory::{AllocationDevice, Allocator, AllocatorType, MemoryInfo, MemoryType};
 use ort::session::builder::GraphOptimizationLevel;
-use ort::session::{IoBinding, Session};
+use ort::session::Session;
 use ort::value::Tensor;
 
 /// Fixed model scale (the shipped model is a 2x SRVGGNetCompact export).
@@ -313,49 +315,48 @@ fn num_threads() -> usize {
     std::thread::available_parallelism().map(|n| n.get().min(8)).unwrap_or(4)
 }
 
-/// Reusable per-size IO: input/output tensors bound once, written in place
-/// every frame. CUDA-pinned (page-locked) host memory when the provider offers
-/// it — DMA transfers without an intermediate pageable copy — else plain CPU
-/// tensors (still reused; only the copies are slower).
+/// Reusable per-size input buffer, written in place every frame (no per-frame
+/// tensor allocation). CUDA-pinned (page-locked) host memory when the provider
+/// offers it — DMA H2D without an intermediate pageable copy — else a plain
+/// CPU tensor (still reused; only the copy is slower).
+///
+/// DELIBERATELY NOT ort IoBinding: with a bound output (pinned OR plain CPU),
+/// reading after run_binding + synchronize_outputs returned STALE PLANE DATA
+/// with the CUDA/TensorRT providers (ort 2.0.0-rc.12) — the device->host copy
+/// into the bound buffer isn't fenced. On screen: horizontal color bands over
+/// AI playback (R/G planes missing per band). Plain `session.run` completes
+/// the output copy before returning; pinned-input reuse is kept because that
+/// copy is sequenced before the kernels. Regression: realesrgan_channel_
+/// integrity_480p.
 struct Bound {
     in_w: usize,
     in_h: usize,
-    // Declaration order = drop order: the binding (which holds the output
-    // tensor) and the input tensor must drop BEFORE the allocators that own
-    // their pinned memory.
+    input_name: String,
+    // Declaration order = drop order: the input tensor must drop BEFORE the
+    // allocator that owns its pinned memory.
     input: Tensor<f32>,
-    binding: IoBinding,
     _allocs: Vec<Allocator>,
 }
 
 impl Bound {
     fn new(session: &Session, in_w: usize, in_h: usize) -> Result<Self, String> {
-        let (out_w, out_h) = (in_w * SCALE as usize, in_h * SCALE as usize);
         let in_shape = [1usize, 3, in_h, in_w];
-        let out_shape = [1usize, 3, out_h, out_w];
 
-        let pinned = |mem_type: MemoryType| -> Result<Allocator, ort::Error> {
-            Allocator::new(
+        let make_pinned_input = || -> Result<(Tensor<f32>, Allocator), ort::Error> {
+            let in_alloc = Allocator::new(
                 session,
-                MemoryInfo::new(AllocationDevice::CUDA_PINNED, 0, AllocatorType::Device, mem_type)?,
-            )
-        };
-        let make = || -> Result<(Tensor<f32>, Tensor<f32>, Vec<Allocator>), ort::Error> {
-            let in_alloc = pinned(MemoryType::CPUInput)?;
-            let out_alloc = pinned(MemoryType::CPUOutput)?;
+                MemoryInfo::new(AllocationDevice::CUDA_PINNED, 0, AllocatorType::Device, MemoryType::CPUInput)?,
+            )?;
             let input = Tensor::<f32>::new(&in_alloc, in_shape)?;
-            let output = Tensor::<f32>::new(&out_alloc, out_shape)?;
-            Ok((input, output, vec![in_alloc, out_alloc]))
+            Ok((input, in_alloc))
         };
-        let (input, output, allocs) = match make() {
-            Ok(v) => v,
+        let (input, allocs) = match make_pinned_input() {
+            Ok((input, alloc)) => (input, vec![alloc]),
             Err(e) => {
-                log::debug!("[earth-media] aisr: pinned buffers unavailable ({}) — CPU buffers", e);
+                log::debug!("[earth-media] aisr: pinned input unavailable ({}) — CPU buffer", e);
                 let input = Tensor::from_array((in_shape, vec![0f32; 3 * in_w * in_h]))
                     .map_err(|e| format!("AI input buffer failed: {}", e))?;
-                let output = Tensor::from_array((out_shape, vec![0f32; 3 * out_w * out_h]))
-                    .map_err(|e| format!("AI output buffer failed: {}", e))?;
-                (input, output, Vec::new())
+                (input, Vec::new())
             }
         };
 
@@ -364,21 +365,7 @@ impl Bound {
             .first()
             .map(|i| i.name().to_string())
             .ok_or("AI model has no inputs")?;
-        let output_name = session
-            .outputs()
-            .first()
-            .map(|o| o.name().to_string())
-            .ok_or("AI model has no outputs")?;
-        let mut binding = session
-            .create_binding()
-            .map_err(|e| format!("AI io-binding failed: {}", e))?;
-        binding
-            .bind_input(input_name, &input)
-            .map_err(|e| format!("AI input bind failed: {}", e))?;
-        binding
-            .bind_output(output_name, output)
-            .map_err(|e| format!("AI output bind failed: {}", e))?;
-        Ok(Self { in_w, in_h, input, binding, _allocs: allocs })
+        Ok(Self { in_w, in_h, input_name, input, _allocs: allocs })
     }
 }
 
@@ -453,11 +440,8 @@ pub fn process(
     }
 
     let outputs = session
-        .run_binding(&b.binding)
+        .run(ort::inputs![b.input_name.as_str() => &b.input])
         .map_err(|e| format!("AI inference failed: {}", e))?;
-    b.binding
-        .synchronize_outputs()
-        .map_err(|e| format!("AI output sync failed: {}", e))?;
     let (shape, data) = outputs[0]
         .try_extract_tensor::<f32>()
         .map_err(|e| format!("AI output extract failed: {}", e))?;
@@ -537,6 +521,60 @@ mod tests {
                 assert_eq!(back[b + 3], 255, "alpha must be forced opaque");
             }
         }
+    }
+
+    /// Channel integrity at the real-world 480p size (854x480 -> 1708x960),
+    /// including size ALTERNATION (rebinding the IO buffers): a solid known
+    /// color in must come back as roughly that color in EVERY region of the
+    /// output — catches partial/stale plane reads (seen as horizontal color
+    /// bands over playback) that a single-size gradient test can miss.
+    #[test]
+    #[ignore = "needs realesr-x2.onnx + onnxruntime installed"]
+    fn realesrgan_channel_integrity_480p() {
+        let solid = |w: usize, h: usize, rgb: [u8; 3]| {
+            let mut v = vec![0u8; w * h * 4];
+            for px in v.chunks_exact_mut(4) {
+                px[0] = rgb[0];
+                px[1] = rgb[1];
+                px[2] = rgb[2];
+                px[3] = 255;
+            }
+            v
+        };
+        let check = |w: usize, h: usize, rgb: [u8; 3]| {
+            let input = solid(w, h, rgb);
+            let (ow, oh) = (w * 2, h * 2);
+            let mut output = vec![0u8; ow * oh * 4];
+            process(&input, w, h, w * 4, &mut output, ow * 4).expect("inference failed");
+            // Check 8 horizontal bands independently — banded corruption shows
+            // up as one band's channel mean collapsing to ~0.
+            for band in 0..8 {
+                let y0 = oh * band / 8;
+                let y1 = oh * (band + 1) / 8;
+                let (mut sums, mut n) = ([0u64; 3], 0u64);
+                for y in y0..y1 {
+                    for px in output[y * ow * 4..(y + 1) * ow * 4].chunks_exact(4) {
+                        sums[0] += px[0] as u64;
+                        sums[1] += px[1] as u64;
+                        sums[2] += px[2] as u64;
+                        n += 1;
+                    }
+                }
+                for c in 0..3 {
+                    let mean = (sums[c] / n) as i32;
+                    assert!(
+                        (mean - rgb[c] as i32).abs() < 40,
+                        "{}x{} band {}: channel {} mean {} != ~{} (banded corruption?)",
+                        w, h, band, c, mean, rgb[c]
+                    );
+                }
+            }
+        };
+        // Distinct per-channel values so any plane swap/offset is visible.
+        check(854, 480, [200, 120, 40]);
+        // Alternate sizes to force IO rebinds, then return to 480p.
+        check(640, 360, [40, 200, 120]);
+        check(854, 480, [200, 120, 40]);
     }
 
     /// Per-frame latency ladder over the sizes the nv_factor gate can admit.
