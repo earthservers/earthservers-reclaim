@@ -215,6 +215,12 @@ can take a few minutes; cached in `~/.earthreclaim/aisr/trt-cache`), and if
 TensorRT is missing it falls back to plain CUDA (`EARTH_AISR_TRT=off` forces
 that).
 
+**Right‑click the Enhance button** for the settings panel: pick the mode
+directly, tune **FSR sharpness** (also applies to enhanced photos) and **AI
+strength** (blend the neural output with the untouched source — turn it down
+if a clip looks over‑smoothed), and see which AI model/backend is active.
+Everything applies live, mid‑playback.
+
 ---
 
 ## Run & Compile

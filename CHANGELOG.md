@@ -5,7 +5,7 @@ All notable changes to Earth Reclaim are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.2.0] - 2026-07-02
 
 ### Added
 
@@ -32,15 +32,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     fp16) on the GPU via onnxruntime, as a **TensorRT engine** (compiled on the
     first engage — one-time, minutes — then cached in
     `~/.earthreclaim/aisr/trt-cache`; falls back to plain CUDA when TensorRT
-    isn't installed, `EARTH_AISR_TRT=off` forces that). Per-frame IO uses
-    reusable CUDA-pinned buffers (onnxruntime IOBinding) — no per-frame
-    allocations. Optional install: `scripts/install-ai-upscaler.sh` (NVIDIA GPU
-    required; ~4 GB of freely-redistributable runtime libraries into
+    isn't installed, `EARTH_AISR_TRT=off` forces that). Frames feed through a
+    reusable CUDA-pinned input buffer — no per-frame input allocations.
+    Optional install: `scripts/install-ai-upscaler.sh` (NVIDIA GPU required;
+    ~4 GB of freely-redistributable runtime libraries into
     `~/.earthreclaim/aisr`). The mode appears automatically once installed. AI
     runs on ≤720p sources (that's what super-resolution is for) and
     transparently degrades to FSR above; over-budget frames drop via QoS
     instead of stalling playback. Measured on an RTX 4060 Ti (TensorRT fp16):
-    ~13 ms/frame for 640x360→1280x720 and ~26 ms for 854x480→1708x960 —
+    ~16 ms/frame for 640x360→1280x720 and ~28 ms for 854x480→1708x960 —
     solidly real-time through 480p.
   - **Enhance settings panel** — right-click the Enhance button for a side
     panel (like Playlists/Queue) with live tuning: mode picker, **FSR
@@ -72,6 +72,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Local AI chat: you couldn't scroll up while an answer was streaming** — the
   transcript re-pinned to the bottom on every token. It now pins only while you're
   already at the bottom; scrolling back down (or sending a message) re-engages it.
+- **Security panel honesty** — its subtitle claimed "no AI in this section" while
+  the (optional, clearly-labeled) AI curator sections render in the same panel.
+  It now states that the readings are deterministic and AI sections are labeled &
+  advisory — and only claims "no AI active" when the curator truly isn't.
 
 ### Developer notes
 
