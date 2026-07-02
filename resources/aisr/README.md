@@ -10,6 +10,10 @@
 - Installed to `~/.earthreclaim/aisr/` by `scripts/install-ai-upscaler.sh`,
   where the media player's Enhance "AI" mode picks it up (NVIDIA GPU +
   CUDA runtime required — the script installs those too).
+- Executed as an fp16 **TensorRT** engine when the TensorRT 10 libs are in
+  the same dir (the script installs them; `EARTH_AISR_TRT=off` forces the
+  CUDA provider). The first AI engage compiles the engine — one-time,
+  can take minutes — and caches it in `~/.earthreclaim/aisr/trt-cache/`.
 
 ## Upstream license (Real-ESRGAN)
 

@@ -199,16 +199,21 @@ that reconstructs detail in ≤720p video and photos — install the local runti
 ```
 
 This puts the bundled Real‑ESRGAN model (BSD‑licensed, `resources/aisr/`) plus
-the official onnxruntime‑gpu and NVIDIA CUDA runtime libraries (the same
-freely‑redistributable PyPI packages PyTorch uses) into `~/.earthreclaim/aisr`
-(~2 GB download). Restart Reclaim and the Enhance button gains the AI mode
-automatically. Requirements: an NVIDIA GPU with a current driver. Everything
-runs locally — the model is inert weights, runtime telemetry is disabled, and
-no frame ever leaves your machine. Uninstall by deleting the directory.
+the official onnxruntime‑gpu, NVIDIA CUDA runtime and TensorRT libraries (the
+same freely‑redistributable PyPI packages PyTorch uses) into
+`~/.earthreclaim/aisr` (~4 GB download). Restart Reclaim and the Enhance
+button gains the AI mode automatically. Requirements: an NVIDIA GPU with a
+current driver. Everything runs locally — the model is inert weights, runtime
+telemetry is disabled, and no frame ever leaves your machine. Uninstall by
+deleting the directory.
 
 Notes: AI engages on ≤720p sources (where super‑resolution actually matters)
 and transparently falls back to FSR above that; if the GPU can't keep up on a
-given clip, frames drop smoothly rather than stalling playback.
+given clip, frames drop smoothly rather than stalling playback. The model runs
+as an fp16 TensorRT engine — the **first** AI engage compiles it (one‑time,
+can take a few minutes; cached in `~/.earthreclaim/aisr/trt-cache`), and if
+TensorRT is missing it falls back to plain CUDA (`EARTH_AISR_TRT=off` forces
+that).
 
 ---
 

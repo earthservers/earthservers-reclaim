@@ -29,13 +29,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     pipeline; vendor-agnostic (any GPU with GStreamer GL). Photos get the same
     shaders via WebGL in the image viewer.
   - **AI (Real-ESRGAN)** — real neural super-resolution (Real-ESRGAN compact x2,
-    fp16) on the GPU via onnxruntime/CUDA. Optional install:
-    `scripts/install-ai-upscaler.sh` (NVIDIA GPU required; ~2 GB of
-    freely-redistributable runtime libraries into `~/.earthreclaim/aisr`). The
-    mode appears automatically once installed. AI runs on ≤720p sources (that's
-    what super-resolution is for) and transparently degrades to FSR above;
-    over-budget frames drop via QoS instead of stalling playback. Measured on an
-    RTX 4060 Ti: ~26 ms/frame for 640x360→1280x720 (real-time).
+    fp16) on the GPU via onnxruntime, as a **TensorRT engine** (compiled on the
+    first engage — one-time, minutes — then cached in
+    `~/.earthreclaim/aisr/trt-cache`; falls back to plain CUDA when TensorRT
+    isn't installed, `EARTH_AISR_TRT=off` forces that). Per-frame IO uses
+    reusable CUDA-pinned buffers (onnxruntime IOBinding) — no per-frame
+    allocations. Optional install: `scripts/install-ai-upscaler.sh` (NVIDIA GPU
+    required; ~4 GB of freely-redistributable runtime libraries into
+    `~/.earthreclaim/aisr`). The mode appears automatically once installed. AI
+    runs on ≤720p sources (that's what super-resolution is for) and
+    transparently degrades to FSR above; over-budget frames drop via QoS
+    instead of stalling playback. Measured on an RTX 4060 Ti (TensorRT fp16):
+    ~13 ms/frame for 640x360→1280x720 and ~26 ms for 854x480→1708x960 —
+    solidly real-time through 480p.
   - Mode switches happen **live** — no pipeline restart, no black flash; the
     upscale caps at 4K; everything stays on-device (model is inert weights,
     runtime telemetry disabled, zero network at playback time).

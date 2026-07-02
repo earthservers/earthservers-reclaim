@@ -11,7 +11,8 @@
 //!     explicitly disabled at init as belt-and-braces; the Linux builds have
 //!     none to begin with),
 //!   * frames go engine-in, engine-out in this process — nothing is written
-//!     or transmitted.
+//!     or transmitted (the TensorRT engine cache under <dir>/trt-cache is a
+//!     compiled form of the same local model, written locally).
 //!
 //! Discovery (no link-time deps; all optional at runtime):
 //!   * dir: EARTH_AISR_DIR, default ~/.earthreclaim/aisr
@@ -21,16 +22,45 @@
 //!     onnxruntime-gpu release, giving the CUDA provider), else the system
 //!     libonnxruntime.so.1 (CPU — correct but slow; fine for photos/preview,
 //!     a warning is logged for video).
+//!   * TensorRT (optional, fastest): <dir>/libonnxruntime_providers_tensorrt.so
+//!     (in the same official onnxruntime-gpu release) + the TensorRT 10 libs
+//!     from the `tensorrt-cu12-libs` PyPI wheel (libnvinfer & co) in <dir>.
+//!     The first engage compiles a TensorRT engine (one-time, minutes) and
+//!     caches it in <dir>/trt-cache; every later run loads in seconds. Kill
+//!     switch: EARTH_AISR_TRT=off falls back to the CUDA provider.
+//!
+//! Per-frame path: reusable IOBound buffers (CUDA-pinned host memory when
+//! available) — no per-frame tensor allocation, and DMA-friendly transfers.
 
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
+use ort::execution_providers::{CUDAExecutionProvider, TensorRTExecutionProvider};
+use ort::memory::{AllocationDevice, Allocator, AllocatorType, MemoryInfo, MemoryType};
 use ort::session::builder::GraphOptimizationLevel;
-use ort::session::Session;
+use ort::session::{IoBinding, Session};
 use ort::value::Tensor;
 
 /// Fixed model scale (the shipped model is a 2x SRVGGNetCompact export).
 pub const SCALE: u32 = 2;
+
+/// Largest input the AI path scales (bigger sources stay 1:1 and the GL stage
+/// falls back to FSR — see `nvsr::nv_factor`, which gates on these). Also the
+/// ceiling of the TensorRT optimization profile, so one cached engine covers
+/// every size the gate can admit. Change the gate ONLY here: TensorRT fails
+/// inference HARD on shapes outside the profile, so a gate above the profile
+/// ceiling would produce broken (fallback-scaled) playback, not just a slow
+/// path. Measured on an RTX 4060 Ti (fp16 TRT engine): 360p ~13 ms, 480p
+/// ~26 ms, 720p ~65 ms/frame — a raise past 720p is far off real-time
+/// anyway.
+pub(crate) const MAX_IN_W: i32 = 1280;
+pub(crate) const MAX_IN_H: i32 = 720;
+
+/// Smallest input the AI path scales — the TensorRT profile floor. Sources
+/// tinier than this (absurd for video) stay 1:1 and get GL-FSR like
+/// oversized ones; the same hard-failure rule as MAX_IN_* applies below the
+/// profile, so keep `nvsr::nv_factor` gated on it.
+pub(crate) const MIN_IN: i32 = 32;
 
 fn aisr_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("EARTH_AISR_DIR") {
@@ -54,9 +84,10 @@ fn ort_ready() -> bool {
         // the CUDA provider); fall back to the system library.
         let local = aisr_dir().join("libonnxruntime.so");
         let path = if local.exists() {
-            // CUDA provider deps (cuDNN/cuBLAS) may live in the same dir —
-            // preload so the provider resolves without LD_LIBRARY_PATH (same
-            // trick as the Maxine loader: ld.so finds already-loaded SONAMEs).
+            // CUDA/TensorRT provider deps (cuDNN/cuBLAS/libnvinfer) may live in
+            // the same dir — preload so the providers resolve without
+            // LD_LIBRARY_PATH (same trick as the Maxine loader: ld.so finds
+            // already-loaded SONAMEs).
             preload_dir_libs(&aisr_dir());
             local.to_string_lossy().into_owned()
         } else {
@@ -76,10 +107,17 @@ fn ort_ready() -> bool {
     })
 }
 
-/// Best-effort preload of CUDA provider dependencies dropped into the aisr dir.
+/// Best-effort preload of CUDA/TensorRT provider dependencies dropped into the
+/// aisr dir. Order matters: each dlopen resolves its own deps against what is
+/// already resident, so bases come before the libs that link them.
 fn preload_dir_libs(dir: &std::path::Path) {
     const PREFIXES: &[&str] = &[
         "libcudart", "libnvrtc", "libcurand", "libcufft", "libcublasLt", "libcublas", "libcudnn",
+        // TensorRT 10 (from the tensorrt-cu12-libs wheel): core first, then
+        // the libs linking it. builder_resource is dlopen'd BY libnvinfer at
+        // engine-build time by bare SONAME — resident-preloading it is the
+        // only way that resolves outside LD_LIBRARY_PATH.
+        "libnvinfer.so", "libnvinfer_builder_resource", "libnvinfer_plugin", "libnvonnxparser",
     ];
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     let mut files: Vec<PathBuf> = entries
@@ -111,9 +149,7 @@ fn cuda_ready() -> bool {
             return false;
         }
         use ort::execution_providers::ExecutionProvider;
-        let ok = ort::execution_providers::CUDAExecutionProvider::default()
-            .is_available()
-            .unwrap_or(false);
+        let ok = CUDAExecutionProvider::default().is_available().unwrap_or(false);
         if !ok {
             log::info!(
                 "[earth-media] aisr: CUDA execution provider unavailable — AI video \
@@ -126,21 +162,55 @@ fn cuda_ready() -> bool {
     })
 }
 
+/// Whether the TensorRT provider should be attempted: its provider lib and the
+/// TensorRT runtime are installed, and it isn't switched off.
+fn trt_enabled() -> bool {
+    if matches!(std::env::var("EARTH_AISR_TRT").as_deref(), Ok("off") | Ok("0")) {
+        return false;
+    }
+    let dir = aisr_dir();
+    dir.join("libonnxruntime_providers_tensorrt.so").exists()
+        && dir.join("libnvinfer.so.10").exists()
+}
+
 /// Whether the open AI upscaler can run: model present + runtime loads + CUDA.
 pub fn available() -> bool {
     model_path().exists() && ort_ready() && cuda_ready()
 }
 
-/// Engage-time preflight: build (and cache) the session once so a broken
-/// model/runtime refuses the MODE SWITCH with a clear error instead of failing
-/// per-frame mid-playback.
+/// Engage-time preflight: build (and cache) the session AND run one warm-up
+/// inference, so a broken model/runtime refuses the MODE SWITCH with a clear
+/// error instead of failing per-frame mid-playback — and so the one-time
+/// TensorRT engine build (minutes on the very first engage, then cached in
+/// trt-cache/) happens HERE rather than stalling the streaming thread.
 pub fn preflight() -> Result<(), String> {
-    session().map(|_| ())
+    static WARM: OnceLock<Result<(), String>> = OnceLock::new();
+    WARM.get_or_init(|| {
+        engine()?;
+        let (w, h) = (640usize, 360usize);
+        let t0 = std::time::Instant::now();
+        let input = vec![0u8; w * h * 4];
+        let mut out = vec![0u8; (w * 2) * (h * 2) * 4];
+        process(&input, w, h, w * 4, &mut out, w * 2 * 4)?;
+        log::info!(
+            "[earth-media] aisr: warm-up inference done in {:.1}s",
+            t0.elapsed().as_secs_f64()
+        );
+        Ok(())
+    })
+    .clone()
 }
 
-fn session() -> Result<&'static Mutex<Session>, String> {
-    static SESSION: OnceLock<Result<Mutex<Session>, String>> = OnceLock::new();
-    SESSION
+/// The live inference state: one session for the process plus the reusable
+/// per-size IO binding (rebuilt only when the input size changes).
+struct Engine {
+    session: Session,
+    bound: Option<Bound>,
+}
+
+fn engine() -> Result<&'static Mutex<Engine>, String> {
+    static ENGINE: OnceLock<Result<Mutex<Engine>, String>> = OnceLock::new();
+    ENGINE
         .get_or_init(|| {
             if !model_path().exists() {
                 return Err(format!(
@@ -151,34 +221,193 @@ fn session() -> Result<&'static Mutex<Session>, String> {
             if !ort_ready() {
                 return Err("onnxruntime could not be loaded".to_string());
             }
-            // CUDA when the runtime has it; ort silently keeps CPU otherwise.
-            let cuda = ort::execution_providers::CUDAExecutionProvider::default().build();
-            let builder = Session::builder()
-                .map_err(|e| format!("AI session builder failed: {}", e))?;
-            let builder = builder
-                .with_execution_providers([cuda])
-                .map_err(|e| format!("AI execution providers failed: {}", e))?;
-            let builder = builder
-                .with_optimization_level(GraphOptimizationLevel::Level2)
-                .map_err(|e| format!("AI optimization level failed: {}", e))?;
-            let mut builder = builder
-                .with_intra_threads(num_threads())
-                .map_err(|e| format!("AI threads failed: {}", e))?;
-            let session = builder
-                .commit_from_file(model_path())
-                .map_err(|e| format!("AI model failed to load: {}", e))?;
+            let session = build_session()?;
             log::info!(
                 "[earth-media] aisr: Real-ESRGAN session ready (inputs: {:?})",
                 session.inputs().iter().map(|i| i.name().to_string()).collect::<Vec<_>>()
             );
-            Ok(Mutex::new(session))
+            Ok(Mutex::new(Engine { session, bound: None }))
         })
         .as_ref()
         .map_err(|e| e.clone())
 }
 
+fn session_builder() -> Result<ort::session::builder::SessionBuilder, String> {
+    let builder = Session::builder()
+        .map_err(|e| format!("AI session builder failed: {}", e))?;
+    let builder = builder
+        .with_optimization_level(GraphOptimizationLevel::Level2)
+        .map_err(|e| format!("AI optimization level failed: {}", e))?;
+    builder
+        .with_intra_threads(num_threads())
+        .map_err(|e| format!("AI threads failed: {}", e))
+}
+
+/// Build the session on the fastest usable provider: TensorRT (fp16, cached
+/// engine) when its libs are installed, else CUDA (ort silently keeps CPU when
+/// even that is missing — `available()` gates video on CUDA regardless).
+fn build_session() -> Result<Session, String> {
+    if trt_enabled() {
+        let cache = aisr_dir().join("trt-cache");
+        let _ = std::fs::create_dir_all(&cache);
+        let cache = cache.to_string_lossy().into_owned();
+        // One explicit optimization profile spanning everything the gate can
+        // send (shape names match the realesr-x2.onnx export's "input"): the
+        // cached engine serves ALL sizes — no rebuild when the video size
+        // changes mid-session.
+        let trt = TensorRTExecutionProvider::default()
+            .with_fp16(true)
+            .with_engine_cache(true)
+            .with_engine_cache_path(&cache)
+            .with_timing_cache(true)
+            .with_timing_cache_path(&cache)
+            .with_profile_min_shapes(format!("input:1x3x{}x{}", MIN_IN, MIN_IN))
+            .with_profile_opt_shapes("input:1x3x360x640")
+            .with_profile_max_shapes(format!("input:1x3x{}x{}", MAX_IN_H, MAX_IN_W))
+            .build()
+            .error_on_failure();
+        let built = session_builder()?
+            .with_execution_providers([trt])
+            .map_err(|e| format!("AI execution providers failed: {}", e))
+            .and_then(|mut b| {
+                b.commit_from_file(model_path())
+                    .map_err(|e| format!("AI model failed to load: {}", e))
+            });
+        match built {
+            Ok(s) => {
+                log::info!("[earth-media] aisr: TensorRT execution provider active (engine cache: {})", cache);
+                return Ok(s);
+            }
+            Err(e) => log::warn!(
+                "[earth-media] aisr: TensorRT provider failed ({}) — falling back to CUDA",
+                e
+            ),
+        }
+    }
+    let cuda = CUDAExecutionProvider::default().build();
+    let session = session_builder()?
+        .with_execution_providers([cuda])
+        .map_err(|e| format!("AI execution providers failed: {}", e))?
+        .commit_from_file(model_path())
+        .map_err(|e| format!("AI model failed to load: {}", e))?;
+    log::info!("[earth-media] aisr: CUDA execution provider active");
+    Ok(session)
+}
+
 fn num_threads() -> usize {
     std::thread::available_parallelism().map(|n| n.get().min(8)).unwrap_or(4)
+}
+
+/// Reusable per-size IO: input/output tensors bound once, written in place
+/// every frame. CUDA-pinned (page-locked) host memory when the provider offers
+/// it — DMA transfers without an intermediate pageable copy — else plain CPU
+/// tensors (still reused; only the copies are slower).
+struct Bound {
+    in_w: usize,
+    in_h: usize,
+    // Declaration order = drop order: the binding (which holds the output
+    // tensor) and the input tensor must drop BEFORE the allocators that own
+    // their pinned memory.
+    input: Tensor<f32>,
+    binding: IoBinding,
+    _allocs: Vec<Allocator>,
+}
+
+impl Bound {
+    fn new(session: &Session, in_w: usize, in_h: usize) -> Result<Self, String> {
+        let (out_w, out_h) = (in_w * SCALE as usize, in_h * SCALE as usize);
+        let in_shape = [1usize, 3, in_h, in_w];
+        let out_shape = [1usize, 3, out_h, out_w];
+
+        let pinned = |mem_type: MemoryType| -> Result<Allocator, ort::Error> {
+            Allocator::new(
+                session,
+                MemoryInfo::new(AllocationDevice::CUDA_PINNED, 0, AllocatorType::Device, mem_type)?,
+            )
+        };
+        let make = || -> Result<(Tensor<f32>, Tensor<f32>, Vec<Allocator>), ort::Error> {
+            let in_alloc = pinned(MemoryType::CPUInput)?;
+            let out_alloc = pinned(MemoryType::CPUOutput)?;
+            let input = Tensor::<f32>::new(&in_alloc, in_shape)?;
+            let output = Tensor::<f32>::new(&out_alloc, out_shape)?;
+            Ok((input, output, vec![in_alloc, out_alloc]))
+        };
+        let (input, output, allocs) = match make() {
+            Ok(v) => v,
+            Err(e) => {
+                log::debug!("[earth-media] aisr: pinned buffers unavailable ({}) — CPU buffers", e);
+                let input = Tensor::from_array((in_shape, vec![0f32; 3 * in_w * in_h]))
+                    .map_err(|e| format!("AI input buffer failed: {}", e))?;
+                let output = Tensor::from_array((out_shape, vec![0f32; 3 * out_w * out_h]))
+                    .map_err(|e| format!("AI output buffer failed: {}", e))?;
+                (input, output, Vec::new())
+            }
+        };
+
+        let input_name = session
+            .inputs()
+            .first()
+            .map(|i| i.name().to_string())
+            .ok_or("AI model has no inputs")?;
+        let output_name = session
+            .outputs()
+            .first()
+            .map(|o| o.name().to_string())
+            .ok_or("AI model has no outputs")?;
+        let mut binding = session
+            .create_binding()
+            .map_err(|e| format!("AI io-binding failed: {}", e))?;
+        binding
+            .bind_input(input_name, &input)
+            .map_err(|e| format!("AI input bind failed: {}", e))?;
+        binding
+            .bind_output(output_name, output)
+            .map_err(|e| format!("AI output bind failed: {}", e))?;
+        Ok(Self { in_w, in_h, input, binding, _allocs: allocs })
+    }
+}
+
+/// RGBA u8 rows (stride-padded) -> NCHW f32 RGB [0,1]. Plane-split slices and
+/// exact chunks keep the inner loops bounds-check-free and autovectorizable.
+fn rgba_to_chw(input: &[u8], w: usize, h: usize, stride: usize, chw: &mut [f32]) {
+    const INV: f32 = 1.0 / 255.0;
+    let plane = w * h;
+    let (r_pl, rest) = chw.split_at_mut(plane);
+    let (g_pl, b_pl) = rest.split_at_mut(plane);
+    for y in 0..h {
+        let row = &input[y * stride..y * stride + w * 4];
+        let r_row = &mut r_pl[y * w..(y + 1) * w];
+        let g_row = &mut g_pl[y * w..(y + 1) * w];
+        let b_row = &mut b_pl[y * w..(y + 1) * w];
+        for (i, px) in row.chunks_exact(4).enumerate() {
+            r_row[i] = px[0] as f32 * INV;
+            g_row[i] = px[1] as f32 * INV;
+            b_row[i] = px[2] as f32 * INV;
+        }
+    }
+}
+
+/// NCHW f32 [0,1] -> RGBA u8 rows (stride-padded, opaque alpha).
+fn chw_to_rgba(chw: &[f32], w: usize, h: usize, output: &mut [u8], stride: usize) {
+    #[inline(always)]
+    fn to_u8(v: f32) -> u8 {
+        (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8
+    }
+    let plane = w * h;
+    let (r_pl, rest) = chw.split_at(plane);
+    let (g_pl, b_pl) = rest.split_at(plane);
+    for y in 0..h {
+        let row = &mut output[y * stride..y * stride + w * 4];
+        let r_row = &r_pl[y * w..(y + 1) * w];
+        let g_row = &g_pl[y * w..(y + 1) * w];
+        let b_row = &b_pl[y * w..(y + 1) * w];
+        for (i, px) in row.chunks_exact_mut(4).enumerate() {
+            px[0] = to_u8(r_row[i]);
+            px[1] = to_u8(g_row[i]);
+            px[2] = to_u8(b_row[i]);
+            px[3] = 255;
+        }
+    }
 }
 
 /// Upscale one RGBA frame 2x. `input` is tightly usable via `in_stride`;
@@ -192,35 +421,28 @@ pub fn process(
     output: &mut [u8],
     out_stride: usize,
 ) -> Result<(), String> {
-    let session = session()?;
+    let engine = engine()?;
     let (out_w, out_h) = (in_w * SCALE as usize, in_h * SCALE as usize);
 
-    // RGBA u8 rows -> NCHW f32 RGB [0,1].
-    let mut chw = vec![0f32; 3 * in_w * in_h];
-    let plane = in_w * in_h;
-    for y in 0..in_h {
-        let row = &input[y * in_stride..y * in_stride + in_w * 4];
-        for x in 0..in_w {
-            let px = &row[x * 4..x * 4 + 3];
-            let idx = y * in_w + x;
-            chw[idx] = px[0] as f32 / 255.0;
-            chw[plane + idx] = px[1] as f32 / 255.0;
-            chw[2 * plane + idx] = px[2] as f32 / 255.0;
-        }
+    let mut guard = engine.lock().map_err(|e| format!("AI session poisoned: {}", e))?;
+    let Engine { session, bound } = &mut *guard;
+    if bound.as_ref().map_or(true, |b| b.in_w != in_w || b.in_h != in_h) {
+        *bound = None; // release the old buffers before allocating replacements
+        *bound = Some(Bound::new(session, in_w, in_h)?);
+    }
+    let b = bound.as_mut().expect("bound just ensured");
+
+    {
+        let (_, chw) = b.input.extract_tensor_mut();
+        rgba_to_chw(input, in_w, in_h, in_stride, chw);
     }
 
-    let tensor = Tensor::from_array(([1usize, 3, in_h, in_w], chw))
-        .map_err(|e| format!("AI input tensor failed: {}", e))?;
-
-    let mut session = session.lock().map_err(|e| format!("AI session poisoned: {}", e))?;
-    let input_name = session
-        .inputs()
-        .first()
-        .map(|i| i.name().to_string())
-        .ok_or("AI model has no inputs")?;
     let outputs = session
-        .run(ort::inputs![input_name.as_str() => tensor])
+        .run_binding(&b.binding)
         .map_err(|e| format!("AI inference failed: {}", e))?;
+    b.binding
+        .synchronize_outputs()
+        .map_err(|e| format!("AI output sync failed: {}", e))?;
     let (shape, data) = outputs[0]
         .try_extract_tensor::<f32>()
         .map_err(|e| format!("AI output extract failed: {}", e))?;
@@ -234,19 +456,7 @@ pub fn process(
         ));
     }
 
-    // NCHW f32 -> RGBA u8 rows.
-    let oplane = out_w * out_h;
-    for y in 0..out_h {
-        let row = &mut output[y * out_stride..y * out_stride + out_w * 4];
-        for x in 0..out_w {
-            let idx = y * out_w + x;
-            let to_u8 = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-            row[x * 4] = to_u8(data[idx]);
-            row[x * 4 + 1] = to_u8(data[oplane + idx]);
-            row[x * 4 + 2] = to_u8(data[2 * oplane + idx]);
-            row[x * 4 + 3] = 255;
-        }
-    }
+    chw_to_rgba(data, out_w, out_h, output, out_stride);
     Ok(())
 }
 
@@ -283,23 +493,63 @@ mod tests {
         assert!(mean > 60 && mean < 190, "red-channel mean {} looks degenerate", mean);
     }
 
-    /// Per-frame latency at a realistic video size (640x360 -> 1280x720).
-    /// Informational — prints the ms/frame so real-time viability is measurable.
+    /// The pure conversions must survive strides and round-trip losslessly
+    /// enough (u8 -> f32 -> u8 is exact for in-range values).
+    #[test]
+    fn rgba_chw_roundtrip_with_strides() {
+        let (w, h) = (5usize, 3usize);
+        let in_stride = w * 4 + 12; // deliberately padded
+        let mut rgba = vec![0u8; in_stride * h];
+        for y in 0..h {
+            for x in 0..w {
+                let i = y * in_stride + x * 4;
+                rgba[i] = (x * 40) as u8;
+                rgba[i + 1] = (y * 70) as u8;
+                rgba[i + 2] = (x * y * 20) as u8;
+                rgba[i + 3] = 7; // alpha ignored
+            }
+        }
+        let mut chw = vec![0f32; 3 * w * h];
+        rgba_to_chw(&rgba, w, h, in_stride, &mut chw);
+        let out_stride = w * 4 + 8;
+        let mut back = vec![0u8; out_stride * h];
+        chw_to_rgba(&chw, w, h, &mut back, out_stride);
+        for y in 0..h {
+            for x in 0..w {
+                let a = y * in_stride + x * 4;
+                let b = y * out_stride + x * 4;
+                assert_eq!(&rgba[a..a + 3], &back[b..b + 3], "pixel ({},{})", x, y);
+                assert_eq!(back[b + 3], 255, "alpha must be forced opaque");
+            }
+        }
+    }
+
+    /// Per-frame latency ladder over the sizes the nv_factor gate can admit.
+    /// Prints ms/frame so real-time viability is measurable. Targets: <=16 ms
+    /// at 360p, <=33 ms at 480p; a gate raise would need 720p <=50 ms
+    /// (measured 62.6 ms on the RTX 4060 Ti — gate stays at 720p). Do NOT add
+    /// sizes above MAX_IN_W/H: they exceed the TensorRT optimization profile
+    /// and fail hard (production can't reach that — the gate caps at the
+    /// profile ceiling).
     #[test]
     #[ignore = "needs realesr-x2.onnx + onnxruntime installed"]
     fn realesrgan_timing_640x360() {
-        let (w, h) = (640usize, 360usize);
-        let input = vec![128u8; w * h * 4];
-        let (ow, oh) = (w * 2, h * 2);
-        let mut output = vec![0u8; ow * oh * 4];
-        // Warm-up (session build + CUDA graph capture happen here).
-        process(&input, w, h, w * 4, &mut output, ow * 4).expect("warm-up failed");
-        let n = 10;
-        let t0 = std::time::Instant::now();
-        for _ in 0..n {
-            process(&input, w, h, w * 4, &mut output, ow * 4).expect("inference failed");
+        for (w, h) in [(640usize, 360usize), (854, 480), (1280, 720)] {
+            let input = vec![128u8; w * h * 4];
+            let (ow, oh) = (w * 2, h * 2);
+            let mut output = vec![0u8; ow * oh * 4];
+            // Warm-up (session + engine build + per-size binding happen here).
+            process(&input, w, h, w * 4, &mut output, ow * 4).expect("warm-up failed");
+            let n = 30;
+            let t0 = std::time::Instant::now();
+            for _ in 0..n {
+                process(&input, w, h, w * 4, &mut output, ow * 4).expect("inference failed");
+            }
+            let per = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
+            println!(
+                "realesrgan {}x{} -> {}x{}: {:.1} ms/frame ({:.1} fps)",
+                w, h, ow, oh, per, 1000.0 / per
+            );
         }
-        let per = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
-        println!("realesrgan 640x360->1280x720: {:.1} ms/frame ({:.1} fps)", per, 1000.0 / per);
     }
 }

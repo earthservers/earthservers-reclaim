@@ -370,15 +370,16 @@ impl Drop for SuperRes {
 // The `earthnvsr` element — a VideoFilter that is passthrough until engaged.
 // ---------------------------------------------------------------------------
 
-/// Whether nvai would scale this input. AI 2x is gated to <=720p sources —
-/// that's both what SR is FOR and what runs in (near) real time at fp32; above
-/// that the element negotiates 1:1 (cheap row copy) and the GL stage falls
-/// back to FSR (see EnhanceCtl::apply), so 'AI mode' never crawls or stalls.
+/// Whether nvai would scale this input. AI 2x is gated to sources the
+/// upscaler holds a real-time budget for (`aisr::MAX_IN_W/H` — also the
+/// TensorRT engine profile ceiling); above that the element negotiates 1:1
+/// (cheap row copy) and the GL stage falls back to FSR (see
+/// EnhanceCtl::apply), so 'AI mode' never crawls or stalls.
 pub(crate) fn nv_factor(w: i32, h: i32) -> i32 {
-    if w > 0
-        && h > 0
-        && w <= 1280
-        && h <= 720
+    if w >= crate::aisr::MIN_IN
+        && h >= crate::aisr::MIN_IN
+        && w <= crate::aisr::MAX_IN_W
+        && h <= crate::aisr::MAX_IN_H
         && (2 * w) as u32 <= MAX_W
         && (2 * h) as u32 <= MAX_H
     {
@@ -752,6 +753,9 @@ mod tests {
         // fp32 inference above 720p can't hold a real-time frame budget.
         assert_eq!(nv_factor(1920, 1080), 1);
         assert_eq!(nv_factor(2560, 1440), 1);
+        // Below the TensorRT profile floor: 1:1 (GL-FSR covers it) — the
+        // engine would hard-fail on sub-profile shapes.
+        assert_eq!(nv_factor(24, 18), 1);
         assert_eq!(nv_factor(0, 0), 1);
     }
 
