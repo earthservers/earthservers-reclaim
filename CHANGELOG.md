@@ -5,6 +5,70 @@ All notable changes to Earth Reclaim are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Per-tab search.** Every search tab now has its **own independent search** —
+  query, streamed results, page number, kinds/sources/retention filters, and
+  collapse state. Switching tabs swaps to that tab's search *preserved* (results
+  are restored from a per-tab cache without re-running the search, and a search
+  still streaming keeps filling in); a brand-new tab starts empty. Previously one
+  shared search showed in every tab.
+- **Saved searches & search history.** A new **Searches** panel in the right dock
+  (button on the Search navbar) lists your saved searches — stored **with their
+  retention/kinds/sources config** so re-running restores the exact same search —
+  and your recent search history (grouped, with run / save / remove / clear-all).
+  The same lists also appear as a third **Searches** tab on the Local AI / History
+  page. Clicking an entry runs it in the current search tab (or a fresh tab if
+  you're on a web page). All local, per profile.
+- **Media "Enhance" — super-resolution for videos *and* photos.** A new toolbar
+  button in the Media player cycles **Off → FSR → AI**:
+  - **FSR** — AMD FidelityFX Super Resolution 1.0 (edge-adaptive 2x upscale +
+    contrast-adaptive sharpening) running as GL shaders inside the playback
+    pipeline; vendor-agnostic (any GPU with GStreamer GL). Photos get the same
+    shaders via WebGL in the image viewer.
+  - **AI (Real-ESRGAN)** — real neural super-resolution (Real-ESRGAN compact x2,
+    fp16) on the GPU via onnxruntime/CUDA. Optional install:
+    `scripts/install-ai-upscaler.sh` (NVIDIA GPU required; ~2 GB of
+    freely-redistributable runtime libraries into `~/.earthreclaim/aisr`). The
+    mode appears automatically once installed. AI runs on ≤720p sources (that's
+    what super-resolution is for) and transparently degrades to FSR above;
+    over-budget frames drop via QoS instead of stalling playback. Measured on an
+    RTX 4060 Ti: ~26 ms/frame for 640x360→1280x720 (real-time).
+  - Mode switches happen **live** — no pipeline restart, no black flash; the
+    upscale caps at 4K; everything stays on-device (model is inert weights,
+    runtime telemetry disabled, zero network at playback time).
+  - Escape hatches: `EARTH_VIDEO_SR=off` disables the feature entirely;
+    `EARTH_AISR_DIR` relocates the AI runtime dir.
+- **Clearer toggle states in the Media player.** Active toggles (shuffle, repeat,
+  slideshow, layout, pane selector, playlists, privacy, fullscreen) highlight
+  **green**; the Enhance button highlights **yellow** so on/off is obvious at a
+  glance.
+
+### Fixed
+
+- **Secondary windows were broken in packaged builds** — they couldn't be closed,
+  showed the Search tab (which is main-window-only), and failed with *"command …
+  not allowed by ACL"* (e.g. loading profiles). Cause: packaged secondary windows
+  load from the localhost asset server, and newer Tauri rejects app commands from
+  remote origins unless explicitly allowed — every custom command is now declared
+  and granted to both window classes. A window served from the asset server also
+  treats itself as secondary *by origin*, so it boots straight to Media and never
+  falls back to "main" even if IPC fails.
+- **Local AI chat: you couldn't scroll up while an answer was streaming** — the
+  transcript re-pinned to the bottom on every token. It now pins only while you're
+  already at the bottom; scrolling back down (or sending a message) re-engages it.
+
+### Developer notes
+
+- New Tauri commands must now be registered in **three** places: `lib.rs`
+  `generate_handler![]`, the command list in `src-tauri/build.rs`, and
+  `src-tauri/permissions/all-app-commands.toml` — otherwise the command is
+  rejected by the ACL in every window. (See the comment in `build.rs`.)
+- `earth-media` and `ort` compile at `opt-level = 3` even in dev profiles —
+  unoptimized per-frame pixel loops made enhancement crawl under `pnpm desktop`.
+
 ## [1.1.1] - 2026-06-30
 
 ### Fixed

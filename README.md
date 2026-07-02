@@ -39,6 +39,8 @@ Everything below runs **on your machine**. The only outbound traffic is the page
 - **NoScript** — JavaScript is blocked by default and trusted **per site** (persistent or session‑only); a web‑process extension blocks untrusted third‑party requests.
 - **Privacy protection** — third‑party cookie blocking, tracking prevention (ITP), user‑agent spoofing, and incognito (ephemeral, nothing on disk).
 - **Your own search engine** — build a private index from the sites *you* curate and **scrape**, plus community trust/bias ratings on domains. Search your own corpus, not an ad network.
+- **Per‑tab search** — every search tab keeps its own query, streamed results, filters and page; switching tabs preserves each search (no re-run), and new tabs start clean.
+- **Saved searches & history** — a right‑dock **Searches** panel (and a tab on the Local AI / History page) with saved searches that remember their filters, plus grouped recent‑search history (run / save / remove / clear). Local and per‑profile.
 
 ### 🔍 Local Search — "Google, but completely local"
 - **Query‑driven local index** — type a query and get fast results that are **scraped, indexed, and grep‑able on your device**. It fuses local SearXNG meta‑search, the web scraper, and the AI curator behind one index (**FTS5 full‑text ⊕ vector embeddings**) with a fusion ranker. The index only ever contains things *you actually searched* — strong privacy by construction.
@@ -56,6 +58,7 @@ Everything below runs **on your machine**. The only outbound traffic is the page
 - **Image slideshow** — shuffle/stagger across panes, fitted on load.
 - **Password‑protected playlists** — playlists are encrypted; lock them behind a media password (+ optional OTP).
 - **Media downloader** — manually save images/gifs/videos with your own descriptions (for the AI), plus **yt‑dlp** for streaming sites like YouTube. You pick the save location.
+- **Enhance (super‑resolution)** — one toolbar button cycles **Off → FSR → AI** for videos *and* photos. FSR (AMD FidelityFX 1.0 as in‑pipeline GL shaders) sharpens on any GPU; **AI (Real‑ESRGAN, fp16 on CUDA)** adds learned detail to ≤720p sources in real time (optional install, see below). Switching is live — no playback restart — and everything runs on‑device.
 
 ### 🕸️ Web Scraper
 - **Crawl & index** — create a job (base URL, crawl depth, max pages, optional URL pattern + content selectors); it crawls, extracts readable text, and indexes pages for **local full‑text search**.
@@ -185,6 +188,28 @@ curl 'http://localhost:8888/search?q=test&format=json' | head -c 200
 
 Then in Reclaim's assistant, open the search‑settings (⚙) and confirm the URL is `http://localhost:8888`. With Research on, the header shows **"Private search via SearXNG ✓"**. (No Docker? See the [SearXNG install docs](https://docs.searxng.org/admin/installation.html) for the script/source install — same two settings: `secret_key` and `formats: [html, json]`.)
 
+### AI video upscaling (optional, NVIDIA)
+
+The Media player's **Enhance** button always offers **FSR** (works on any GPU,
+nothing to install). To unlock the **AI (Real‑ESRGAN)** mode — a neural network
+that reconstructs detail in ≤720p video and photos — install the local runtime:
+
+```bash
+./scripts/install-ai-upscaler.sh
+```
+
+This puts the bundled Real‑ESRGAN model (BSD‑licensed, `resources/aisr/`) plus
+the official onnxruntime‑gpu and NVIDIA CUDA runtime libraries (the same
+freely‑redistributable PyPI packages PyTorch uses) into `~/.earthreclaim/aisr`
+(~2 GB download). Restart Reclaim and the Enhance button gains the AI mode
+automatically. Requirements: an NVIDIA GPU with a current driver. Everything
+runs locally — the model is inert weights, runtime telemetry is disabled, and
+no frame ever leaves your machine. Uninstall by deleting the directory.
+
+Notes: AI engages on ≤720p sources (where super‑resolution actually matters)
+and transparently falls back to FSR above that; if the GPU can't keep up on a
+given clip, frames drop smoothly rather than stalling playback.
+
 ---
 
 ## Run & Compile
@@ -209,6 +234,8 @@ Bundles are written to `apps/reclaim/src-tauri/target/release/bundle/` (`.deb`, 
 
 ### Useful flags
 - `EARTH_EMBED=x11` — opt into the legacy X11 page‑surface embed (default is the GTK overlay embed).
+- `EARTH_VIDEO_SR=off` — disable the media Enhance feature entirely (no GL elements are created).
+- `EARTH_AISR_DIR` — where the AI upscaler runtime lives (default `~/.earthreclaim/aisr`).
 
 #### Security toggles (all default to ON / safe; set to `0` to disable)
 - `RECLAIM_WEBKIT_SANDBOX=0` — disable the WebKitGTK renderer sandbox (debugging only).
