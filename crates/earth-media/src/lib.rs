@@ -4,8 +4,10 @@
 //! Bypasses gst_player API to avoid unwanted GTK overlay controls.
 //! Includes YouTube support via yt-dlp.
 
+mod enhance;
 mod youtube;
 
+pub use enhance::EnhanceMode;
 pub use youtube::{VideoInfo, YouTubeError, YouTubeExtractor};
 
 use gstreamer as gst;
@@ -155,6 +157,8 @@ pub struct PlayerStatus {
     /// True once playback has reached end-of-stream. The frontend edge-detects this
     /// (false -> true) to advance the queue, since playbin reports Playing at EOS.
     pub eos: bool,
+    /// Active video enhancement ("off" | "fsr") — see `enhance` module.
+    pub enhance: String,
 }
 
 /// Hardware-accelerated media player using GStreamer playbin directly
@@ -166,6 +170,9 @@ pub struct MediaPlayer {
     pipeline: gst::Element,
     /// Video sink element for VideoOverlay
     video_sink: Option<gst::Element>,
+    /// Active video enhancement (FSR upscaling) — drives which `video-filter`
+    /// is installed on playbin. See the `enhance` module.
+    enhance: Arc<Mutex<EnhanceMode>>,
     /// The video decoder element that actually instantiated (hardware vs software),
     /// observed live via `deep-element-added`. Proves NVDEC is really in use.
     active_decoder: Arc<Mutex<Option<String>>>,
@@ -261,54 +268,15 @@ impl MediaPlayer {
         pipeline.set_property_from_str("flags", flags_str);
         log::info!("Set playbin flags to '{}' (video + audio + soft-volume)", flags_str);
 
-        // High-quality scaling (additive; never touches decode/sink selection).
-        // Route any in-pipeline scaling through Lanczos resampling instead of the
-        // default bilinear, for sharper output. The scaler is chosen to MATCH the
-        // sink's memory path so we never add a needless GPU<->CPU transfer:
-        //   * GL sink (glimagesink): glcolorscale — GPU-side, frames stay on the GPU.
-        //   * xvimagesink/ximagesink: software videoscale method=lanczos. These sinks
-        //     present from SYSTEM memory, so frames are already on the CPU path
-        //     (even with NVDEC, which decodes on the GPU and then downloads for the
-        //     sink) — a CUDA scaler here would only force an extra round-trip. This
-        //     matches the "xvimagesink without GL -> CPU path -> software videoscale"
-        //     rule and keeps NVDEC decode fully on the GPU.
-        {
-            let sink_name = stored_sink
-                .as_ref()
-                .and_then(|s| s.factory())
-                .map(|f| f.name().to_string())
-                .unwrap_or_default();
-
-            let scaler: Option<gst::Element> = if sink_name.contains("gl") {
-                // GL presentation path: GPU-side colour-convert + scale (no download).
-                gst::ElementFactory::make("glcolorscale").build().ok()
-            } else {
-                // System-memory presentation path: CPU Lanczos resampling.
-                gst::ElementFactory::make("videoscale").build().ok().map(|s| {
-                    s.set_property_from_str("method", "lanczos");
-                    s
-                })
-            };
-
-            match scaler {
-                Some(f) => {
-                    let fname = f.factory().map(|x| x.name().to_string()).unwrap_or_default();
-                    // playbin inserts this in the video path (surrounded by its own
-                    // converters as needed). Bare videoscale = passthrough at native
-                    // res, Lanczos only when a scale is actually negotiated.
-                    pipeline.set_property("video-filter", &f);
-                    log::info!(
-                        "[earth-media] HQ scaling: video-filter={} (sink={}, {})",
-                        fname,
-                        sink_name,
-                        if sink_name.contains("gl") { "GPU-side" } else { "CPU-side" }
-                    );
-                }
-                None => {
-                    log::warn!("[earth-media] HQ scaler unavailable — using default scaling");
-                }
-            }
-        }
+        // Video filter (playbin `video-filter` slot): either the HQ Lanczos
+        // scaler (default) or the FSR enhance bin. New players inherit the
+        // session's last enhance choice so extra panes match the toggle.
+        let enhance_mode = if enhance::sr_env_disabled() {
+            EnhanceMode::Off
+        } else {
+            enhance::default_enhance()
+        };
+        Self::install_video_filter(&pipeline, stored_sink.as_ref(), enhance_mode);
 
         let info = Arc::new(Mutex::new(MediaInfo::default()));
         let muted = Arc::new(Mutex::new(false));
@@ -427,6 +395,7 @@ impl MediaPlayer {
         Ok(Self {
             pipeline,
             video_sink: stored_sink,
+            enhance: Arc::new(Mutex::new(enhance_mode)),
             active_decoder,
             window_handle,
             info,
@@ -435,6 +404,76 @@ impl MediaPlayer {
             last_error,
             eos,
         })
+    }
+
+    /// Install the video filter matching `mode` on playbin's `video-filter` slot.
+    ///
+    /// Off = high-quality scaling (additive; never touches decode/sink selection):
+    /// route any in-pipeline scaling through Lanczos resampling instead of the
+    /// default bilinear. The scaler is chosen to MATCH the sink's memory path so
+    /// we never add a needless GPU<->CPU transfer:
+    ///   * GL sink (glimagesink): glcolorscale — GPU-side, frames stay on the GPU.
+    ///   * xvimagesink/ximagesink: software videoscale method=lanczos. These sinks
+    ///     present from SYSTEM memory, so frames are already on the CPU path
+    ///     (even with NVDEC, which decodes on the GPU and then downloads for the
+    ///     sink) — a CUDA scaler here would only force an extra round-trip.
+    ///
+    /// Fsr = the GL enhance bin (EASU 2x upscale + RCAS sharpen, then back to
+    /// system memory — the sink itself stays untouched). If the bin can't be
+    /// built (missing GL plugins), falls back to the default scaler so playback
+    /// never breaks.
+    fn install_video_filter(
+        pipeline: &gst::Element,
+        sink: Option<&gst::Element>,
+        mode: EnhanceMode,
+    ) {
+        let sink_name = sink
+            .and_then(|s| s.factory())
+            .map(|f| f.name().to_string())
+            .unwrap_or_default();
+
+        if mode == EnhanceMode::Fsr {
+            match enhance::build_fsr_bin() {
+                Ok(bin) => {
+                    pipeline.set_property("video-filter", &bin);
+                    log::info!("[earth-media] video-filter=FSR enhance bin (sink={})", sink_name);
+                    return;
+                }
+                Err(e) => {
+                    log::warn!("[earth-media] FSR unavailable ({}); using default scaler", e);
+                }
+            }
+        }
+
+        let scaler: Option<gst::Element> = if sink_name.contains("gl") {
+            // GL presentation path: GPU-side colour-convert + scale (no download).
+            gst::ElementFactory::make("glcolorscale").build().ok()
+        } else {
+            // System-memory presentation path: CPU Lanczos resampling.
+            gst::ElementFactory::make("videoscale").build().ok().map(|s| {
+                s.set_property_from_str("method", "lanczos");
+                s
+            })
+        };
+
+        match scaler {
+            Some(f) => {
+                let fname = f.factory().map(|x| x.name().to_string()).unwrap_or_default();
+                // playbin inserts this in the video path (surrounded by its own
+                // converters as needed). Bare videoscale = passthrough at native
+                // res, Lanczos only when a scale is actually negotiated.
+                pipeline.set_property("video-filter", &f);
+                log::info!(
+                    "[earth-media] HQ scaling: video-filter={} (sink={}, {})",
+                    fname,
+                    sink_name,
+                    if sink_name.contains("gl") { "GPU-side" } else { "CPU-side" }
+                );
+            }
+            None => {
+                log::warn!("[earth-media] HQ scaler unavailable — using default scaling");
+            }
+        }
     }
 
     /// The decoder element currently instantiated in the live pipeline, if a
@@ -705,7 +744,67 @@ impl MediaPlayer {
             hw_decode_available: nvdec_available(),
             active_decoder: self.get_active_decoder(),
             eos: self.eos.lock().map(|e| *e).unwrap_or(false),
+            enhance: self.get_enhance().as_str().to_string(),
         }
+    }
+
+    /// Current video enhancement mode.
+    pub fn get_enhance(&self) -> EnhanceMode {
+        self.enhance.lock().map(|e| *e).unwrap_or(EnhanceMode::Off)
+    }
+
+    /// Switch video enhancement (FSR upscaling) on/off.
+    ///
+    /// playbin's `video-filter` can only be swapped safely at NULL, so a live
+    /// pipeline is restarted around the swap: remember position + play state,
+    /// tear down to NULL, install the new filter, then preroll, seek back and
+    /// resume. A short glitch is expected; playback never ends up broken — if
+    /// the FSR bin can't be built we fall back to the default scaler (logged).
+    pub fn set_enhance(&self, mode: EnhanceMode) -> Result<(), MediaError> {
+        if mode != EnhanceMode::Off && enhance::sr_env_disabled() {
+            return Err(MediaError::PlayerError(
+                "video enhancement is disabled by EARTH_VIDEO_SR".to_string(),
+            ));
+        }
+        {
+            let mut cur = self.enhance.lock().map_err(|e| {
+                MediaError::PlayerError(format!("enhance state poisoned: {}", e))
+            })?;
+            if *cur == mode {
+                return Ok(());
+            }
+            *cur = mode;
+        }
+
+        // Capture playback context before tearing down.
+        let position = self.get_position();
+        let state = self.get_state();
+        let has_media = self
+            .pipeline
+            .property::<Option<String>>("uri")
+            .map(|u| !u.is_empty())
+            .unwrap_or(false);
+
+        // Swap the filter at NULL (wait for teardown to actually finish).
+        let _ = self.pipeline.set_state(gst::State::Null);
+        let _ = self.pipeline.state(gst::ClockTime::from_seconds(2));
+        Self::install_video_filter(&self.pipeline, self.video_sink.as_ref(), mode);
+
+        // Restore playback where it was.
+        if has_media && matches!(state, PlaybackState::Playing | PlaybackState::Paused) {
+            self.pipeline
+                .set_state(gst::State::Paused)
+                .map_err(|e| MediaError::PlaybackError(format!("enhance restart failed: {:?}", e)))?;
+            let _ = self.pipeline.state(gst::ClockTime::from_seconds(5)); // preroll
+            if let Some(pos) = position {
+                let _ = self.seek(pos);
+            }
+            if state == PlaybackState::Playing {
+                self.play()?;
+            }
+        }
+        log::info!("[earth-media] enhance set to '{}'", mode.as_str());
+        Ok(())
     }
 
     /// Skip forward by seconds
@@ -915,6 +1014,20 @@ impl MediaPlayerManager {
         let players = recover_lock(self.players.lock())?;
         if let Some(player) = players.get(player_id) {
             player.set_volume(volume)
+        } else {
+            Err(MediaError::PlayerError(format!("Player {} not found", player_id)))
+        }
+    }
+
+    /// Set video enhancement on a specific player (auto-creates if needed) and
+    /// make it the session default so panes created later inherit the choice.
+    pub fn set_enhance(&self, player_id: &str, mode: EnhanceMode) -> Result<(), MediaError> {
+        self.get_or_create_player(player_id)?;
+        let players = recover_lock(self.players.lock())?;
+        if let Some(player) = players.get(player_id) {
+            player.set_enhance(mode)?;
+            enhance::set_default_enhance(mode);
+            Ok(())
         } else {
             Err(MediaError::PlayerError(format!("Player {} not found", player_id)))
         }

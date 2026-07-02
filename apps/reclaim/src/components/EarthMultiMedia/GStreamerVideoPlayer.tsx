@@ -57,6 +57,8 @@ interface PlayerStatus {
   /// True once playback reached end-of-stream (playbin stays "Playing" at EOS,
   /// so this flag — not state/position — is the reliable end signal).
   eos?: boolean;
+  /// Active video enhancement ("off" | "fsr").
+  enhance?: string;
 }
 
 // Helper to check playback state

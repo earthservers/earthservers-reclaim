@@ -346,6 +346,7 @@ fn main() {
             "player_stop_all",
             "player_list",
             "player_set_window_handle",
+            "player_set_enhance",
             "player_expose",
             "set_active_media_player",
             "get_window_xid",

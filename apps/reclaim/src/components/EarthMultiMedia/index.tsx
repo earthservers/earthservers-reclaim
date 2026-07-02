@@ -201,6 +201,9 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
   const [playlistNamePrompt, setPlaylistNamePrompt] = useState<{ title: string; onConfirm: (name: string) => void } | null>(null);
   const [playlistNameInput, setPlaylistNameInput] = useState('');
   const [isFullscreen, setIsFullscreen] = useState(false);
+  // Video "Enhance" (FSR super-resolution upscaling) — session-scoped; the
+  // backend keeps it as the default for panes created later.
+  const [enhanceOn, setEnhanceOn] = useState(false);
   const [showFullscreenHeader, setShowFullscreenHeader] = useState(true);
   const fullscreenHeaderTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -233,6 +236,25 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
   const winLabelRef = useRef(winLabel);
   winLabelRef.current = winLabel;
   const panePid = useCallback((i: number) => `${winLabel}::pane-${i}`, [winLabel]);
+
+  // Toggle FSR super-resolution on every pane of THIS window. The backend
+  // restarts each pipeline around the filter swap (position is restored) and
+  // remembers the mode as the session default for new panes. Reverts the UI
+  // state if the backend refuses (e.g. GL plugins missing / EARTH_VIDEO_SR=off).
+  const toggleEnhance = useCallback(async () => {
+    const next = !enhanceOn;
+    setEnhanceOn(next);
+    const mode = next ? 'fsr' : 'off';
+    try {
+      const ids = await invoke<string[]>('player_list').catch(() => [] as string[]);
+      const mine = ids.filter(id => id.startsWith(`${winLabelRef.current}::`));
+      const targets = mine.length ? mine : [`${winLabelRef.current}::pane-0`];
+      await Promise.all(targets.map(id => invoke('player_set_enhance', { playerId: id, mode })));
+    } catch (err) {
+      console.error('Failed to set video enhancement:', err);
+      setEnhanceOn(!next);
+    }
+  }, [enhanceOn]);
   // Extract the pane index from a (possibly namespaced) player id like "main::pane-2".
   const paneIndexOf = useCallback((id: string | null | undefined) => {
     const m = (id || '').match(/pane-(\d+)/);
@@ -2277,6 +2299,19 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
                 </span>
               )}
 
+              {/* Enhance (FSR super-resolution) toggle */}
+              <button
+                onClick={toggleEnhance}
+                className={`p-2 rounded transition-colors ${
+                  enhanceOn ? 'bg-[var(--primary-color)]/20 text-[var(--primary-color)]' : 'text-gray-400 hover:text-white'
+                }`}
+                title={enhanceOn ? 'Enhance: FSR upscaling ON' : 'Enhance video (FSR upscaling)'}
+              >
+                <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 3v4M3 5h4M6 17v4m-2-2h4m5-16l2.286 6.857L21 12l-5.714 2.143L13 21l-2.286-6.857L5 12l5.714-2.143L13 3z" />
+                </svg>
+              </button>
+
               {/* Playlist toggle */}
               <button
                 onClick={() => setShowPlaylistPanel(!showPlaylistPanel)}
@@ -2600,6 +2635,19 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
             {playedItems.size}/{queue.length} played
           </span>
         )}
+
+        {/* Enhance (FSR super-resolution) toggle */}
+        <button
+          onClick={toggleEnhance}
+          className={`p-2 rounded transition-colors ${
+            enhanceOn ? 'bg-[var(--primary-color)]/20 text-[var(--primary-color)]' : 'text-gray-400 hover:text-white'
+          }`}
+          title={enhanceOn ? 'Enhance: FSR upscaling ON' : 'Enhance video (FSR upscaling)'}
+        >
+          <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 3v4M3 5h4M6 17v4m-2-2h4m5-16l2.286 6.857L21 12l-5.714 2.143L13 21l-2.286-6.857L5 12l5.714-2.143L13 3z" />
+          </svg>
+        </button>
 
         {/* Playlist toggle */}
         <button

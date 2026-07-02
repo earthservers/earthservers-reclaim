@@ -5,7 +5,7 @@
 //! Includes YouTube support via yt-dlp.
 //! Supports VideoOverlay for embedded video playback in the app window.
 
-use earth_media::{MediaPlayer, MediaPlayerManager, PlayerStatus, VideoInfo};
+use earth_media::{EnhanceMode, MediaPlayer, MediaPlayerManager, PlayerStatus, VideoInfo};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use tauri::State;
@@ -190,6 +190,22 @@ pub async fn player_set_muted(
     muted: bool,
 ) -> Result<(), String> {
     player_set_muted_internal(&player_id, muted).await
+}
+
+/// Set video enhancement (FSR super-resolution) on a specific player/pane.
+/// `mode` is "off" | "fsr". Also becomes the session default for new panes.
+/// Returns the applied mode.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn player_set_enhance(
+    player_id: String,
+    mode: String,
+) -> Result<String, String> {
+    let parsed = EnhanceMode::parse(&mode)
+        .ok_or_else(|| format!("invalid enhance mode '{}' (expected off|fsr)", mode))?;
+    GLOBAL_PLAYER_MANAGER
+        .set_enhance(&player_id, parsed)
+        .map_err(|e| e.to_string())?;
+    Ok(parsed.as_str().to_string())
 }
 
 /// Get status of a specific player/pane

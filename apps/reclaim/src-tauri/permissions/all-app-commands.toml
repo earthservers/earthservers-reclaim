@@ -348,6 +348,7 @@ permissions = [
   "allow-player-stop-all",
   "allow-player-list",
   "allow-player-set-window-handle",
+  "allow-player-set-enhance",
   "allow-player-expose",
   "allow-set-active-media-player",
   "allow-get-window-xid",

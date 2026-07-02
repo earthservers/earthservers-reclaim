@@ -3224,6 +3224,7 @@ pub fn run() {
             media_player::player_stop_all,
             media_player::player_list,
             media_player::player_set_window_handle,
+            media_player::player_set_enhance,
             media_player::player_expose,
             media_player::set_active_media_player,
             media_player::get_window_xid,
