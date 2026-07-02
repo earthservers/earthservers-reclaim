@@ -879,5 +879,15 @@ mod tests {
         player.set_enhance(EnhanceMode::Off).unwrap();
         assert_healthy("off-again");
         player.stop_and_wait().unwrap();
+
+        // Second pipeline STARTING with AI already engaged (session default) —
+        // the reported at-load failure path: initial negotiation must succeed
+        // with the engaged element in the chain.
+        player.set_enhance(EnhanceMode::NvAi).unwrap();
+        player.load(&media).unwrap();
+        player.play().unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        assert_healthy("nvai-at-load");
+        player.stop_and_wait().unwrap();
     }
 }

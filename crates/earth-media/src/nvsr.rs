@@ -535,21 +535,16 @@ mod imp {
                 for s in caps.iter() {
                     let mut s = s.to_owned();
                     if engaged {
-                        if let (Ok(w), Ok(h)) = (s.get::<i32>("width"), s.get::<i32>("height")) {
-                            let f = nv_factor(
-                                if direction == gst::PadDirection::Sink { w } else { w / 2 },
-                                if direction == gst::PadDirection::Sink { h } else { h / 2 },
-                            );
-                            if f == 2 {
-                                if direction == gst::PadDirection::Sink {
-                                    s.set("width", w * 2);
-                                    s.set("height", h * 2);
-                                } else {
-                                    s.set("width", w / 2);
-                                    s.set("height", h / 2);
-                                }
-                            }
-                        }
+                        // Scaler pattern (like videoscale): while engaged the
+                        // other side's size is UNCONSTRAINED at query time —
+                        // only scaling fixed sizes broke initial negotiation
+                        // (ranges passed through unscaled contradicted the
+                        // scaled fixed caps -> "not-negotiated" at load when a
+                        // player starts with AI already on). fixate_caps picks
+                        // the actual 2x/1x output.
+                        s.set("width", gst::IntRange::new(1i32, i32::MAX));
+                        s.set("height", gst::IntRange::new(1i32, i32::MAX));
+                        let _ = direction;
                     }
                     out.append_structure(s);
                 }
@@ -558,6 +553,37 @@ mod imp {
                 out = out.intersect_with_mode(filter, gst::CapsIntersectMode::First);
             }
             Some(out)
+        }
+
+        fn fixate_caps(
+            &self,
+            direction: gst::PadDirection,
+            caps: &gst::Caps,
+            othercaps: gst::Caps,
+        ) -> gst::Caps {
+            let engaged = self.engaged.load(Ordering::Relaxed);
+            let mut othercaps = othercaps;
+            if engaged {
+                if let Some(s) = caps.structure(0) {
+                    if let (Ok(w), Ok(h)) = (s.get::<i32>("width"), s.get::<i32>("height")) {
+                        // sink->src: output = input * factor (2x for <=720p,
+                        // else 1:1). src->sink: input = output / factor.
+                        let (tw, th) = if direction == gst::PadDirection::Sink {
+                            let f = nv_factor(w, h);
+                            (w * f, h * f)
+                        } else {
+                            let f = nv_factor(w / 2, h / 2);
+                            (w / f, h / f)
+                        };
+                        if let Some(m) = othercaps.make_mut().structure_mut(0) {
+                            m.fixate_field_nearest_int("width", tw);
+                            m.fixate_field_nearest_int("height", th);
+                        }
+                    }
+                }
+            }
+            othercaps.fixate();
+            othercaps
         }
     }
 
