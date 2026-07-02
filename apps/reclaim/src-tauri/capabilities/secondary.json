@@ -7,6 +7,7 @@
     "urls": ["http://127.0.0.1:9877/*", "http://localhost:9877/*"]
   },
   "permissions": [
+    "all-app-commands",
     "core:default",
     "core:window:allow-minimize",
     "core:window:allow-maximize",

@@ -4,6 +4,7 @@
   "description": "Default permissions for the application",
   "windows": ["main"],
   "permissions": [
+    "all-app-commands",
     "core:default",
     "core:window:allow-minimize",
     "core:window:allow-maximize",
