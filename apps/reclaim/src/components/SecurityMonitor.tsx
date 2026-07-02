@@ -170,7 +170,9 @@ export function SecurityMonitor({ activeEngine }: { activeEngine?: string }) {
         open={open}
         width={SECURITY_PANEL_WIDTH}
         title="Security"
-        subtitle="Live posture & events. Deterministic — no AI in this section."
+        subtitle={aiAvailable
+          ? 'Live posture & events. Readings are deterministic; AI sections are labeled & advisory.'
+          : 'Live posture & events. Deterministic — no AI active in this section.'}
         onClose={() => setOpen(false)}
       >
         {/* ---- Posture header (top) — real boundaries, honest tags. No LLM. ---- */}
