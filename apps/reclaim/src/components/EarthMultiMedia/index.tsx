@@ -429,10 +429,13 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
   // Mirror the ACTIVE pane's media title to the backend so the floating controls
   // can show it (the backend's own GStreamer-tag title is usually empty for local
   // files). Driven by activePane + its media, so it follows the focused video.
+  // Photos are skipped (not cleared): the floating controls never drive photos,
+  // so a focused photo/slideshow must not overwrite the video title they show.
   useEffect(() => {
     if (!isTauri() || !winReady) return;
-    const title = mediaItems[activePane]?.title || '';
-    invoke('set_media_active_title', { window: winLabel, title }).catch(() => {});
+    const focused = mediaItems[activePane];
+    if (focused?.type === 'image') return;
+    invoke('set_media_active_title', { window: winLabel, title: focused?.title || '' }).catch(() => {});
   }, [activePane, mediaItems, winLabel, winReady]);
 
   // Mirror fullscreen state to the backend so the floating controls can show an
@@ -558,15 +561,19 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
   // controls talk to a WebSocket server that broadcasts ONE player's status and
   // routes commands to it — so without this the controls are stuck on pane-0.
   //
-  // Only claim the shared (cross-window) active player when THIS window actually has
-  // media — otherwise merely opening an empty second window would hijack the active
-  // player to its empty pane-0 and freeze the controls that another window is driving.
+  // Only claim the shared (cross-window) active player when THIS window's
+  // focused pane holds PLAYER media (video/audio). Photos have their own
+  // in-page controls and must never grab the floating controls — this effect
+  // re-fires on every mediaItems change, so a slideshow window advancing
+  // photos would otherwise re-claim (and retarget) the controls away from a
+  // video playing in another window on every slide. It also keeps an empty
+  // second window from hijacking the controls to its empty pane-0.
   useEffect(() => {
     if (!isTauri() || !winReady) return;
-    const hasMedia = mediaItems.some(Boolean) || queue.length > 0;
-    if (!hasMedia) return;
+    const focused = mediaItems[activePane];
+    if (!focused || focused.type === 'image') return;
     invoke('set_active_media_player', { playerId: activePlayerId }).catch(() => {});
-  }, [activePlayerId, winReady, mediaItems, queue]);
+  }, [activePlayerId, winReady, mediaItems, queue, activePane]);
 
   // Create X11 webview controls window with HTML controls
   // This creates a GTK window with WebKitGTK that loads the /media-controls route
