@@ -1,7 +1,7 @@
 // EarthMultiMedia ImageViewer Component
 // Privacy-focused image viewer with zoom, pan, and comparison features
 
-import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
+import { useState, useRef, useEffect, useCallback } from 'react';
 import { convertFileSrc } from '@tauri-apps/api/core';
 import { fsrUpscaleToCanvas } from '../../lib/fsrCanvas';
 
@@ -66,20 +66,55 @@ export function ImageViewer({
   const [showOverlay, setShowOverlay] = useState(true);
   const overlayTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Convert file:// URIs to Tauri asset URLs for proper loading in webview
-  const imageSrc = useMemo(() => {
-    if (!source) return '';
-    // If it's a file:// URI, convert to Tauri asset protocol
-    if (source.startsWith('file://')) {
-      const filePath = source.replace('file://', '');
-      return convertFileSrc(filePath);
+  // Resolve the source to something the <img> can actually load.
+  //
+  // Local files are read through the fs plugin into a blob: URL rather than
+  // convertFileSrc: blob URLs are same-origin in EVERY window, while the
+  // asset:// protocol only loads in `tauri://` pages — packaged secondary
+  // windows (new window / tray / detached tabs) are served from the localhost
+  // asset server (an http origin, see app_content_url), where WebKit rejects
+  // asset:// subresources and every photo showed "Failed to load image".
+  // The asset protocol stays as a fallback if the fs read fails (e.g. the
+  // path is outside the fs scope).
+  const [imageSrc, setImageSrc] = useState('');
+  useEffect(() => {
+    const filePath = source.startsWith('file://')
+      ? source.replace('file://', '')
+      : source.startsWith('/')
+        ? source
+        : null;
+    if (!filePath) {
+      // HTTP/HTTPS, blob and data URLs work directly (empty source stays empty).
+      setImageSrc(source);
+      return;
     }
-    // If it's a raw file path, convert it
-    if (source.startsWith('/')) {
-      return convertFileSrc(source);
-    }
-    // HTTP/HTTPS URLs and blob URLs work directly
-    return source;
+    let cancelled = false;
+    let objectUrl: string | null = null;
+    (async () => {
+      try {
+        const { readFile } = await import('@tauri-apps/plugin-fs');
+        const data = await readFile(filePath);
+        const ext = (filePath.split('.').pop() || '').toLowerCase();
+        const mime: Record<string, string> = {
+          jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif',
+          webp: 'image/webp', bmp: 'image/bmp', svg: 'image/svg+xml',
+          avif: 'image/avif', ico: 'image/x-icon', tif: 'image/tiff', tiff: 'image/tiff',
+        };
+        objectUrl = URL.createObjectURL(new Blob([data], { type: mime[ext] || 'application/octet-stream' }));
+        if (cancelled) {
+          URL.revokeObjectURL(objectUrl);
+        } else {
+          setImageSrc(objectUrl);
+        }
+      } catch (err) {
+        console.warn('[ImageViewer] fs read failed, falling back to asset protocol:', err);
+        if (!cancelled) setImageSrc(convertFileSrc(filePath));
+      }
+    })();
+    return () => {
+      cancelled = true;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
   }, [source]);
 
   const [state, setState] = useState<ImageState>({
@@ -403,7 +438,9 @@ export function ImageViewer({
       {/* Image */}
       <img
         ref={imageRef}
-        src={imageSrc}
+        // undefined (not "") while the blob is being read — an empty string src
+        // resolves to the page URL and fires a spurious onError.
+        src={imageSrc || undefined}
         alt={title || 'Image'}
         className="max-w-none"
         style={{
