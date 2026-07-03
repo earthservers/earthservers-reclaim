@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The hidden mouse cursor comes back when you move over the video.** The
+  idle auto-hide (controls + cursor) only counted mouse activity over the
+  page — the native video surface sits above it, so wiggling the mouse over
+  the actual video didn't register and the cursor stayed hidden until it
+  crossed some UI chrome. Pointer motion over the surface is now forwarded
+  (throttled) to the media view like clicks already were.
 - **Slideshow photos no longer steal the floating media controls.** With a
   video in one window and a slideshow in another, every photo advance
   retargeted the shared controls to the photo. The controls now only follow
