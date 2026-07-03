@@ -195,6 +195,8 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
   const [showPrivacyPanel, setShowPrivacyPanel] = useState(false);
   const [urlInput, setUrlInput] = useState('');
   const [newPlaylistName, setNewPlaylistName] = useState('');
+  // Playlist pending delete confirmation (inline are-you-sure in its row).
+  const [confirmDeletePlaylist, setConfirmDeletePlaylist] = useState<Playlist | null>(null);
   // Which queue item's "add to playlist" menu is currently open (by queue item id)
   const [addToPlaylistMenuId, setAddToPlaylistMenuId] = useState<string | null>(null);
   // In-app "name this playlist" modal (replaces the native prompt() dialog)
@@ -1998,6 +2000,21 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
     }
   };
 
+  // Delete a playlist (invoked from the inline confirm in its row)
+  const deletePlaylist = async (playlist: Playlist) => {
+    try {
+      await invoke('delete_media_playlist', { playlistId: playlist.id });
+      setConfirmDeletePlaylist(null);
+      if (currentPlaylist?.id === playlist.id) {
+        setCurrentPlaylist(null);
+        setPlaylistItems([]);
+      }
+      loadPlaylists();
+    } catch (err) {
+      console.error('Failed to delete playlist:', err);
+    }
+  };
+
   // Load playlist items
   const loadPlaylistItems = async (playlist: Playlist) => {
     try {
@@ -3172,20 +3189,50 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
                 ) : (
                   <div className="space-y-1">
                     {playlists.map((playlist) => (
-                      <div
-                        key={playlist.id}
-                        className={`p-2 rounded cursor-pointer transition-colors ${
-                          currentPlaylist?.id === playlist.id
-                            ? 'bg-[var(--primary-color)]/20'
-                            : 'hover:bg-white/5'
-                        }`}
-                        onClick={() => loadPlaylistItems(playlist)}
-                      >
-                        <div className="flex items-center justify-between">
-                          <span className="text-white text-sm truncate">{playlist.name}</span>
-                          <span className="text-gray-500 text-xs">{playlist.item_count}</span>
+                      confirmDeletePlaylist?.id === playlist.id ? (
+                        // Inline are-you-sure — the row itself becomes the confirm.
+                        <div key={playlist.id} className="p-2 rounded bg-red-500/10 border border-red-500/30">
+                          <div className="text-white text-xs mb-1.5">
+                            Delete "{playlist.name}"? Its saved entries go with it.
+                          </div>
+                          <div className="flex justify-end gap-2">
+                            <button
+                              onClick={() => setConfirmDeletePlaylist(null)}
+                              className="text-xs text-gray-300 hover:text-white px-1"
+                            >
+                              Cancel
+                            </button>
+                            <button
+                              onClick={() => deletePlaylist(playlist)}
+                              className="text-xs px-2 py-0.5 bg-red-500/80 hover:bg-red-500 text-white rounded"
+                            >
+                              Delete
+                            </button>
+                          </div>
                         </div>
-                      </div>
+                      ) : (
+                        <div
+                          key={playlist.id}
+                          className={`group p-2 rounded cursor-pointer transition-colors ${
+                            currentPlaylist?.id === playlist.id
+                              ? 'bg-[var(--primary-color)]/20'
+                              : 'hover:bg-white/5'
+                          }`}
+                          onClick={() => loadPlaylistItems(playlist)}
+                        >
+                          <div className="flex items-center justify-between gap-1.5">
+                            <span className="text-white text-sm truncate">{playlist.name}</span>
+                            <span className="text-gray-500 text-xs ml-auto">{playlist.item_count}</span>
+                            <button
+                              onClick={(e) => { e.stopPropagation(); setConfirmDeletePlaylist(playlist); }}
+                              className="text-gray-500 hover:text-red-400 text-xs px-0.5 opacity-0 group-hover:opacity-100 transition-opacity"
+                              title="Delete playlist"
+                            >
+                              ✕
+                            </button>
+                          </div>
+                        </div>
+                      )
                     ))}
                   </div>
                 )}
