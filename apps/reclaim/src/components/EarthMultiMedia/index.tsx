@@ -1081,17 +1081,16 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
     window.addEventListener('keydown', onActivity);
     window.addEventListener('wheel', onActivity, { passive: true });
 
-    // Pointer motion forwarded from the native video surface (Tauri event). The
-    // payload is the namespaced player id; only count motion over OUR window's
-    // surfaces so another window's video doesn't keep this window's controls awake.
-    let unlistenMotion: (() => void) | undefined;
-    if (isTauri()) {
-      import('@tauri-apps/api/event').then(({ listen }) => {
-        listen<string>('video-surface-motion', (e) => {
-          if ((e.payload || '').startsWith(`${winLabelRef.current}::`)) onActivity();
-        }).then((un) => { unlistenMotion = un; });
-      });
-    }
+    // Pointer motion forwarded from the native video surface — the backend
+    // evals a DOM CustomEvent into the OWNING window's webview (like surface
+    // clicks; a broadcast Tauri event never reaches a 2nd window). Without
+    // this, moving the mouse over the video (which covers the DOM) never
+    // counted as activity and the hidden cursor/controls wouldn't come back.
+    const onSurfaceMotion = (e: Event) => {
+      const pid = (e as CustomEvent).detail?.playerId as string | undefined;
+      if (pid && pid.startsWith(`${winLabelRef.current}::`)) onActivity();
+    };
+    window.addEventListener('__earth_video_surface_motion', onSurfaceMotion);
 
     markMediaActivity(); // arm the timer on mount
     return () => {
@@ -1099,8 +1098,8 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
       window.removeEventListener('mousedown', onActivity);
       window.removeEventListener('keydown', onActivity);
       window.removeEventListener('wheel', onActivity);
+      window.removeEventListener('__earth_video_surface_motion', onSurfaceMotion);
       if (idleTimerRef.current) clearTimeout(idleTimerRef.current);
-      unlistenMotion?.();
     };
   }, [markMediaActivity]);
 

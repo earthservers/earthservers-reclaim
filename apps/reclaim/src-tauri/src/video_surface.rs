@@ -139,6 +139,36 @@ pub async fn create_video_surface(
                 glib::Propagation::Proceed
             });
 
+            // Forward pointer MOTION over the surface (throttled) so the media
+            // view's idle auto-hide can wake the cursor/controls again: the
+            // surface is a native X11 window ABOVE the DOM, so webview
+            // mousemove never fires while the pointer is over the video, and
+            // without this the cursor stayed hidden until the mouse reached
+            // some DOM chrome. Same eval-into-owning-window delivery as clicks
+            // (a broadcast emit never reaches a 2nd window's listener).
+            drawing_area.add_events(gdk::EventMask::POINTER_MOTION_MASK);
+            let app_motion = app.clone();
+            let pid_motion = player_id_for_closure.clone();
+            let last_motion = std::cell::Cell::new(
+                std::time::Instant::now() - std::time::Duration::from_secs(1),
+            );
+            drawing_area.connect_motion_notify_event(move |_widget, _event| {
+                // ~4 forwards/sec is plenty for an idle timer; eval per motion
+                // event would hammer the webview.
+                if last_motion.get().elapsed() >= std::time::Duration::from_millis(250) {
+                    last_motion.set(std::time::Instant::now());
+                    use tauri::Manager;
+                    let label = crate::controls_server::window_label_of(&pid_motion);
+                    if let Some(wv) = app_motion.get_webview_window(&label) {
+                        let detail = serde_json::json!({ "playerId": pid_motion });
+                        let _ = wv.eval(format!(
+                            "window.dispatchEvent(new CustomEvent('__earth_video_surface_motion',{{detail:{detail}}}))"
+                        ));
+                    }
+                }
+                glib::Propagation::Proceed
+            });
+
             // Create a window to hold the drawing area
             // Using Popup type to avoid window manager decorations
             let gtk_window = gtk::Window::new(gtk::WindowType::Popup);
