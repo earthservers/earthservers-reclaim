@@ -5,6 +5,24 @@ All notable changes to Earth Reclaim are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Photos failed to load in the Media player** ("Failed to load image") in
+  packaged builds. Windows served from the localhost asset server (new window /
+  tray / detached tabs) are an http origin, where WebKit refuses `asset://`
+  image subresources. Photos are now read through the fs plugin into a blob URL
+  — same-origin everywhere — with the asset protocol kept as a fallback.
+- **Creating playlists did nothing.** The playlist commands expect camelCase
+  arguments (`profileId`, `playlistId`, `mediaType`) but the Media UI sent
+  snake_case, so "New playlist +", "add to playlist" and "open playlist items"
+  all failed silently. All call sites fixed.
+- **Playlist naming now happens inline in the right panel** — the Playlists /
+  Queue panel itself turns into the naming form (replacing the centered modal),
+  and the redundant "+ New playlist…" entry was removed from the queue item's
+  add-to-playlist menu.
+
 ## [1.2.0] - 2026-07-02
 
 ### Added

@@ -1986,7 +1986,7 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
     if (!newPlaylistName.trim()) return;
     try {
       await invoke('create_media_playlist', {
-        profile_id: profileId,
+        profileId,
         name: newPlaylistName,
         description: null,
         encrypted: false,
@@ -2001,7 +2001,7 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
   // Load playlist items
   const loadPlaylistItems = async (playlist: Playlist) => {
     try {
-      const items = await invoke<PlaylistItem[]>('get_media_playlist_items', { playlist_id: playlist.id });
+      const items = await invoke<PlaylistItem[]>('get_media_playlist_items', { playlistId: playlist.id });
       setPlaylistItems(items);
       setCurrentPlaylist(playlist);
     } catch (err) {
@@ -2015,9 +2015,9 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
     if (!media) return;
     try {
       await invoke('add_to_media_playlist', {
-        playlist_id: playlistId,
+        playlistId,
         source: media.source,
-        media_type: media.type,
+        mediaType: media.type,
         title: media.title || null,
         thumbnail: null,
       });
@@ -2034,9 +2034,9 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
   const addQueueItemToPlaylist = async (playlistId: number, item: QueueItem) => {
     try {
       await invoke('add_to_media_playlist', {
-        playlist_id: playlistId,
+        playlistId,
         source: item.source,
-        media_type: item.type || 'video',
+        mediaType: item.type || 'video',
         title: item.title || null,
         thumbnail: null,
       });
@@ -2046,28 +2046,6 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
     } catch (err) {
       console.error('Failed to add item to playlist:', err);
     }
-  };
-
-  // Create a new playlist and immediately add this queue item to it
-  const createPlaylistWithItem = (item: QueueItem) => {
-    setAddToPlaylistMenuId(null);
-    setPlaylistNameInput('');
-    setPlaylistNamePrompt({
-      title: 'New playlist',
-      onConfirm: async (name) => {
-        try {
-          const pl = await invoke<Playlist>('create_media_playlist', {
-            profile_id: profileId,
-            name,
-            description: null,
-            encrypted: false,
-          });
-          await addQueueItemToPlaylist(pl.id, item);
-        } catch (err) {
-          console.error('Failed to create playlist:', err);
-        }
-      },
-    });
   };
 
   // Render media pane
@@ -2388,7 +2366,7 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
 
               {/* Playlist toggle */}
               <button
-                onClick={() => { setShowPlaylistPanel(!showPlaylistPanel); setShowEnhancePanel(false); }}
+                onClick={() => { setShowPlaylistPanel(!showPlaylistPanel); setShowEnhancePanel(false); setPlaylistNamePrompt(null); }}
                 className={`p-2 rounded transition-colors ${
                   showPlaylistPanel ? 'bg-green-500/25 text-green-400' : 'text-gray-400 hover:text-white'
                 }`}
@@ -2733,7 +2711,7 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
 
         {/* Playlist toggle */}
         <button
-          onClick={() => { setShowPlaylistPanel(!showPlaylistPanel); setShowEnhancePanel(false); }}
+          onClick={() => { setShowPlaylistPanel(!showPlaylistPanel); setShowEnhancePanel(false); setPlaylistNamePrompt(null); }}
           className={`p-2 rounded transition-colors ${
             showPlaylistPanel ? 'bg-green-500/25 text-green-400' : 'text-gray-400 hover:text-white'
           }`}
@@ -2939,9 +2917,51 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
         {showPlaylistPanel && (
           <div className="w-80 bg-[var(--card-bg-color)] border-l border-gray-700/50 flex flex-col flex-shrink-0">
             <div className="p-3 border-b border-gray-700/50">
-              <h3 className="font-medium text-white mb-2">Playlists / Queue</h3>
+              <h3 className="font-medium text-white mb-2">{playlistNamePrompt ? playlistNamePrompt.title : 'Playlists / Queue'}</h3>
             </div>
 
+            {/* Inline naming form — the panel itself becomes the "new playlist"
+                surface (no centered modal; see playlistNamePrompt setters). */}
+            {playlistNamePrompt ? (
+              <div className="p-3 space-y-3">
+                <input
+                  autoFocus
+                  type="text"
+                  value={playlistNameInput}
+                  onChange={(e) => setPlaylistNameInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' && playlistNameInput.trim()) {
+                      playlistNamePrompt.onConfirm(playlistNameInput.trim());
+                      setPlaylistNamePrompt(null);
+                    } else if (e.key === 'Escape') {
+                      setPlaylistNamePrompt(null);
+                    }
+                  }}
+                  placeholder="Playlist name…"
+                  className="w-full bg-black/30 border border-gray-700 rounded px-3 py-2 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-[var(--primary-color)]"
+                />
+                <div className="flex justify-end gap-2">
+                  <button
+                    onClick={() => setPlaylistNamePrompt(null)}
+                    className="px-3 py-1.5 text-sm text-gray-300 hover:text-white"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    onClick={() => {
+                      if (playlistNameInput.trim()) {
+                        playlistNamePrompt.onConfirm(playlistNameInput.trim());
+                        setPlaylistNamePrompt(null);
+                      }
+                    }}
+                    disabled={!playlistNameInput.trim()}
+                    className="px-3 py-1.5 text-sm bg-[var(--primary-color)] text-white rounded disabled:opacity-50"
+                  >
+                    Create
+                  </button>
+                </div>
+              </div>
+            ) : (
             <div className="flex-1 overflow-y-auto">
               {/* Current Queue Section */}
               <div className="p-3 border-b border-gray-700/50">
@@ -2962,16 +2982,16 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
                           onConfirm: async (name) => {
                             try {
                               const newPlaylist = await invoke<Playlist>('create_media_playlist', {
-                                profile_id: profileId,
+                                profileId,
                                 name,
                                 description: `Saved from queue on ${new Date().toLocaleDateString()}`,
                                 encrypted: false,
                               });
                               for (const item of queue) {
                                 await invoke('add_to_media_playlist', {
-                                  playlist_id: newPlaylist.id,
+                                  playlistId: newPlaylist.id,
                                   source: item.source,
-                                  media_type: item.type,
+                                  mediaType: item.type,
                                   title: item.title || null,
                                   thumbnail: null,
                                 });
@@ -3096,12 +3116,6 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
                               {pl.name}
                             </button>
                           ))}
-                          <button
-                            onClick={(e) => { e.stopPropagation(); createPlaylistWithItem(item); }}
-                            className="block w-full text-left text-xs text-[var(--primary-color)] hover:bg-white/5 rounded px-1 py-0.5"
-                          >
-                            + New playlist…
-                          </button>
                         </div>
                       )}
                       </div>
@@ -3210,6 +3224,7 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
                 )}
               </div>
             </div>
+            )}
           </div>
         )}
 
@@ -3365,57 +3380,6 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
           </div>
         )}
       </div>
-
-      {/* Playlist name modal (in-app replacement for the native prompt() dialog) */}
-      {playlistNamePrompt && (
-        <div
-          className="fixed inset-0 z-[10003] flex items-center justify-center bg-black/70 backdrop-blur-sm"
-          onClick={() => setPlaylistNamePrompt(null)}
-        >
-          <div
-            className="bg-gray-900 border border-gray-700 rounded-xl shadow-2xl w-full max-w-sm mx-4 p-5"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <h3 className="text-white font-medium mb-3">{playlistNamePrompt.title}</h3>
-            <input
-              autoFocus
-              type="text"
-              value={playlistNameInput}
-              onChange={(e) => setPlaylistNameInput(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' && playlistNameInput.trim()) {
-                  playlistNamePrompt.onConfirm(playlistNameInput.trim());
-                  setPlaylistNamePrompt(null);
-                } else if (e.key === 'Escape') {
-                  setPlaylistNamePrompt(null);
-                }
-              }}
-              placeholder="Playlist name…"
-              className="w-full bg-black/30 border border-gray-700 rounded px-3 py-2 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-[var(--primary-color)]"
-            />
-            <div className="flex justify-end gap-2 mt-4">
-              <button
-                onClick={() => setPlaylistNamePrompt(null)}
-                className="px-3 py-1.5 text-sm text-gray-300 hover:text-white"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={() => {
-                  if (playlistNameInput.trim()) {
-                    playlistNamePrompt.onConfirm(playlistNameInput.trim());
-                    setPlaylistNamePrompt(null);
-                  }
-                }}
-                disabled={!playlistNameInput.trim()}
-                className="px-3 py-1.5 text-sm bg-[var(--primary-color)] text-white rounded disabled:opacity-50"
-              >
-                Create
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
 
       {/* Password Setup Modal */}
       {showPasswordSetupModal && (
