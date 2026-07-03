@@ -19,6 +19,14 @@ ignore = [
     # glib VariantStrIter unsoundness — inherent to the unmaintained gtk-rs 0.18
     # GTK3 stack; removable only by migrating the whole UI to gtk4-rs.
     "RUSTSEC-2024-0429",
+    # quick-xml 0.39 DoS advisories (quadratic dup-attribute check; unbounded
+    # NsReader namespace allocation). Reached ONLY via plist -> tauri-utils,
+    # which parses the app's own bundle metadata (Apple plists) — never
+    # attacker-controlled XML — so the DoS input path doesn't exist here.
+    # Fixed in quick-xml >=0.41, but plist 1.9.0 (latest as of 2026-07-02)
+    # still pins ^0.39: remove these once plist/tauri-utils ship the bump.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
 ]
 
 [licenses]
