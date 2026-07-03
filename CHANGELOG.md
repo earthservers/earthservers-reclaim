@@ -5,6 +5,15 @@ All notable changes to Earth Reclaim are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Slideshow photos no longer steal the floating media controls.** With a
+  video in one window and a slideshow in another, every photo advance
+  retargeted the shared controls to the photo. The controls now only follow
+  panes holding video/audio — photos keep their own in-page controls.
+
 ## [1.2.1] - 2026-07-02
 
 ### Added
