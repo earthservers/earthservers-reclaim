@@ -557,17 +557,18 @@ impl EnhanceCtl {
             EnhanceMode::Fsr => true,
             EnhanceMode::Off => false,
             EnhanceMode::NvAi => {
+                // Judge by what the AI element ACTUALLY negotiated — its
+                // `scaling` flag, set in set_info BEFORE the caps event that
+                // triggers this probe. Reading pad caps here instead raced
+                // live renegotiations (they briefly report the previous
+                // stream's sizes) and made this stage FSR-scale ON TOP of the
+                // AI output: double-scaled, aspect-distorting geometry when a
+                // gate-failing (e.g. vertical) video was followed by a
+                // gate-passing one.
                 let ai_scaled = self
                     .nvsr
                     .as_ref()
-                    .and_then(|n| n.static_pad("sink"))
-                    .and_then(|p| p.current_caps())
-                    .and_then(|c| c.structure(0).map(|s| s.to_owned()))
-                    .and_then(|s| {
-                        let iw = s.get::<i32>("width").ok()?;
-                        let ih = s.get::<i32>("height").ok()?;
-                        Some(crate::nvsr::nv_factor(iw, ih) == 2)
-                    })
+                    .map(|n| n.property::<bool>("scaling"))
                     .unwrap_or(false);
                 !ai_scaled
             }
@@ -966,6 +967,90 @@ mod tests {
 
         let (_, state, _) = pipeline.state(gst::ClockTime::ZERO);
         assert_eq!(state, gst::State::Playing, "pipeline must stay PLAYING across all toggles");
+        pipeline.set_state(gst::State::Null).unwrap();
+    }
+
+    /// Aspect-ratio repro: AI mode with a VERTICAL source first (fails the
+    /// nv_factor gate on height -> GL-FSR pins vertical 2x dims), then the
+    /// source switches to HORIZONTAL mid-play (same resident bin, like a queue
+    /// advance). The bin's output must follow the new aspect — the reported
+    /// bug squished horizontal videos vertically after a vertical video.
+    #[test]
+    #[ignore = "needs display + GL + AI backend installed"]
+    fn enhance_bin_aspect_follows_source_switch_in_ai_mode() {
+        gst::init().unwrap();
+        assert!(crate::nvsr::ai_available(), "no AI backend installed");
+        let pipeline = gst::Pipeline::new();
+        let src = gst::ElementFactory::make("videotestsrc")
+            .property("is-live", true)
+            .build()
+            .unwrap();
+        let incaps = gst::ElementFactory::make("capsfilter").build().unwrap();
+        let vertical = gst::Caps::builder("video/x-raw")
+            .field("width", 480i32)
+            .field("height", 854i32)
+            .field("framerate", gst::Fraction::new(30, 1))
+            .build();
+        let horizontal = gst::Caps::builder("video/x-raw")
+            .field("width", 854i32)
+            .field("height", 480i32)
+            .field("framerate", gst::Fraction::new(30, 1))
+            .build();
+        incaps.set_property("caps", &vertical);
+        let (enhance, ctl) = build_enhance_bin(EnhanceMode::Off).unwrap();
+        let convert = gst::ElementFactory::make("videoconvert").build().unwrap();
+        let sink = gst::ElementFactory::make("fakesink")
+            .property("sync", false)
+            .build()
+            .unwrap();
+        pipeline.add_many([&src, &incaps, &enhance, &convert, &sink]).unwrap();
+        gst::Element::link_many([&src, &incaps, &enhance, &convert, &sink]).unwrap();
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let (res, _, _) = pipeline.state(gst::ClockTime::from_seconds(10));
+        assert!(res.is_ok(), "failed to start");
+        let bus = pipeline.bus().unwrap();
+        let no_errors = |bus: &gst::Bus, phase: &str| {
+            while let Some(msg) = bus.pop_filtered(&[gst::MessageType::Error]) {
+                let gst::MessageView::Error(e) = msg.view() else { continue };
+                panic!("pipeline ERROR during {}: {} ({:?})", phase, e.error(), e.debug());
+            }
+        };
+        let out_pad = enhance.static_pad("src").unwrap();
+        let caps_size = |pad: &gst::Pad| -> Option<(i32, i32)> {
+            let c = pad.current_caps()?;
+            let s = c.structure(0)?;
+            Some((s.get("width").ok()?, s.get("height").ok()?))
+        };
+        let settle = |target: (i32, i32), phase: &str, bus: &gst::Bus| {
+            for _ in 0..80 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                no_errors(bus, phase);
+                if caps_size(&out_pad) == Some(target) {
+                    return;
+                }
+            }
+            panic!(
+                "{}: output caps never reached {:?} (got {:?})",
+                phase, target, caps_size(&out_pad)
+            );
+        };
+
+        // AI mode on the vertical source: gate fails on height -> GL-FSR 2x.
+        ctl.set_mode(EnhanceMode::NvAi).unwrap();
+        settle((960, 1708), "nvai-vertical (FSR fallback)", &bus);
+
+        // Live source switch to horizontal (like the next queue item): the AI
+        // stage now engages (2x) and the output must be 1708x960 — NOT the
+        // stale vertical geometry.
+        incaps.set_property("caps", &horizontal);
+        settle((1708, 960), "nvai-horizontal after vertical", &bus);
+
+        // And back to vertical again for good measure.
+        incaps.set_property("caps", &vertical);
+        settle((960, 1708), "nvai-vertical again", &bus);
+
+        let (_, state, _) = pipeline.state(gst::ClockTime::ZERO);
+        assert_eq!(state, gst::State::Playing, "pipeline must stay PLAYING");
         pipeline.set_state(gst::State::Null).unwrap();
     }
 

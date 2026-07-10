@@ -441,6 +441,12 @@ mod imp {
 
     pub struct EarthNvSr {
         pub engaged: AtomicBool,
+        /// Whether the CURRENT negotiation actually scales (out == 2x in).
+        /// Set in set_info — i.e. BEFORE the new caps event reaches the
+        /// downstream GL stage — so the enhance ctl can trust it from its
+        /// caps probe (reading pad caps there raced renegotiation and
+        /// double-scaled the GL stage on live size switches).
+        pub scaling: AtomicBool,
         /// AI blend strength 0.0..=1.0 as f32 bits (1.0 = pure AI output). A
         /// plain property read per frame — changing it never renegotiates.
         pub strength: AtomicU32,
@@ -452,6 +458,7 @@ mod imp {
         fn default() -> Self {
             Self {
                 engaged: AtomicBool::new(false),
+                scaling: AtomicBool::new(false),
                 strength: AtomicU32::new(1.0f32.to_bits()),
                 engine: Mutex::new(None),
                 infos: Mutex::new(None),
@@ -475,6 +482,12 @@ mod imp {
                         .nick("Engaged")
                         .blurb("Run NVIDIA SuperRes (false = zero-cost passthrough)")
                         .default_value(false)
+                        .build(),
+                    glib::ParamSpecBoolean::builder("scaling")
+                        .nick("Scaling")
+                        .blurb("Whether the current negotiation scales 2x (read-only)")
+                        .default_value(false)
+                        .read_only()
                         .build(),
                     glib::ParamSpecDouble::builder("strength")
                         .nick("AI strength")
@@ -531,6 +544,7 @@ mod imp {
         fn property(&self, _id: usize, pspec: &glib::ParamSpec) -> glib::Value {
             match pspec.name() {
                 "engaged" => self.engaged.load(Ordering::Relaxed).to_value(),
+                "scaling" => self.scaling.load(Ordering::Relaxed).to_value(),
                 "strength" => (f32::from_bits(self.strength.load(Ordering::Relaxed)) as f64).to_value(),
                 _ => unimplemented!(),
             }
@@ -594,20 +608,62 @@ mod imp {
             {
                 let out = out.get_mut().unwrap();
                 for s in caps.iter() {
-                    let mut s = s.to_owned();
-                    if engaged {
-                        // Scaler pattern (like videoscale): while engaged the
-                        // other side's size is UNCONSTRAINED at query time —
-                        // only scaling fixed sizes broke initial negotiation
-                        // (ranges passed through unscaled contradicted the
-                        // scaled fixed caps -> "not-negotiated" at load when a
-                        // player starts with AI already on). fixate_caps picks
-                        // the actual 2x/1x output.
+                    if !engaged {
+                        out.append_structure(s.to_owned());
+                        continue;
+                    }
+                    // Engaged. For RANGE sizes stay UNCONSTRAINED (scaler
+                    // pattern, like videoscale) — scaling ranges broke initial
+                    // negotiation when a player STARTS with AI on. But for
+                    // FIXED sizes map EXACTLY size*nv_factor: advertising
+                    // unconstrained sizes for fixed inputs let a downstream
+                    // caps pin force this element to scale a source the gate
+                    // rejected (e.g. a GL-FSR 2x pin from a vertical video
+                    // made 'nvai' scale it anyway — TensorRT then fails HARD
+                    // out-of-profile, playback degrades to nearest-neighbour,
+                    // and the enhance stage FSR-scales the result AGAIN,
+                    // ending at wrong, aspect-distorting geometry).
+                    let fixed = (s.get::<i32>("width").ok(), s.get::<i32>("height").ok());
+                    let (Some(w), Some(h)) = fixed else {
+                        let mut s = s.to_owned();
                         s.set("width", gst::IntRange::new(1i32, i32::MAX));
                         s.set("height", gst::IntRange::new(1i32, i32::MAX));
-                        let _ = direction;
+                        out.append_structure(s);
+                        continue;
+                    };
+                    if direction == gst::PadDirection::Sink {
+                        // sink -> src: exactly one possible output.
+                        let f = nv_factor(w, h);
+                        let mut s = s.to_owned();
+                        s.set("width", w * f);
+                        s.set("height", h * f);
+                        out.append_structure(s);
+                    } else {
+                        // src -> sink: enumerate the inputs that can yield this
+                        // fixed output — half size (if the gate admits it at
+                        // 2x) and/or identity (if the gate keeps it 1:1).
+                        let mut any = false;
+                        if w % 2 == 0 && h % 2 == 0 && nv_factor(w / 2, h / 2) == 2 {
+                            let mut s2 = s.to_owned();
+                            s2.set("width", w / 2);
+                            s2.set("height", h / 2);
+                            out.append_structure(s2);
+                            any = true;
+                        }
+                        if nv_factor(w, h) == 1 {
+                            out.append_structure(s.to_owned());
+                            any = true;
+                        }
+                        if !any {
+                            // No input maps to this output (e.g. an odd-sized
+                            // 2x proposal); answer unconstrained so the query
+                            // can continue rather than returning EMPTY.
+                            let mut s = s.to_owned();
+                            s.set("width", gst::IntRange::new(1i32, i32::MAX));
+                            s.set("height", gst::IntRange::new(1i32, i32::MAX));
+                            out.append_structure(s);
+                        }
                     }
-                    out.append_structure(s);
                 }
             }
             if let Some(filter) = filter {
@@ -657,9 +713,11 @@ mod imp {
             out_info: &gst_video::VideoInfo,
         ) -> Result<(), gst::LoggableError> {
             let engaged = self.engaged.load(Ordering::Relaxed);
+            let scaling = engaged && out_info.width() == in_info.width() * 2;
+            self.scaling.store(scaling, Ordering::Relaxed);
             let mut engine = self.engine.lock().unwrap();
             *engine = None;
-            if engaged && out_info.width() == in_info.width() * 2 {
+            if scaling {
                 // Prefer the Maxine SDK when installed; otherwise the open
                 // Real-ESRGAN/onnxruntime backend (the one users can freely get).
                 if available() {
