@@ -5,6 +5,17 @@ All notable changes to Earth Reclaim are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **AI mode no longer distorts aspect after a vertical video.** Playing a
+  vertical (or any >720p-dimension) video in AI mode and then a horizontal one
+  double-scaled the picture and squished it. The AI element can no longer be
+  forced by downstream negotiation to scale sources its gate rejects, and the
+  enhance stage now reads the element's actual scaling state instead of
+  racing pad caps during live renegotiations.
+
 ## [1.2.2] - 2026-07-02
 
 ### Fixed
