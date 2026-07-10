@@ -1,6 +1,6 @@
 [package]
 name = "reclaim"
-version = "1.2.2"
+version = "1.2.3"
 description = "Earth Reclaim - Privacy-first browser with local AI"
 authors = ["EarthServers"]
 license = "MIT"
