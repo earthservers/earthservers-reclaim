@@ -197,6 +197,8 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
   const [newPlaylistName, setNewPlaylistName] = useState('');
   // Playlist pending delete confirmation (inline are-you-sure in its row).
   const [confirmDeletePlaylist, setConfirmDeletePlaylist] = useState<Playlist | null>(null);
+  // Right-click context menu on a playlist item (remove-from-playlist).
+  const [playlistItemMenu, setPlaylistItemMenu] = useState<{ x: number; y: number; item: PlaylistItem } | null>(null);
   // Which queue item's "add to playlist" menu is currently open (by queue item id)
   const [addToPlaylistMenuId, setAddToPlaylistMenuId] = useState<string | null>(null);
   // In-app "name this playlist" modal (replaces the native prompt() dialog)
@@ -2021,6 +2023,31 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
     }
   };
 
+  // Append every item of a playlist to the queue (in playlist order).
+  const addPlaylistToQueue = async (playlist: Playlist) => {
+    try {
+      const items = await invoke<PlaylistItem[]>('get_media_playlist_items', { playlistId: playlist.id });
+      addToQueue(items.map(it => ({
+        source: it.source,
+        type: it.media_type as MediaType,
+        title: it.title || undefined,
+      })));
+    } catch (err) {
+      console.error('Failed to add playlist to queue:', err);
+    }
+  };
+
+  // Remove one item from its playlist (from the right-click context menu).
+  const removePlaylistItem = async (it: PlaylistItem) => {
+    try {
+      await invoke('remove_from_media_playlist', { itemId: it.id });
+      if (currentPlaylist) loadPlaylistItems(currentPlaylist);
+      loadPlaylists(); // refresh item counts
+    } catch (err) {
+      console.error('Failed to remove from playlist:', err);
+    }
+  };
+
   // Load playlist items
   const loadPlaylistItems = async (playlist: Playlist) => {
     try {
@@ -3062,13 +3089,21 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
                         } hover:bg-white/5`}
                         onClick={() => openMedia(item.source, item.type, item.title)}
                       >
-                        {/* Drag handle */}
-                        <svg className="w-3 h-3 text-gray-600 flex-shrink-0 cursor-grab active:cursor-grabbing" fill="currentColor" viewBox="0 0 24 24">
-                          <title>Drag to reorder</title>
-                          <circle cx="9" cy="6" r="1.5" /><circle cx="15" cy="6" r="1.5" />
-                          <circle cx="9" cy="12" r="1.5" /><circle cx="15" cy="12" r="1.5" />
-                          <circle cx="9" cy="18" r="1.5" /><circle cx="15" cy="18" r="1.5" />
-                        </svg>
+                        {/* Drag handle — becomes a play marker on the item
+                            currently loaded in a pane. */}
+                        {mediaItems.some(m => m?.source === item.source) ? (
+                          <svg className="w-3 h-3 text-[var(--primary-color)] flex-shrink-0" fill="currentColor" viewBox="0 0 24 24">
+                            <title>Now playing</title>
+                            <path d="M8 5v14l11-7z" />
+                          </svg>
+                        ) : (
+                          <svg className="w-3 h-3 text-gray-600 flex-shrink-0 cursor-grab active:cursor-grabbing" fill="currentColor" viewBox="0 0 24 24">
+                            <title>Drag to reorder</title>
+                            <circle cx="9" cy="6" r="1.5" /><circle cx="15" cy="6" r="1.5" />
+                            <circle cx="9" cy="12" r="1.5" /><circle cx="15" cy="12" r="1.5" />
+                            <circle cx="9" cy="18" r="1.5" /><circle cx="15" cy="18" r="1.5" />
+                          </svg>
+                        )}
                         <span className="text-gray-500 text-xs w-4">{index + 1}</span>
                         {item.type === 'video' && (
                           <svg className="w-3 h-3 text-gray-400 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -3224,11 +3259,28 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
                               ? 'bg-[var(--primary-color)]/20'
                               : 'hover:bg-white/5'
                           }`}
-                          onClick={() => loadPlaylistItems(playlist)}
+                          onClick={() => {
+                            // Click again to collapse the open playlist.
+                            if (currentPlaylist?.id === playlist.id) {
+                              setCurrentPlaylist(null);
+                              setPlaylistItems([]);
+                            } else {
+                              loadPlaylistItems(playlist);
+                            }
+                          }}
                         >
                           <div className="flex items-center justify-between gap-1.5">
                             <span className="text-white text-sm truncate">{playlist.name}</span>
                             <span className="text-gray-500 text-xs ml-auto">{playlist.item_count}</span>
+                            <button
+                              onClick={(e) => { e.stopPropagation(); addPlaylistToQueue(playlist); }}
+                              className="text-gray-500 hover:text-[var(--primary-color)] px-0.5 opacity-0 group-hover:opacity-100 transition-opacity"
+                              title="Add playlist to queue"
+                            >
+                              <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h12M4 10h12M4 14h7m4 0h6m-3-3v6" />
+                              </svg>
+                            </button>
                             <button
                               onClick={(e) => { e.stopPropagation(); setConfirmDeletePlaylist(playlist); }}
                               className="text-gray-500 hover:text-red-400 text-xs px-0.5 opacity-0 group-hover:opacity-100 transition-opacity"
@@ -3265,6 +3317,10 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
                             key={item.id}
                             className="p-1.5 rounded hover:bg-white/5 cursor-pointer"
                             onClick={() => openMedia(item.source, item.media_type as MediaType)}
+                            onContextMenu={(e) => {
+                              e.preventDefault();
+                              setPlaylistItemMenu({ x: e.clientX, y: e.clientY, item });
+                            }}
                           >
                             <span className="text-white text-xs truncate block">
                               {item.title || item.source.split('/').pop()}
@@ -3433,6 +3489,34 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
           </div>
         )}
       </div>
+
+      {/* Playlist item context menu (right-click): remove from playlist. */}
+      {playlistItemMenu && (
+        <div
+          className="fixed inset-0 z-[10004]"
+          onClick={() => setPlaylistItemMenu(null)}
+          onContextMenu={(e) => { e.preventDefault(); setPlaylistItemMenu(null); }}
+        >
+          <div
+            className="absolute bg-gray-900 border border-gray-700 rounded-lg shadow-2xl py-1 min-w-[180px]"
+            style={{
+              left: Math.min(playlistItemMenu.x, window.innerWidth - 200),
+              top: Math.min(playlistItemMenu.y, window.innerHeight - 60),
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <button
+              onClick={() => {
+                removePlaylistItem(playlistItemMenu.item);
+                setPlaylistItemMenu(null);
+              }}
+              className="block w-full text-left px-3 py-1.5 text-sm text-red-400 hover:bg-white/5"
+            >
+              Remove from playlist
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Password Setup Modal */}
       {showPasswordSetupModal && (
