@@ -5,7 +5,7 @@ All notable changes to Earth Reclaim are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.2.4] - 2026-07-10
 
 ### Added
 
@@ -13,7 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "add to queue" button (appends its items in order); right-click an item in
   an open playlist to remove it; click an open playlist again to collapse it;
   and the currently playing entry in the queue shows a ▶ marker instead of the
-  drag dots.
+  drag dots. Clicking a playlist item queues it (deduped) and plays it with its
+  title showing on the floating controls.
 
 ## [1.2.3] - 2026-07-02
 
