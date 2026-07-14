@@ -2037,6 +2037,19 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
     }
   };
 
+  // Open a playlist item: make sure it's IN the queue (playlists feed the
+  // queue — otherwise next/prev and the now-playing marker skip it), then play
+  // it in the focused pane. The title travels along so the floating controls
+  // show the right name (they mirror the focused pane's title).
+  const openPlaylistItem = (it: PlaylistItem) => {
+    const type = it.media_type as MediaType;
+    const title = it.title || it.source.split('/').pop();
+    if (!queueRef.current.some(q => q.source === it.source)) {
+      addToQueue([{ source: it.source, type, title }]);
+    }
+    openMedia(it.source, type, title);
+  };
+
   // Remove one item from its playlist (from the right-click context menu).
   const removePlaylistItem = async (it: PlaylistItem) => {
     try {
@@ -3316,7 +3329,7 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
                           <div
                             key={item.id}
                             className="p-1.5 rounded hover:bg-white/5 cursor-pointer"
-                            onClick={() => openMedia(item.source, item.media_type as MediaType)}
+                            onClick={() => openPlaylistItem(item)}
                             onContextMenu={(e) => {
                               e.preventDefault();
                               setPlaylistItemMenu({ x: e.clientX, y: e.clientY, item });
