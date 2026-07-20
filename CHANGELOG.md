@@ -5,6 +5,21 @@ All notable changes to Earth Reclaim are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.5] - 2026-07-20
+
+### Fixed
+
+- **Video playback showed black (audio fine, or nothing at all) after
+  upgrading to a Wayland-default distro** (Nobara/Fedora 44). Two causes,
+  both fixed: the session now exports `GDK_BACKEND=wayland` globally, which
+  silently made the app Wayland-native and broke all video embedding
+  (`GDK_BACKEND` is now always forced to x11; override with
+  `EARTH_GDK_BACKEND`); and GStreamer auto-picked the Wayland GL platform,
+  which renders pure black frames through the Enhance chain without any
+  error (`GST_GL_PLATFORM=glx` + `GST_GL_WINDOW=x11` are now forced, and
+  the GL health probe verifies actual pixels so this failure mode degrades
+  to "Enhance unavailable" instead of black video).
+
 ## [1.2.4] - 2026-07-10
 
 ### Added
