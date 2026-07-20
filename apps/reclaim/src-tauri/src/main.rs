@@ -21,11 +21,30 @@ fn main() {
         // reparenting, which only works when the Tauri/GTK windows are real X11
         // surfaces. On a Wayland session they're Wayland surfaces with no X11 parent,
         // so dropped videos pop out as separate top-level windows and the floating
-        // controls never appear. Dev already runs with GDK_BACKEND=x11; do the same
-        // for packaged builds (XWayland on Wayland sessions). Must be set before GTK
-        // initializes. An explicit GDK_BACKEND override is respected.
-        if env::var("GDK_BACKEND").is_err() {
-            env::set_var("GDK_BACKEND", "x11");
+        // controls never appear. Must be set before GTK initializes.
+        //
+        // ALWAYS force it: Nobara/Fedora 44 KDE exports GDK_BACKEND=wayland
+        // SESSION-WIDE, so the old "respect an existing GDK_BACKEND" made the
+        // whole app silently go Wayland-native after the distro upgrade — the
+        // main window had no XID, every create_video_surface failed with
+        // "unsupported window handle type: Wayland", and playback showed a
+        // black pane. A session-wide default is not a choice about THIS app;
+        // the only override honored is the app-specific EARTH_GDK_BACKEND.
+        match env::var("EARTH_GDK_BACKEND") {
+            Ok(v) if !v.is_empty() => env::set_var("GDK_BACKEND", v),
+            _ => env::set_var("GDK_BACKEND", "x11"),
+        }
+
+        // Same story for GStreamer's GL stack (the Enhance bin): on a Wayland
+        // session it auto-picks the Wayland GL platform (WAYLAND_DISPLAY is
+        // set), which renders PURE BLACK frames into our X11 pipeline without
+        // a single error — every video looked black with working audio.
+        // Explicitly user-set values are respected (these are not distro-set).
+        if env::var("GST_GL_PLATFORM").is_err() {
+            env::set_var("GST_GL_PLATFORM", "glx");
+        }
+        if env::var("GST_GL_WINDOW").is_err() {
+            env::set_var("GST_GL_WINDOW", "x11");
         }
 
         // Workaround for WebKitGTK GBM buffer allocation issues on some GPUs:

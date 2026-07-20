@@ -71,7 +71,10 @@ pub async fn create_video_surface(
             match handle.as_raw() {
                 RawWindowHandle::Xlib(xlib_handle) => xlib_handle.window as u64,
                 RawWindowHandle::Xcb(xcb_handle) => xcb_handle.window.get() as u64,
-                _ => return Err("Unsupported window handle type".to_string()),
+                other => {
+                    log::warn!("[surface] {}: unsupported window handle type: {:?}", player_id, other);
+                    return Err("Unsupported window handle type".to_string());
+                }
             }
         }
         Err(e) => return Err(format!("Failed to get window handle: {}", e)),

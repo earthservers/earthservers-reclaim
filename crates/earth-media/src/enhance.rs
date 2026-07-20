@@ -170,10 +170,26 @@ pub fn gl_available() -> bool {
         if sr_env_disabled() {
             return false;
         }
+        // Force the GLX/X11 GL path before ANY GL element exists. On Wayland
+        // sessions (Nobara/Fedora 44 KDE default) GStreamer auto-picks the
+        // Wayland GL platform because WAYLAND_DISPLAY is set — but the whole
+        // media stack runs on X11/XWayland, and the mismatched GL context
+        // "works" while producing PURE BLACK frames (buffers flow, EOS
+        // reached, pixels black — verified empirically on GStreamer 1.28.5 +
+        // NVIDIA 595). Explicit user-set values are respected.
+        if std::env::var("GST_GL_PLATFORM").is_err() {
+            std::env::set_var("GST_GL_PLATFORM", "glx");
+        }
+        if std::env::var("GST_GL_WINDOW").is_err() {
+            std::env::set_var("GST_GL_WINDOW", "x11");
+        }
         let ok = (|| -> Option<bool> {
+            use std::sync::atomic::{AtomicU64, Ordering as AtOrd};
+            use std::sync::Arc;
             let pipeline = gst::Pipeline::new();
             let src = gst::ElementFactory::make("videotestsrc")
                 .property("num-buffers", 1i32)
+                .property_from_str("pattern", "smpte")
                 .build()
                 .ok()?;
             let upload = gst::ElementFactory::make("glupload").build().ok()?;
@@ -181,20 +197,58 @@ pub fn gl_available() -> bool {
             let shader = gst::ElementFactory::make("glshader").build().ok()?;
             shader.set_property("fragment", PASSTHROUGH_FRAGMENT);
             let download = gst::ElementFactory::make("gldownload").build().ok()?;
+            let convert_out = gst::ElementFactory::make("videoconvert").build().ok()?;
             let sink = gst::ElementFactory::make("fakesink").build().ok()?;
             pipeline
-                .add_many([&src, &upload, &convert, &shader, &download, &sink])
+                .add_many([&src, &upload, &convert, &shader, &download, &convert_out, &sink])
                 .ok()?;
-            gst::Element::link_many([&src, &upload, &convert, &shader, &download, &sink]).ok()?;
+            gst::Element::link_many([&src, &upload, &convert, &shader, &download, &convert_out, &sink])
+                .ok()?;
+
+            // The probe must verify PIXELS, not just that buffers flow: a
+            // wrong GL platform renders solid black without a single error,
+            // which used to pass this probe and then black out all playback.
+            let brightness = Arc::new((AtomicU64::new(0), AtomicU64::new(0))); // (sum, count)
+            {
+                let brightness = brightness.clone();
+                let pad = sink.static_pad("sink")?;
+                pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
+                    if let Some(buffer) = info.buffer() {
+                        if let Ok(map) = buffer.map_readable() {
+                            let data = map.as_slice();
+                            // Sample up to ~64k bytes; SMPTE bars are bright.
+                            let step = (data.len() / 65536).max(1);
+                            let mut sum = 0u64;
+                            let mut n = 0u64;
+                            for i in (0..data.len()).step_by(step) {
+                                sum += data[i] as u64;
+                                n += 1;
+                            }
+                            brightness.0.fetch_add(sum, AtOrd::Relaxed);
+                            brightness.1.fetch_add(n, AtOrd::Relaxed);
+                        }
+                    }
+                    gst::PadProbeReturn::Ok
+                });
+            }
+
             pipeline.set_state(gst::State::Playing).ok()?;
             let bus = pipeline.bus()?;
             let msg = bus.timed_pop_filtered(
                 gst::ClockTime::from_seconds(5),
                 &[gst::MessageType::Eos, gst::MessageType::Error],
             );
-            let ok = matches!(msg.map(|m| m.type_()), Some(gst::MessageType::Eos));
+            let eos = matches!(msg.map(|m| m.type_()), Some(gst::MessageType::Eos));
             let _ = pipeline.set_state(gst::State::Null);
-            Some(ok)
+            let (sum, n) = (brightness.0.load(AtOrd::Relaxed), brightness.1.load(AtOrd::Relaxed));
+            let mean = if n > 0 { sum / n } else { 0 };
+            if eos && mean <= 4 {
+                log::warn!(
+                    "[earth-media] enhance: GL probe rendered BLACK (mean {}) — wrong GL platform?",
+                    mean
+                );
+            }
+            Some(eos && mean > 4)
         })()
         .unwrap_or(false);
         if ok {
