@@ -1163,6 +1163,24 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
     setLayout(l);
     const maxPanes = getMaxPanesForLayout(l);
     const newItems = [...mediaItemsRef.current];
+    // Shrinking (e.g. quad -> single): stop & clear the panes the new layout
+    // cuts off — their players otherwise keep playing (audio!) invisibly.
+    // Backend teardown mirrors closeMedia (stop + remove + hide surface; never
+    // destroy the surface here — that races teardown and crashes X11).
+    const cut: number[] = [];
+    for (let i = maxPanes; i < newItems.length; i++) {
+      if (newItems[i]) {
+        cut.push(i);
+        newItems[i] = null;
+        const pid = panePid(i);
+        invoke('player_stop', { playerId: pid }).catch(() => {});
+        invoke('player_remove', { playerId: pid }).catch(() => {});
+        invoke('hide_video_surface', { playerId: pid }).catch(() => {});
+      }
+    }
+    if (cut.length > 0 && activePaneRef.current >= maxPanes) {
+      setActivePane(0);
+    }
     const showing = new Set(newItems.map(m => m?.source).filter(Boolean) as string[]);
     const candidates = queue.filter(it => !playedItems.has(it.id) && !showing.has(it.source));
     let ci = 0;
@@ -1174,15 +1192,16 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
         updates.push({ index: i, item });
       }
     }
-    if (updates.length > 0) {
+    if (updates.length > 0 || cut.length > 0) {
       setMediaItems(newItems);
       setPaneStates(prev => {
         const u = [...prev];
         updates.forEach(({ index, item }) => { u[index] = { ...u[index], currentItem: item, isPlaying: true }; });
+        cut.forEach(i => { u[i] = { ...u[i], currentItem: null, isPlaying: false }; });
         return u;
       });
     }
-  }, [getMaxPanesForLayout, queue, playedItems]);
+  }, [getMaxPanesForLayout, queue, playedItems, panePid]);
 
 
   // Advance a single pane to the next video when its clip ends (auto, via EOS) or
@@ -2027,11 +2046,35 @@ export function EarthMultiMedia({ profileId, initialSource, initialType, onFulls
   const addPlaylistToQueue = async (playlist: Playlist) => {
     try {
       const items = await invoke<PlaylistItem[]>('get_media_playlist_items', { playlistId: playlist.id });
-      addToQueue(items.map(it => ({
+      const queued = addToQueue(items.map(it => ({
         source: it.source,
         type: it.media_type as MediaType,
         title: it.title || undefined,
       })));
+      // Autoplay: fill every empty visible pane from the newly queued items
+      // (same pattern as changeLayout's expand-fill) so queuing a playlist
+      // starts playback instead of just sitting in the list.
+      const maxPanes = getMaxPanesForLayout(layout);
+      const paneItems = [...mediaItemsRef.current];
+      const showing = new Set(paneItems.map(m => m?.source).filter(Boolean) as string[]);
+      const candidates = queued.filter(it => !showing.has(it.source));
+      let ci = 0;
+      const updates: { index: number; item: QueueItem }[] = [];
+      for (let i = 0; i < maxPanes; i++) {
+        if (paneItems[i] == null && ci < candidates.length) {
+          const item = candidates[ci++];
+          paneItems[i] = { source: item.source, type: item.type, title: item.title };
+          updates.push({ index: i, item });
+        }
+      }
+      if (updates.length > 0) {
+        setMediaItems(paneItems);
+        setPaneStates(prev => {
+          const u = [...prev];
+          updates.forEach(({ index, item }) => { u[index] = { ...u[index], currentItem: item, isPlaying: true }; });
+          return u;
+        });
+      }
     } catch (err) {
       console.error('Failed to add playlist to queue:', err);
     }
