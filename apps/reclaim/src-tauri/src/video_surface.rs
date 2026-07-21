@@ -138,6 +138,15 @@ pub async fn create_video_surface(
                     let _ = wv.eval(format!(
                         "window.dispatchEvent(new CustomEvent('__earth_video_surface_clicked',{{detail:{detail}}}))"
                     ));
+                    // Yank keyboard focus back to the app webview. The surface
+                    // is a foreign X11 child: its clicks never pass through
+                    // GTK, so after ANY focus change (other app window, the
+                    // floating controls webview grabbing X input focus, ...)
+                    // the webview's keyboard stayed dead — Space/arrows did
+                    // nothing until some DOM chrome was clicked. Clicking the
+                    // video is the natural "control this pane" gesture, so it
+                    // must also restore the keyboard.
+                    let _ = wv.set_focus();
                 }
                 glib::Propagation::Proceed
             });
