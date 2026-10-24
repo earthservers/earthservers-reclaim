@@ -27,6 +27,16 @@ ignore = [
     # still pins ^0.39: remove these once plist/tauri-utils ship the bump.
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
+    # zip 4.x extraction advisories (symlink targets escaping the destination,
+    # SUID/SGID preserved, permissions applied through symlinks). Reached ONLY
+    # via tauri-plugin-updater on Windows, which unpacks the update bundle it
+    # just downloaded AND signature-verified with the app's updater pubkey —
+    # so the archive is never attacker-controlled unless the signing key is.
+    # Fixed in zip >=9, but tauri-plugin-updater 2.10.1 (latest stable as of
+    # 2026-10-24) still pins ^4: remove these once the plugin ships the bump.
+    "RUSTSEC-2026-0367",
+    "RUSTSEC-2026-0368",
+    "RUSTSEC-2026-0369",
 ]
 
 [licenses]
