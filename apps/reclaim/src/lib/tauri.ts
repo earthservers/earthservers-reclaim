@@ -22,6 +22,19 @@ export async function saveDialog(options?: { defaultPath?: string; filters?: { n
   return options?.defaultPath || 'export.json';
 }
 
+// Open a native file/folder picker. Returns the selected absolute paths.
+// Browser dev mode has no native picker, so it resolves to an empty list.
+export async function openFileDialog(options?: { multiple?: boolean; directory?: boolean }): Promise<string[]> {
+  if (isTauri()) {
+    const { open } = await import('@tauri-apps/plugin-dialog');
+    const picked = await open({ multiple: options?.multiple ?? true, directory: options?.directory ?? false });
+    if (!picked) return [];
+    return Array.isArray(picked) ? picked : [picked];
+  }
+  console.log('[Mock] openFileDialog', options);
+  return [];
+}
+
 // Mock file write
 export async function writeFile(path: string, contents: string): Promise<void> {
   if (isTauri()) {
@@ -272,6 +285,9 @@ let mockBookmarks: any[] = [
 // Per-profile feature-gate passwords (hashed in production). Keyed by profileId.
 const privateBookmarksPasswords: Record<number, string> = {};
 const aiLockPasswords: Record<number, string> = {};
+
+// Assistant chat sessions for browser dev mode (in-memory only).
+let mockAiChats: any[] = [];
 
 // Password manager data
 let passwordManagerMaster: Record<number, string> = {}; // profile_id -> master password
@@ -731,6 +747,35 @@ const mockCommands: Record<string, (args?: any) => any> = {
   },
   has_private_bookmarks_password: (args: any) => privateBookmarksPasswords[args.profileId] != null,
   get_bookmarks_by_location: (args: any) => mockBookmarks.filter(b => b.location === args.location && b.profile_id === args.profile_id && !b.url.startsWith('earth://')),
+
+  // Assistant file attachments / filesystem access. Browser dev mode has no real
+  // filesystem, so these return an empty set rather than throwing.
+  assistant_read_files: (args: any) => (args?.paths ?? []).map((p: string) => ({
+    path: p,
+    name: p.split(/[/\\]/).pop() || p,
+    kind: 'file',
+    content: `[Mock] contents of ${p}`,
+    bytes: 0,
+    truncated: false,
+  })),
+  assistant_resolve_paths: () => [],
+
+  // Encrypted assistant chat store. The mock keeps them in memory (plaintext) —
+  // the real backend encrypts at rest in SQLite.
+  ai_chats_load: (args: any) => mockAiChats.filter((c: any) => c.profileId === (args?.profileId ?? 1)),
+  ai_chats_save: (args: any) => {
+    const pid = args?.profileId ?? 1;
+    const i = mockAiChats.findIndex((c: any) => c.profileId === pid && c.id === args.chat.id);
+    const row = { ...args.chat, profileId: pid };
+    if (i >= 0) mockAiChats[i] = row; else mockAiChats.unshift(row);
+    return undefined;
+  },
+  ai_chats_delete: (args: any) => {
+    mockAiChats = mockAiChats.filter((c: any) => !(c.profileId === (args?.profileId ?? 1) && c.id === args.id));
+    return undefined;
+  },
+  ai_chats_rekey: () => 0,
+  ai_chats_import_journal: () => 0,
 
   // Local AI / History password gate (per profile)
   ai_lock_has_password: (args: any) => aiLockPasswords[args.profileId] != null,

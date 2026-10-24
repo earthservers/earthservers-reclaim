@@ -5,8 +5,13 @@
 //!
 //! Earlier versions stored a single global row shared by every profile;
 //! `ensure_table` migrates that away (drops it) so each profile has its own gate.
-//! Nothing the gate protects is encrypted with this password, so dropping the old
-//! shared gate loses no data — it just resets to "no password" until one is set.
+//! Dropping the old shared gate loses no data — it just resets to "no password".
+//!
+//! NOTE: this password is ALSO the key material for chat encryption (see
+//! `assistant_chats`). Changing or removing it must re-encrypt the stored chats
+//! (`ai_chats_rekey`) in the same flow, or they become permanently unreadable —
+//! the UI does this in `AiLockModal`. Anything added here that changes the
+//! password must do the same.
 
 use std::sync::Mutex;
 

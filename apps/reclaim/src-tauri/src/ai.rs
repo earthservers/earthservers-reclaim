@@ -110,11 +110,16 @@ impl OllamaClient {
         model: &str,
         messages: &serde_json::Value,
         tools: Option<&serde_json::Value>,
+        num_ctx: u32,
     ) -> Result<serde_json::Value, String> {
+        // Research mode feeds whole fetched pages back through this loop, so it
+        // needs the same raised context window as the streamed answer — at
+        // Ollama's 4096 default the earlier tool results get evicted mid-loop.
         let mut body = serde_json::json!({
             "model": model,
             "stream": false,
             "messages": messages,
+            "options": { "num_ctx": num_ctx },
         });
         if let Some(t) = tools {
             body["tools"] = t.clone();

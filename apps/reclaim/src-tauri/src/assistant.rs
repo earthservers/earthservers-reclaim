@@ -145,6 +145,27 @@ async fn resolve_model(model: Option<String>) -> String {
     }
 }
 
+/// Context window (tokens) requested from Ollama when the caller doesn't specify.
+///
+/// Ollama's own default is 4096 (~16KB of text), which silently truncates the
+/// prompt from the FRONT once history + attachments exceed it — dropping the
+/// system prompt and attached files while the model answers anyway.
+///
+/// 16384 (~65KB) is the default because it's what a 14B model actually fits
+/// alongside its weights on a 16GB card. Measured on an RTX 4060 Ti (16GB) with
+/// qwen2.5:14b: 16384 loads fine, 24576+ kills the llama runner (exit status 2).
+/// Raise it only with a smaller model or more VRAM — the KV cache grows with
+/// this number, and overshooting fails at load time rather than degrading.
+pub const DEFAULT_NUM_CTX: u32 = 16_384;
+const MIN_NUM_CTX: u32 = 2_048;
+const MAX_NUM_CTX: u32 = 131_072;
+
+/// Clamp a caller-supplied context size into a sane range (and fall back to the
+/// default when unset), so a bad value can't produce a broken request.
+fn resolve_num_ctx(requested: Option<u32>) -> u32 {
+    requested.unwrap_or(DEFAULT_NUM_CTX).clamp(MIN_NUM_CTX, MAX_NUM_CTX)
+}
+
 /// The assistant's pre-prompt (persona + behavior). This is the single source of
 /// truth for how the assistant behaves — edit here to tune it. (The curator has
 /// its own, separate prompt in `ai.rs::curate`.)
@@ -167,18 +188,22 @@ When it isn't relevant, ignore it and answer from general knowledge. \
 Never invent knowledge-base entries that aren't shown.";
 
 /// Build the grounded chat message list: the pre-prompt + relevant saved
-/// knowledge, then the (capped) history, then the new user message.
+/// knowledge (+ any attached/referenced files), then the (capped) history, then
+/// the new user message.
 fn build_chat_messages(
     db_path: &str,
     profile_id: i64,
     message: &str,
     history: &[ChatMsg],
+    files: &[crate::assistant_files::AttachedFile],
 ) -> Vec<(String, String)> {
     let context = retrieve_context(db_path, profile_id, message);
+    let attachments = crate::assistant_files::format_attachments(files);
     let system = format!(
-        "{}\n\n--- User's saved knowledge ---\n{}",
+        "{}\n\n--- User's saved knowledge ---\n{}{}",
         SYSTEM_PROMPT,
-        if context.trim().is_empty() { "(nothing relevant found for this message)".to_string() } else { context }
+        if context.trim().is_empty() { "(nothing relevant found for this message)".to_string() } else { context },
+        if attachments.is_empty() { String::new() } else { format!("\n\n{}", attachments) }
     );
     let mut msgs: Vec<(String, String)> = vec![("system".to_string(), system)];
     for h in history.iter().rev().take(12).rev() {
@@ -225,7 +250,7 @@ pub async fn assistant_chat(
         return Err("Ollama isn't running — start it with `ollama serve`.".to_string());
     }
     let model = resolve_model(model).await;
-    let msgs = build_chat_messages(&db_path, profile_id, &message, &history);
+    let msgs = build_chat_messages(&db_path, profile_id, &message, &history, &[]);
     client.chat(&model, &msgs).await
 }
 
@@ -277,6 +302,7 @@ async fn stream_answer(
     app: &tauri::AppHandle,
     model: &str,
     messages: &serde_json::Value,
+    num_ctx: u32,
 ) -> Result<String, String> {
     use tauri::Emitter;
     let client = reqwest::Client::new();
@@ -284,8 +310,18 @@ async fn stream_answer(
     // Ask reasoning models to expose their thinking as a separate `thinking` field
     // (`think: true`). Models that don't support it make Ollama reject the request,
     // so we retry once without `think`.
+    //
+    // `num_ctx` raises Ollama's context window from its 4096-token default —
+    // without it, long attachments and history are silently evicted from the
+    // FRONT of the prompt (system prompt + files first), and the model answers
+    // confidently from what's left. See `DEFAULT_NUM_CTX`.
     let send = |think: bool| {
-        let mut payload = serde_json::json!({ "model": model, "stream": true, "messages": messages });
+        let mut payload = serde_json::json!({
+            "model": model,
+            "stream": true,
+            "messages": messages,
+            "options": { "num_ctx": num_ctx },
+        });
         if think {
             payload["think"] = serde_json::Value::Bool(true);
         }
@@ -301,14 +337,27 @@ async fn stream_answer(
             .ok()
             .and_then(|v| v["error"].as_str().map(str::to_string))
             .unwrap_or(body);
-        // If the model just doesn't support thinking, retry without it.
-        if detail.to_lowercase().contains("think") {
+        // If the model just doesn't support thinking, retry without it. Match the
+        // capability message specifically ("does not support thinking") rather
+        // than any mention of "think" — a model whose NAME contains "think"
+        // would otherwise swallow unrelated errors and retry pointlessly.
+        if detail.to_lowercase().contains("support thinking") {
             resp = send(false).await.map_err(|e| format!("Ollama isn't reachable: {}", e))?;
             if !resp.status().is_success() {
                 let s = resp.status();
                 let b = resp.text().await.unwrap_or_default();
                 return Err(format!("Ollama: {} (HTTP {})", b.trim(), s));
             }
+        } else if detail.contains("llama runner process has terminated") {
+            // Almost always an out-of-VRAM at load: the KV cache for `num_ctx`
+            // plus the weights didn't fit. Ollama's own message doesn't say so,
+            // which sends people hunting for the wrong problem.
+            return Err(format!(
+                "The model couldn't load with a {}K context — it likely needs more VRAM than you have. \
+                 Lower the context window in the assistant settings, or use a smaller model. (Ollama: {})",
+                num_ctx / 1024,
+                detail.trim()
+            ));
         } else {
             return Err(format!("Ollama: {} (HTTP {})", detail.trim(), status));
         }
@@ -357,6 +406,8 @@ pub async fn assistant_research_stream(
     model: Option<String>,
     journal: bool,
     searxng_url: Option<String>,
+    files: Option<Vec<crate::assistant_files::AttachedFile>>,
+    num_ctx: Option<u32>,
 ) -> Result<(), String> {
     use tauri::Emitter;
 
@@ -369,18 +420,21 @@ pub async fn assistant_research_stream(
         return Err("Ollama isn't running — start it with `ollama serve`.".to_string());
     }
     let model = resolve_model(model).await;
+    let num_ctx = resolve_num_ctx(num_ctx);
 
     // Build messages: persona + research guide + local-knowledge context, history, user.
     let context = retrieve_context(&db_path, profile_id, &message);
+    let attachments = crate::assistant_files::format_attachments(&files.unwrap_or_default());
     let system = format!(
-        "{}\n\n{}\n\n--- User's saved knowledge ---\n{}",
+        "{}\n\n{}\n\n--- User's saved knowledge ---\n{}{}",
         SYSTEM_PROMPT,
         RESEARCH_GUIDE,
         if context.trim().is_empty() {
             "(nothing relevant found for this message)".to_string()
         } else {
             context
-        }
+        },
+        if attachments.is_empty() { String::new() } else { format!("\n\n{}", attachments) }
     );
     let mut messages: Vec<serde_json::Value> =
         vec![serde_json::json!({ "role": "system", "content": system })];
@@ -396,7 +450,7 @@ pub async fn assistant_research_stream(
     // Agentic loop — search/read up to 5 steps.
     for step in 0..5 {
         let msg = match client
-            .chat_with_tools(&model, &serde_json::Value::Array(messages.clone()), Some(&tools))
+            .chat_with_tools(&model, &serde_json::Value::Array(messages.clone()), Some(&tools), num_ctx)
             .await
         {
             Ok(m) => m,
@@ -458,7 +512,7 @@ pub async fn assistant_research_stream(
     }
 
     // Final streamed answer using everything gathered.
-    let full = stream_answer(&app, &model, &serde_json::Value::Array(messages)).await?;
+    let full = stream_answer(&app, &model, &serde_json::Value::Array(messages), num_ctx).await?;
     let _ = app.emit("assistant-done", ());
 
     if journal && !full.trim().is_empty() {
@@ -485,6 +539,8 @@ pub async fn assistant_chat_stream(
     history: Vec<ChatMsg>,
     model: Option<String>,
     journal: bool,
+    files: Option<Vec<crate::assistant_files::AttachedFile>>,
+    num_ctx: Option<u32>,
 ) -> Result<(), String> {
     use tauri::Emitter;
 
@@ -493,13 +549,15 @@ pub async fn assistant_chat_stream(
         s.db_path.clone()
     };
     let model = resolve_model(model).await;
-    let msgs = build_chat_messages(&db_path, profile_id, &message, &history);
+    let num_ctx = resolve_num_ctx(num_ctx);
+    let files = files.unwrap_or_default();
+    let msgs = build_chat_messages(&db_path, profile_id, &message, &history, &files);
     // Stream via the shared helper so plain chat also exposes the model's thinking
     // (and the think-unsupported fallback) consistently with research mode.
     let messages = serde_json::Value::Array(
         msgs.iter().map(|(r, c)| serde_json::json!({ "role": r, "content": c })).collect(),
     );
-    let full = stream_answer(&app, &model, &messages).await?;
+    let full = stream_answer(&app, &model, &messages, num_ctx).await?;
     let _ = app.emit("assistant-done", ());
 
     if journal && !full.trim().is_empty() {

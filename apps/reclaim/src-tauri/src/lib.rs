@@ -28,6 +28,8 @@ mod router;
 mod vault;
 mod media_downloads;
 mod assistant;
+mod assistant_chats;
+mod assistant_files;
 mod research;
 mod ai_lock;
 mod assets_server;
@@ -3049,6 +3051,13 @@ pub fn run() {
             assistant::assistant_chat,
             assistant::assistant_chat_stream,
             assistant::assistant_research_stream,
+            assistant_files::assistant_read_files,
+            assistant_files::assistant_resolve_paths,
+            assistant_chats::ai_chats_load,
+            assistant_chats::ai_chats_save,
+            assistant_chats::ai_chats_delete,
+            assistant_chats::ai_chats_rekey,
+            assistant_chats::ai_chats_import_journal,
             research::web_search,
             research::fetch_url,
             research::research_status,
