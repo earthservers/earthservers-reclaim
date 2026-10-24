@@ -5,6 +5,32 @@ All notable changes to Earth Reclaim are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.7] - 2026-10-24
+
+### Added
+
+- **AI assistant workspace.** The Local AI Hub now keeps chat sessions
+  (encrypted at rest, per profile, optionally behind the AI lock password),
+  lets you attach files or drop them onto a chat, and can read paths you
+  mention in a message when filesystem access is switched on.
+
+### Fixed
+
+- **Floating media controls rendered only in pieces on WebKitGTK 2.54.**
+  After a distro update (Nobara/Fedora 44) the transparent controls window
+  showed just the progress bar and timer, with the rest of the card blank.
+  The app now keeps WebKit's DMA-BUF renderer on shared-memory buffers
+  instead of forcing the legacy renderer, which also avoids the GBM
+  allocation failure on NVIDIA.
+- **A missing media file now shows a "File not found" popup** instead of a
+  raw GStreamer error, and the file's path is no longer written to the logs.
+- **Assistant file reads are bounded.** Reading a device, pipe or very large
+  file could previously exhaust memory or hang a worker thread.
+- **Chat history is saved once per pause** rather than once per streamed
+  token, and a stale save can no longer overwrite a newer one.
+- **Removing the AI lock password** re-keys existing chats before the gate
+  is dropped, so a failure can't leave them unreadable.
+
 ## [1.2.6] - 2026-07-20
 
 ### Fixed
