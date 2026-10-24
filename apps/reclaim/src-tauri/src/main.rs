@@ -47,16 +47,30 @@ fn main() {
             env::set_var("GST_GL_WINDOW", "x11");
         }
 
-        // Workaround for WebKitGTK GBM buffer allocation issues on some GPUs:
-        // disabling the DMA-BUF renderer forces a software-ish path. But that
-        // path is exactly what blocks GPU-accelerated media. So when the GPU-accel
-        // spike is enabled (EARTH_GL), DON'T disable it — let WebKit use the
-        // accelerated renderer end-to-end.
+        // WebKitGTK renderer selection. Two constraints:
+        //
+        // 1. The DMA-BUF renderer's default GBM buffer path fails on the NVIDIA
+        //    proprietary driver ("Failed to create GBM buffer ... Invalid
+        //    argument") and the webview then paints nothing at all.
+        // 2. The legacy NON-DMA-BUF path (WEBKIT_DISABLE_DMABUF_RENDERER=1, our
+        //    old workaround for #1) broke in WebKitGTK 2.54 (Nobara/Fedora 44
+        //    update, Oct 2026): in the transparent X11 floating-controls
+        //    webview only the regions that changed since the last frame got
+        //    painted — progress fill and timer visible, the rest of the card
+        //    blank. Reproduced in isolation; disabling WebKit's damage-tracking
+        //    features and WEBKIT_DISABLE_COMPOSITING_MODE did NOT help.
+        //
+        // What works on both counts: keep the DMA-BUF renderer but force it to
+        // use shared-memory buffers instead of GBM. Verified rendering the whole
+        // controls card correctly on WebKitGTK 2.54 + NVIDIA 595 + Xwayland.
+        // When the GPU-accel spike is enabled (EARTH_GL) leave the renderer
+        // fully default so WebKit can use GBM end-to-end. Explicit user-set
+        // values are respected.
         let gl_enabled = env::var("EARTH_GL")
             .map(|v| v == "1" || v == "ondemand" || v == "always")
             .unwrap_or(false);
-        if !gl_enabled && env::var("WEBKIT_DISABLE_DMABUF_RENDERER").is_err() {
-            env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+        if !gl_enabled && env::var("WEBKIT_DMABUF_RENDERER_FORCE_SHM").is_err() {
+            env::set_var("WEBKIT_DMABUF_RENDERER_FORCE_SHM", "1");
         }
 
         // NOTE: We intentionally do NOT force `GST_GL_API=opengl3`. The embedded

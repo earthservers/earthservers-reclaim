@@ -70,6 +70,11 @@ function isStateError(state: PlaybackState): state is { Error: string } {
   return typeof state === 'object' && 'Error' in state;
 }
 
+// Must match ERR_FILE_NOT_FOUND in crates/earth-media/src/lib.rs. The backend
+// reports a missing file with exactly this text (and no path) so we can show a
+// popup rather than a raw GStreamer message.
+const FILE_NOT_FOUND = 'File not found';
+
 interface VideoState {
   isPlaying: boolean;
   currentTime: number;
@@ -110,6 +115,7 @@ export function GStreamerVideoPlayer({
   const startPositionMsRef = useRef(startPositionMs);
   startPositionMsRef.current = startPositionMs;
   const statusPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const reportedErrorRef = useRef<string | null>(null);
   const surfaceCreatedRef = useRef(false);
   // Retry count for transient surface-creation failures. Without retry, a single
   // failure (e.g. X11 contention when several panes/controls are created at once)
@@ -413,6 +419,7 @@ export function GStreamerVideoPlayer({
     }
 
     const loadMedia = async () => {
+      reportedErrorRef.current = null;
       setState(s => ({ ...s, isLoading: true, error: null }));
 
       try {
@@ -510,7 +517,21 @@ export function GStreamerVideoPlayer({
             isLoading: false,
             isPlaying: false,
           }));
-          onError?.(errorMsg);
+          // The poll keeps seeing the same error every 250ms; report it once.
+          if (reportedErrorRef.current !== errorMsg) {
+            reportedErrorRef.current = errorMsg;
+            onError?.(errorMsg);
+            if (errorMsg === FILE_NOT_FOUND) {
+              // Loud in the app, quiet in the logs: a native error popup with
+              // no path in it (the pane overlay shows the short text too).
+              void import('@tauri-apps/plugin-dialog')
+                .then(({ message }) => message(
+                  'This file could not be found. It may have been moved, renamed or deleted.',
+                  { title: 'File not found', kind: 'error' },
+                ))
+                .catch(() => {});
+            }
+          }
           return;
         }
 

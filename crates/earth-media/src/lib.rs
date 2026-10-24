@@ -99,6 +99,11 @@ fn build_video_sink(hw: bool) -> Option<gst::Element> {
     None
 }
 
+/// User-facing playback error for a media file that does not exist (or was
+/// moved/deleted). Deliberately contains no path. The frontend matches on this
+/// exact string to show a popup instead of the raw GStreamer message.
+pub const ERR_FILE_NOT_FOUND: &str = "File not found";
+
 #[derive(Error, Debug)]
 pub enum MediaError {
     #[error("GStreamer initialization failed: {0}")]
@@ -380,15 +385,48 @@ impl MediaPlayer {
                     }
                 }
                 MessageView::Error(err) => {
-                    let error_msg = format!(
-                        "Error from {:?}: {} ({:?})",
-                        err.src().map(|s| s.path_string()),
-                        err.error(),
-                        err.debug()
-                    );
-                    log::error!("{}", error_msg);
-                    if let Ok(mut e) = error_clone.lock() {
-                        *e = Some(error_msg);
+                    let error = err.error();
+                    let debug = err.debug();
+                    // A missing file is the user's problem, not a diagnostic one:
+                    // surface it as a plain "File not found" (no path — the
+                    // frontend turns it into a popup) and keep the path out of
+                    // the logs entirely.
+                    let not_found = error.kind::<gst::ResourceError>()
+                        == Some(gst::ResourceError::NotFound);
+                    // When a source can't start, GStreamer posts a generic
+                    // "state change failed" FIRST and the real reason (e.g.
+                    // NotFound above) right after. Don't shout the generic one
+                    // either; it carries the same path.
+                    let source_start_failed = error.kind::<gst::CoreError>()
+                        == Some(gst::CoreError::StateChange)
+                        && debug
+                            .as_deref()
+                            .map_or(false, |d| d.contains("gst_base_src_start"));
+                    if not_found {
+                        log::debug!("playback error: media file not found");
+                        if let Ok(mut e) = error_clone.lock() {
+                            *e = Some(ERR_FILE_NOT_FOUND.to_string());
+                        }
+                    } else if source_start_failed {
+                        log::debug!("playback error: source element failed to start");
+                        if let Ok(mut e) = error_clone.lock() {
+                            // Placeholder only; the specific reason usually
+                            // follows and overrides it.
+                            if e.is_none() {
+                                *e = Some("Could not open media".to_string());
+                            }
+                        }
+                    } else {
+                        let error_msg = format!(
+                            "Error from {:?}: {} ({:?})",
+                            err.src().map(|s| s.path_string()),
+                            error,
+                            debug
+                        );
+                        log::error!("{}", error_msg);
+                        if let Ok(mut e) = error_clone.lock() {
+                            *e = Some(error_msg);
+                        }
                     }
                 }
                 MessageView::Warning(warn) => {
@@ -551,7 +589,9 @@ impl MediaPlayer {
             )));
         };
 
-        log::info!("Loading media: {}", full_uri);
+        // Debug level on purpose: the URI is a path on the user's disk and
+        // should not land in default logs.
+        log::debug!("Loading media: {}", full_uri);
 
         // Clear any previous error
         if let Ok(mut err) = self.last_error.lock() {
